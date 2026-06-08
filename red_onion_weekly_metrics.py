@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -533,13 +534,27 @@ def write_table_sheet(
             header = headers[col_index - 1]
             if "Date" in header or header in {"Week Start", "Week End", "Latest Week End"}:
                 cell.number_format = "m/d/yyyy"
+            elif "Rank" in header:
+                cell.number_format = "#,##0"
+            elif "Ticket Time Change (Min)" in header:
+                cell.number_format = "0.0"
+            elif "Check Average Change" in header:
+                cell.number_format = "$#,##0.00"
+            elif "Wine % Change" in header:
+                cell.number_format = "0.00%"
+            elif "Rate Change" in header:
+                cell.number_format = "0.00"
             elif "Wine %" in header:
                 cell.number_format = "0.00%"
             elif "Rate of Sale" in header:
                 cell.number_format = "0.00"
             elif "Ticket Time" in header:
                 cell.number_format = "[h]:mm:ss"
-            elif header in {"Gross Sales", "Wine Sales", "Total Gross Sales", "Total Wine Sales", "Check Average", "Latest Check Average", "Weighted Check Average"}:
+            elif (
+                "Gross Sales" in header
+                or "Wine Sales" in header
+                or ("Check Average" in header and "Rank" not in header)
+            ):
                 cell.number_format = "$#,##0.00"
             elif "Guest" in header or "Days" in header or "Weeks" in header:
                 cell.number_format = "#,##0"
@@ -574,6 +589,9 @@ def write_table_sheet(
         "O": 18,
         "P": 18,
     }
+    for index in range(1, len(headers) + 1):
+        col = get_column_letter(index)
+        default_widths.setdefault(col, min(max(len(headers[index - 1]) + 2, 12), 24))
     default_widths.update(widths or {})
     for col, width in default_widths.items():
         ws.column_dimensions[col].width = width
@@ -606,6 +624,172 @@ def weekly_rollups(records: list[MetricRecord]) -> tuple[list[dict[str, Any]], l
     return server_rows, location_rows
 
 
+def assign_rank(
+    rows: list[dict[str, Any]],
+    value_field: str,
+    rank_field: str,
+    *,
+    higher_is_better: bool,
+    min_guest_count: int,
+) -> None:
+    eligible = [
+        row
+        for row in rows
+        if row.get("guest_count", 0) >= min_guest_count and row.get(value_field) is not None
+    ]
+    eligible.sort(
+        key=lambda row: row[value_field],
+        reverse=higher_is_better,
+    )
+
+    previous_value: float | None = None
+    previous_rank = 0
+    for index, row in enumerate(eligible, start=1):
+        value = row[value_field]
+        rank = previous_rank if previous_value == value else index
+        row[rank_field] = rank
+        previous_rank = rank
+        previous_value = value
+
+    for row in rows:
+        row.setdefault(rank_field, None)
+
+
+def weekly_server_rank_rows(
+    weekly_server_rows: list[dict[str, Any]],
+    min_guest_count: int,
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[date, date, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in weekly_server_rows:
+        ranked = dict(row)
+        groups[(ranked["week_start"], ranked["week_end"], ranked["location"])].append(ranked)
+
+    ranked_rows: list[dict[str, Any]] = []
+    for group_rows in groups.values():
+        assign_rank(
+            group_rows,
+            "check_average",
+            "check_average_rank",
+            higher_is_better=True,
+            min_guest_count=min_guest_count,
+        )
+        assign_rank(
+            group_rows,
+            "wine_pct",
+            "wine_pct_rank",
+            higher_is_better=True,
+            min_guest_count=min_guest_count,
+        )
+        assign_rank(
+            group_rows,
+            "rate_of_sale_by_guest_count",
+            "rate_rank",
+            higher_is_better=False,
+            min_guest_count=min_guest_count,
+        )
+        assign_rank(
+            group_rows,
+            "average_ticket_time_seconds",
+            "ticket_time_rank",
+            higher_is_better=False,
+            min_guest_count=min_guest_count,
+        )
+        ranked_rows.extend(group_rows)
+
+    ranked_rows.sort(
+        key=lambda row: (
+            row["week_end"],
+            row["location"],
+            row.get("check_average_rank") or 9999,
+            row["display_name"],
+        )
+    )
+    return ranked_rows
+
+
+def trend_note(
+    check_change: float | None,
+    wine_change: float | None,
+    rate_change: float | None,
+    ticket_change_minutes: float | None,
+) -> str:
+    if check_change is None:
+        return "No prior week"
+
+    improved = 0
+    declined = 0
+    for value, higher_is_better in (
+        (check_change, True),
+        (wine_change, True),
+        (rate_change, False),
+        (ticket_change_minutes, False),
+    ):
+        if value is None or abs(value) < 0.000001:
+            continue
+        if (higher_is_better and value > 0) or ((not higher_is_better) and value < 0):
+            improved += 1
+        else:
+            declined += 1
+
+    if improved >= 2 and improved > declined:
+        return "Improving"
+    if declined >= 2 and declined > improved:
+        return "Watch"
+    return "Mixed"
+
+
+def server_week_trend_rows(ranked_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in ranked_rows:
+        groups[(row["location"], row["raw_user_name"], row["display_name"])].append(row)
+
+    trend_rows: list[dict[str, Any]] = []
+    for (_, _, _), rows in groups.items():
+        rows.sort(key=lambda row: row["week_end"])
+        previous: dict[str, Any] | None = None
+        for row in rows:
+            check_change = (
+                row["check_average"] - previous["check_average"] if previous else None
+            )
+            wine_change = row["wine_pct"] - previous["wine_pct"] if previous else None
+            rate_change = (
+                row["rate_of_sale_by_guest_count"] - previous["rate_of_sale_by_guest_count"]
+                if previous
+                else None
+            )
+            ticket_change_minutes = (
+                (row["average_ticket_time_seconds"] - previous["average_ticket_time_seconds"]) / 60
+                if previous
+                else None
+            )
+            trend_rows.append(
+                {
+                    **row,
+                    "check_average_change": check_change,
+                    "wine_pct_change": wine_change,
+                    "rate_change": rate_change,
+                    "ticket_time_change_minutes": ticket_change_minutes,
+                    "trend_note": trend_note(
+                        check_change,
+                        wine_change,
+                        rate_change,
+                        ticket_change_minutes,
+                    ),
+                }
+            )
+            previous = row
+
+    trend_rows.sort(
+        key=lambda row: (
+            row["week_end"],
+            row["location"],
+            row.get("check_average_rank") or 9999,
+            row["display_name"],
+        )
+    )
+    return trend_rows
+
+
 def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in weekly_server_rows:
@@ -620,12 +804,14 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
         rate_weighted = sum(row["rate_of_sale_by_guest_count"] * row["guest_count"] for row in rows)
         ticket_weighted = sum(row["average_ticket_time_seconds"] * row["guest_count"] for row in rows)
         latest = rows[-1]
+        prior = rows[-2] if len(rows) > 1 else None
         summary.append(
             {
                 "location": location,
                 "raw_user_name": raw_name,
                 "display_name": display_name,
                 "weeks_tracked": len(rows),
+                "active_days_tracked": sum(row["active_days"] for row in rows),
                 "total_gross_sales": total_gross,
                 "total_guest_count": total_guests,
                 "weighted_check_average": total_gross / total_guests if total_guests else 0.0,
@@ -633,16 +819,399 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
                 "overall_wine_pct": total_wine / total_gross if total_gross else 0.0,
                 "weighted_rate": rate_weighted / total_guests if total_guests else 0.0,
                 "weighted_ticket_time_seconds": ticket_weighted / total_guests if total_guests else 0.0,
+                "first_week_end": rows[0]["week_end"],
                 "latest_week_end": latest["week_end"],
+                "prior_week_end": prior["week_end"] if prior else None,
                 "latest_check_average": latest["check_average"],
+                "prior_check_average": prior["check_average"] if prior else None,
+                "check_average_change": (
+                    latest["check_average"] - prior["check_average"] if prior else None
+                ),
                 "latest_wine_pct": latest["wine_pct"],
+                "prior_wine_pct": prior["wine_pct"] if prior else None,
+                "wine_pct_change": latest["wine_pct"] - prior["wine_pct"] if prior else None,
                 "latest_rate": latest["rate_of_sale_by_guest_count"],
+                "prior_rate": prior["rate_of_sale_by_guest_count"] if prior else None,
+                "rate_change": (
+                    latest["rate_of_sale_by_guest_count"] - prior["rate_of_sale_by_guest_count"]
+                    if prior
+                    else None
+                ),
                 "latest_ticket_time_seconds": latest["average_ticket_time_seconds"],
+                "prior_ticket_time_seconds": (
+                    prior["average_ticket_time_seconds"] if prior else None
+                ),
+                "ticket_time_change_minutes": (
+                    (latest["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
+                    if prior
+                    else None
+                ),
             }
         )
 
     summary.sort(key=lambda row: (row["location"], -row["weighted_check_average"], row["display_name"]))
     return summary
+
+
+def style_title(ws, title: str, end_col: int) -> None:
+    ws.sheet_view.showGridLines = False
+    ws.cell(row=1, column=1, value=title)
+    ws.cell(row=1, column=1).font = Font(size=16, bold=True, color="FFFFFF")
+    ws.cell(row=1, column=1).fill = PatternFill("solid", fgColor="7A1E1E")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
+
+
+def style_section_header(ws, row: int, start_col: int, end_col: int, label: str) -> None:
+    for col in range(start_col, end_col + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = PatternFill("solid", fgColor="E1E1E1")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.cell(row=row, column=start_col, value=label)
+
+
+def apply_dashboard_number_formats(ws, row_start: int, row_end: int) -> None:
+    for row in range(row_start, row_end + 1):
+        for col in range(1, ws.max_column + 1):
+            header = str(ws.cell(row=row_start - 1, column=col).value or "")
+            cell = ws.cell(row=row, column=col)
+            if "Date" in header or "Week End" in header:
+                cell.number_format = "m/d/yyyy"
+            elif "Wine %" in header:
+                cell.number_format = "0.00%"
+            elif "Rate" in header:
+                cell.number_format = "0.00"
+            elif "Ticket Time Change (Min)" in header:
+                cell.number_format = "0.0"
+            elif "Ticket Time" in header:
+                cell.number_format = "[h]:mm:ss"
+            elif "Gross Sales" in header or "Check Average" in header or "Wine Sales" in header:
+                cell.number_format = "$#,##0.00"
+            elif "Guest" in header or "Rank" in header:
+                cell.number_format = "#,##0"
+
+
+def write_dashboard_sheet(
+    wb: Workbook,
+    records: list[MetricRecord],
+    weekly_location_rows: list[dict[str, Any]],
+    ranked_rows: list[dict[str, Any]],
+    source_dir: Path,
+    public_start: date,
+    public_end: date,
+) -> None:
+    ws = wb.create_sheet("Dashboard", 0)
+    style_title(ws, "Red Onion Weekly Performance Dashboard", 12)
+    ws.freeze_panes = "A4"
+    for col, width in {
+        "A": 18,
+        "B": 18,
+        "C": 16,
+        "D": 16,
+        "E": 16,
+        "F": 14,
+        "G": 14,
+        "H": 16,
+        "I": 16,
+        "J": 16,
+        "K": 16,
+        "L": 18,
+    }.items():
+        ws.column_dimensions[col].width = width
+
+    dates = sorted({record.report_date for record in records})
+    latest_week_end = max(row["week_end"] for row in weekly_location_rows)
+    latest_location_rows = [
+        row for row in weekly_location_rows if row["week_end"] == latest_week_end
+    ]
+    prior_week_end = max(
+        (row["week_end"] for row in weekly_location_rows if row["week_end"] < latest_week_end),
+        default=None,
+    )
+    prior_by_location = {
+        row["location"]: row
+        for row in weekly_location_rows
+        if prior_week_end and row["week_end"] == prior_week_end
+    }
+
+    summary_rows = [
+        ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Source Folder", str(source_dir)),
+        ("Raw Reports Read", len({record.source_file for record in records})),
+        ("Date Coverage", format_date_range(min(dates), max(dates))),
+        ("Public Snapshot Dates", format_date_range(public_start, public_end)),
+        ("Weeks Tracked", len({row["week_end"] for row in weekly_location_rows})),
+    ]
+    style_section_header(ws, 3, 1, 2, "Run Summary")
+    for row_index, (label, value) in enumerate(summary_rows, start=4):
+        ws.cell(row=row_index, column=1, value=label).font = Font(bold=True)
+        ws.cell(row=row_index, column=2, value=value)
+        ws.cell(row=row_index, column=2).alignment = Alignment(wrap_text=True)
+
+    start_row = 3
+    start_col = 4
+    headers = [
+        "Week End",
+        "Location",
+        "Gross Sales",
+        "Guest Count",
+        "Check Average",
+        "Check Average Change",
+        "Wine %",
+        "Wine % Change",
+        "Rate",
+        "Rate Change",
+        "Ticket Time",
+        "Ticket Time Change (Min)",
+    ]
+    for offset, header in enumerate(headers):
+        cell = ws.cell(row=start_row, column=start_col + offset, value=header)
+        cell.fill = PatternFill("solid", fgColor="E1E1E1")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_offset, row in enumerate(
+        sorted(latest_location_rows, key=lambda item: item["location"]), start=1
+    ):
+        prior = prior_by_location.get(row["location"])
+        values = [
+            row["week_end"],
+            row["location"],
+            row["gross_sales"],
+            row["guest_count"],
+            row["check_average"],
+            row["check_average"] - prior["check_average"] if prior else None,
+            row["wine_pct"],
+            row["wine_pct"] - prior["wine_pct"] if prior else None,
+            row["rate_of_sale_by_guest_count"],
+            row["rate_of_sale_by_guest_count"] - prior["rate_of_sale_by_guest_count"]
+            if prior
+            else None,
+            duration_fraction(row["average_ticket_time_seconds"]),
+            (row["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
+            if prior
+            else None,
+        ]
+        for col_offset, value in enumerate(values):
+            ws.cell(row=start_row + row_offset, column=start_col + col_offset, value=value)
+    apply_dashboard_number_formats(ws, start_row + 1, start_row + len(latest_location_rows))
+
+    latest_ranked = [row for row in ranked_rows if row["week_end"] == latest_week_end]
+    leaderboard_sections = [
+        (
+            "Highest Check Average",
+            lambda rows: sorted(
+                rows,
+                key=lambda row: (row.get("check_average_rank") or 9999, row["display_name"]),
+            )[:3],
+            "Check Average",
+            "check_average",
+            "$#,##0.00",
+        ),
+        (
+            "Highest Wine %",
+            lambda rows: sorted(
+                rows,
+                key=lambda row: (row.get("wine_pct_rank") or 9999, row["display_name"]),
+            )[:3],
+            "Wine %",
+            "wine_pct",
+            "0.00%",
+        ),
+        (
+            "Best Rate Of Sale",
+            lambda rows: sorted(
+                rows,
+                key=lambda row: (row.get("rate_rank") or 9999, row["display_name"]),
+            )[:3],
+            "Rate",
+            "rate_of_sale_by_guest_count",
+            "0.00",
+        ),
+        (
+            "Fastest Ticket Time",
+            lambda rows: sorted(
+                rows,
+                key=lambda row: (row.get("ticket_time_rank") or 9999, row["display_name"]),
+            )[:3],
+            "Ticket Time",
+            "average_ticket_time_seconds",
+            "[h]:mm:ss",
+        ),
+    ]
+
+    table_row = 12
+    for title, selector, value_label, value_field, number_format in leaderboard_sections:
+        style_section_header(ws, table_row, 1, 6, title)
+        for col, header in enumerate(["Location", "Rank", "Server", "Guest Count", value_label, "Active Days"], start=1):
+            cell = ws.cell(row=table_row + 1, column=col, value=header)
+            cell.fill = PatternFill("solid", fgColor="F3F4F6")
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        write_row = table_row + 2
+        for location in sorted({row["location"] for row in latest_ranked}):
+            rows = [
+                row
+                for row in latest_ranked
+                if row["location"] == location and row.get("guest_count", 0) > 0
+            ]
+            for selected in selector(rows):
+                if value_field == "average_ticket_time_seconds":
+                    value = duration_fraction(selected[value_field])
+                else:
+                    value = selected[value_field]
+                rank_key = {
+                    "check_average": "check_average_rank",
+                    "wine_pct": "wine_pct_rank",
+                    "rate_of_sale_by_guest_count": "rate_rank",
+                    "average_ticket_time_seconds": "ticket_time_rank",
+                }[value_field]
+                ws.cell(row=write_row, column=1, value=location)
+                ws.cell(row=write_row, column=2, value=selected.get(rank_key))
+                ws.cell(row=write_row, column=3, value=selected["display_name"])
+                ws.cell(row=write_row, column=4, value=selected["guest_count"])
+                ws.cell(row=write_row, column=5, value=value)
+                ws.cell(row=write_row, column=6, value=selected["active_days"])
+                ws.cell(row=write_row, column=5).number_format = number_format
+                write_row += 1
+        table_row = write_row + 2
+
+    if latest_location_rows:
+        chart_ws = wb.create_sheet("_Dashboard Chart Data")
+        chart_ws.sheet_state = "hidden"
+        chart_anchor_row = 10
+        helper_row = chart_anchor_row
+        helper_location_col = 1
+        helper_value_col = 2
+        chart_ws.cell(row=helper_row, column=helper_location_col, value="Location")
+        chart_ws.cell(row=helper_row, column=helper_value_col, value="Check Average")
+        for index, row in enumerate(sorted(latest_location_rows, key=lambda item: item["location"]), start=1):
+            chart_ws.cell(row=helper_row + index, column=helper_location_col, value=row["location"])
+            chart_ws.cell(row=helper_row + index, column=helper_value_col, value=row["check_average"])
+            chart_ws.cell(row=helper_row + index, column=helper_value_col).number_format = "$#,##0.00"
+        chart = BarChart()
+        chart.type = "col"
+        chart.title = "Latest Check Average By Location"
+        chart.y_axis.title = "Check Average"
+        chart.x_axis.title = "Location"
+        data = Reference(chart_ws, min_col=helper_value_col, min_row=helper_row, max_row=helper_row + len(latest_location_rows))
+        cats = Reference(chart_ws, min_col=helper_location_col, min_row=helper_row + 1, max_row=helper_row + len(latest_location_rows))
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        chart.height = 7
+        chart.width = 13
+        ws.add_chart(chart, "H12")
+
+
+def write_data_quality_sheet(
+    wb: Workbook,
+    records: list[MetricRecord],
+    weekly_location_rows: list[dict[str, Any]],
+) -> None:
+    source_groups: dict[str, list[MetricRecord]] = defaultdict(list)
+    for record in records:
+        source_groups[record.source_file].append(record)
+
+    source_headers = [
+        "Source File",
+        "Report Date",
+        "Locations Found",
+        "Server Rows",
+        "Location Total Rows",
+        "Status",
+    ]
+    source_rows: list[list[Any]] = []
+    for source_file, source_records in sorted(source_groups.items()):
+        locations = sorted({record.location for record in source_records})
+        source_rows.append(
+            [
+                source_file,
+                min(record.report_date for record in source_records),
+                ", ".join(locations),
+                sum(1 for record in source_records if not record.is_location_total),
+                sum(1 for record in source_records if record.is_location_total),
+                "OK" if len(locations) >= 2 else "Review",
+            ]
+        )
+
+    ws = wb.create_sheet("Data Quality")
+    style_title(ws, "Data Quality Checks", len(source_headers))
+    ws.freeze_panes = "A4"
+    for col_index, header in enumerate(source_headers, start=1):
+        cell = ws.cell(row=3, column=col_index, value=header)
+        cell.fill = PatternFill("solid", fgColor="E1E1E1")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_index, row in enumerate(source_rows, start=4):
+        for col_index, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_index, column=col_index, value=value)
+            if col_index == 2:
+                cell.number_format = "m/d/yyyy"
+    if source_rows:
+        ref = f"A3:{get_column_letter(len(source_headers))}{len(source_rows) + 3}"
+        table = Table(displayName="DataQualitySources", ref=ref)
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+        ws.add_table(table)
+
+    for col, width in {"A": 56, "B": 14, "C": 30, "D": 14, "E": 18, "F": 14}.items():
+        ws.column_dimensions[col].width = width
+
+    all_dates = sorted({record.report_date for record in records})
+    check_row = len(source_rows) + 6
+    style_section_header(ws, check_row, 1, 4, "Date Coverage")
+    date_headers = ["Date", "Status", "Locations With Totals", "Source Files"]
+    for col_index, header in enumerate(date_headers, start=1):
+        cell = ws.cell(row=check_row + 1, column=col_index, value=header)
+        cell.fill = PatternFill("solid", fgColor="F3F4F6")
+        cell.font = Font(bold=True)
+    expected_dates = []
+    if all_dates:
+        current = min(all_dates)
+        while current <= max(all_dates):
+            expected_dates.append(current)
+            current += timedelta(days=1)
+
+    location_totals_by_date: dict[date, set[str]] = defaultdict(set)
+    source_files_by_date: dict[date, set[str]] = defaultdict(set)
+    for record in records:
+        if record.is_location_total:
+            location_totals_by_date[record.report_date].add(record.location)
+        source_files_by_date[record.report_date].add(record.source_file)
+
+    for offset, report_date in enumerate(expected_dates, start=2):
+        row_index = check_row + offset
+        status = "OK" if report_date in all_dates else "Missing"
+        ws.cell(row=row_index, column=1, value=report_date).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=2, value=status)
+        ws.cell(
+            row=row_index,
+            column=3,
+            value=", ".join(sorted(location_totals_by_date.get(report_date, set()))),
+        )
+        ws.cell(
+            row=row_index,
+            column=4,
+            value=", ".join(sorted(source_files_by_date.get(report_date, set()))),
+        )
+        if status == "Missing":
+            ws.cell(row=row_index, column=2).fill = PatternFill("solid", fgColor="F4CCCC")
+
+    location_check_row = check_row + len(expected_dates) + 5
+    style_section_header(ws, location_check_row, 1, 5, "Weekly Location Coverage")
+    loc_headers = ["Week End", "Location", "Active Days", "Source Days", "Status"]
+    for col_index, header in enumerate(loc_headers, start=1):
+        cell = ws.cell(row=location_check_row + 1, column=col_index, value=header)
+        cell.fill = PatternFill("solid", fgColor="F3F4F6")
+        cell.font = Font(bold=True)
+    for offset, row in enumerate(sorted(weekly_location_rows, key=lambda item: (item["week_end"], item["location"])), start=2):
+        row_index = location_check_row + offset
+        status = "OK" if row["source_days"] >= 5 else "Short Week"
+        ws.cell(row=row_index, column=1, value=row["week_end"]).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=2, value=row["location"])
+        ws.cell(row=row_index, column=3, value=row["active_days"])
+        ws.cell(row=row_index, column=4, value=row["source_days"])
+        ws.cell(row=row_index, column=5, value=status)
+        if status != "OK":
+            ws.cell(row=row_index, column=5).fill = PatternFill("solid", fgColor="FFF2CC")
 
 
 def write_master_workbook(
@@ -654,10 +1223,24 @@ def write_master_workbook(
     public_end: date,
 ) -> Path:
     weekly_server_rows, weekly_location_rows = weekly_rollups(records)
+    rank_min_guest_count = int(
+        config.get("master_min_guest_count_for_rankings", config.get("public_min_guest_count", 1))
+    )
+    ranked_rows = weekly_server_rank_rows(weekly_server_rows, rank_min_guest_count)
+    server_trend_detail_rows = server_week_trend_rows(ranked_rows)
     trend_rows = trend_summary_rows(weekly_server_rows)
 
     wb = Workbook()
     wb.remove(wb.active)
+    write_dashboard_sheet(
+        wb,
+        records,
+        weekly_location_rows,
+        ranked_rows,
+        source_dir,
+        public_start,
+        public_end,
+    )
 
     server_headers = [
         "Week Start",
@@ -698,6 +1281,121 @@ def write_master_workbook(
         )
     ]
     write_table_sheet(wb, "Weekly Server Metrics", server_headers, server_data, "WeeklyServerMetrics")
+
+    ranking_headers = [
+        "Week Start",
+        "Week End",
+        "Location",
+        "Raw Server",
+        "Display Name",
+        "Guest Count",
+        "Check Average",
+        "Check Average Rank",
+        "Wine %",
+        "Wine % Rank",
+        "Rate of Sale by Guest Count",
+        "Rate Rank",
+        "Average Ticket Time",
+        "Ticket Time Rank",
+        "Active Days",
+    ]
+    ranking_data = [
+        [
+            row["week_start"],
+            row["week_end"],
+            row["location"],
+            row["raw_user_name"],
+            row["display_name"],
+            row["guest_count"],
+            row["check_average"],
+            row["check_average_rank"],
+            row["wine_pct"],
+            row["wine_pct_rank"],
+            row["rate_of_sale_by_guest_count"],
+            row["rate_rank"],
+            duration_fraction(row["average_ticket_time_seconds"]),
+            row["ticket_time_rank"],
+            row["active_days"],
+        ]
+        for row in ranked_rows
+    ]
+    write_table_sheet(
+        wb,
+        "Weekly Server Rankings",
+        ranking_headers,
+        ranking_data,
+        "WeeklyServerRankings",
+        widths={"A": 14, "B": 14, "C": 22, "D": 28, "E": 28, "K": 22, "M": 18},
+    )
+
+    trend_detail_headers = [
+        "Week Start",
+        "Week End",
+        "Location",
+        "Raw Server",
+        "Display Name",
+        "Guest Count",
+        "Check Average",
+        "Check Average Rank",
+        "Check Average Change",
+        "Wine %",
+        "Wine % Rank",
+        "Wine % Change",
+        "Rate of Sale by Guest Count",
+        "Rate Rank",
+        "Rate Change",
+        "Average Ticket Time",
+        "Ticket Time Rank",
+        "Ticket Time Change (Min)",
+        "Active Days",
+        "Trend Note",
+    ]
+    trend_detail_data = [
+        [
+            row["week_start"],
+            row["week_end"],
+            row["location"],
+            row["raw_user_name"],
+            row["display_name"],
+            row["guest_count"],
+            row["check_average"],
+            row["check_average_rank"],
+            row["check_average_change"],
+            row["wine_pct"],
+            row["wine_pct_rank"],
+            row["wine_pct_change"],
+            row["rate_of_sale_by_guest_count"],
+            row["rate_rank"],
+            row["rate_change"],
+            duration_fraction(row["average_ticket_time_seconds"]),
+            row["ticket_time_rank"],
+            row["ticket_time_change_minutes"],
+            row["active_days"],
+            row["trend_note"],
+        ]
+        for row in server_trend_detail_rows
+    ]
+    write_table_sheet(
+        wb,
+        "Server Week Trends",
+        trend_detail_headers,
+        trend_detail_data,
+        "ServerWeekTrends",
+        widths={
+            "A": 14,
+            "B": 14,
+            "C": 22,
+            "D": 28,
+            "E": 28,
+            "I": 20,
+            "L": 16,
+            "M": 22,
+            "O": 14,
+            "P": 18,
+            "R": 20,
+            "T": 16,
+        },
+    )
 
     location_headers = [
         "Week Start",
@@ -810,6 +1508,7 @@ def write_master_workbook(
         "Raw Server",
         "Display Name",
         "Weeks Tracked",
+        "Active Days Tracked",
         "Total Gross Sales",
         "Total Guest Count",
         "Weighted Check Average",
@@ -817,11 +1516,21 @@ def write_master_workbook(
         "Wine %",
         "Rate of Sale by Guest Count",
         "Average Ticket Time",
+        "First Week End",
         "Latest Week End",
+        "Prior Week End",
         "Latest Check Average",
+        "Prior Check Average",
+        "Check Average Change",
         "Latest Wine %",
+        "Prior Wine %",
+        "Wine % Change",
         "Latest Rate of Sale by Guest Count",
+        "Prior Rate of Sale by Guest Count",
+        "Rate Change",
         "Latest Ticket Time",
+        "Prior Ticket Time",
+        "Ticket Time Change (Min)",
     ]
     trend_data = [
         [
@@ -829,6 +1538,7 @@ def write_master_workbook(
             row["raw_user_name"],
             row["display_name"],
             row["weeks_tracked"],
+            row["active_days_tracked"],
             row["total_gross_sales"],
             row["total_guest_count"],
             row["weighted_check_average"],
@@ -836,11 +1546,23 @@ def write_master_workbook(
             row["overall_wine_pct"],
             row["weighted_rate"],
             duration_fraction(row["weighted_ticket_time_seconds"]),
+            row["first_week_end"],
             row["latest_week_end"],
+            row["prior_week_end"],
             row["latest_check_average"],
+            row["prior_check_average"],
+            row["check_average_change"],
             row["latest_wine_pct"],
+            row["prior_wine_pct"],
+            row["wine_pct_change"],
             row["latest_rate"],
+            row["prior_rate"],
+            row["rate_change"],
             duration_fraction(row["latest_ticket_time_seconds"]),
+            duration_fraction(row["prior_ticket_time_seconds"])
+            if row["prior_ticket_time_seconds"] is not None
+            else None,
+            row["ticket_time_change_minutes"],
         ]
         for row in trend_rows
     ]
@@ -850,10 +1572,25 @@ def write_master_workbook(
         trend_headers,
         trend_data,
         "ServerTrendSummary",
-        widths={"A": 22, "B": 28, "C": 28, "D": 14, "J": 20, "K": 18, "O": 24, "P": 18},
+        widths={
+            "A": 22,
+            "B": 28,
+            "C": 28,
+            "D": 14,
+            "E": 18,
+            "K": 22,
+            "L": 18,
+            "R": 20,
+            "U": 16,
+            "V": 24,
+            "X": 14,
+            "AA": 22,
+        },
     )
 
-    notes = wb.create_sheet("Run Notes", 0)
+    write_data_quality_sheet(wb, records, weekly_location_rows)
+
+    notes = wb.create_sheet("Run Notes", 1)
     notes.sheet_view.showGridLines = False
     notes.column_dimensions["A"].width = 28
     notes.column_dimensions["B"].width = 90
@@ -868,6 +1605,9 @@ def write_master_workbook(
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
         ("Public Exclude Patterns", ", ".join(config.get("public_exclude_name_contains", []))),
+        ("Ranking Minimum Guest Count", rank_min_guest_count),
+        ("Dashboard", "Dashboard summarizes latest weekly location results and current server leaders."),
+        ("Trend Tabs", "Weekly Server Rankings ranks each metric by week/location; Server Week Trends adds week-over-week changes."),
         ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
         ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
     ]

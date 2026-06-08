@@ -128,12 +128,31 @@ Public exclusions are controlled by `red_onion_config.json`. Excluded names are 
 
 The master workbook is rebuilt from every raw daily report found in `source_daily_reports`. It includes rows excluded from public posting so store performance remains accurate.
 
+The master workbook includes these tabs:
+
+- `Dashboard`: latest weekly location results, current server leaderboards, and a quick check average chart.
+- `Run Notes`: source folder, date coverage, public snapshot dates, exclusions, and metric rules.
+- `Weekly Server Metrics`: one weekly rollup row per server/location.
+- `Weekly Server Rankings`: weekly server rankings for check average, wine percentage, rate of sale, and ticket time.
+- `Server Week Trends`: week-over-week server changes, rank movement context, and a trend note.
+- `Weekly Location Metrics`: one weekly rollup row per location.
+- `Daily Server Detail`: daily source rows by server.
+- `Daily Location Detail`: daily source rows by location.
+- `Server Trend Summary`: all-time server summary plus latest/prior week comparisons.
+- `Data Quality`: source file, date coverage, and location coverage checks.
+
 Calculated metrics use these rollup rules:
 
 - Check average = total gross sales / total guest count.
 - Wine percentage = total wine sales / total gross sales.
 - Rate of sale by guest count = guest-weighted average of the daily rate, displayed as a decimal to match the raw report. Lower values are better.
 - Average ticket time = guest-weighted average of the daily ticket time.
+
+Ranking logic:
+
+- Check average and wine percentage rank highest value as best.
+- Rate of sale by guest count and ticket time rank lowest value as best.
+- Rankings use `master_min_guest_count_for_rankings` from `red_onion_config.json` if present. If that setting is not present, the program uses `public_min_guest_count`.
 
 ## Config Updates
 

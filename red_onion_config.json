@@ -8,6 +8,7 @@
     }
   },
   "public_min_guest_count": 1,
+  "master_min_guest_count_for_rankings": 1,
   "public_name_aliases": {
     "Bar 1 Bar 1": "Bar",
     "Bar Server": "Bar",
