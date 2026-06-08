@@ -9,6 +9,10 @@
   },
   "public_min_guest_count": 1,
   "master_min_guest_count_for_rankings": 1,
+  "dashboard_exclude_name_contains": [
+    "Banquet",
+    "Server"
+  ],
   "public_name_aliases": {
     "Bar 1 Bar 1": "Bar",
     "Bar Server": "Bar",

@@ -160,6 +160,8 @@ Edit `red_onion_config.json` to adjust:
 
 - Location short codes used in public file names.
 - Minimum guest count for public posting.
+- Minimum guest count for internal master rankings.
+- Names or name fragments to keep out of the Dashboard leaderboards.
 - Public display aliases such as `Bar 1 Bar 1` to `Bar`.
 - Names or name fragments to keep out of the public competition snapshot.
 

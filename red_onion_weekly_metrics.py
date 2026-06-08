@@ -23,6 +23,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "RC Virginia Beach": {"short_code": "VB"},
     },
     "public_min_guest_count": 1,
+    "master_min_guest_count_for_rankings": 1,
+    "dashboard_exclude_name_contains": ["Banquet", "Server"],
     "public_name_aliases": {
         "Bar 1 Bar 1": "Bar",
         "Bar Server": "Bar",
@@ -326,6 +328,14 @@ def public_excluded(row: dict[str, Any], config: dict[str, Any]) -> bool:
         return True
     haystack = f"{row.get('raw_user_name', '')} {row.get('display_name', '')}".casefold()
     for pattern in config.get("public_exclude_name_contains", []):
+        if str(pattern).casefold() in haystack:
+            return True
+    return False
+
+
+def dashboard_excluded(row: dict[str, Any], config: dict[str, Any]) -> bool:
+    haystack = str(row.get("display_name") or row.get("raw_user_name", "")).casefold()
+    for pattern in config.get("dashboard_exclude_name_contains", []):
         if str(pattern).casefold() in haystack:
             return True
     return False
@@ -896,6 +906,7 @@ def write_dashboard_sheet(
     records: list[MetricRecord],
     weekly_location_rows: list[dict[str, Any]],
     ranked_rows: list[dict[str, Any]],
+    config: dict[str, Any],
     source_dir: Path,
     public_start: date,
     public_end: date,
@@ -959,8 +970,8 @@ def write_dashboard_sheet(
         "Check Average Change",
         "Wine %",
         "Wine % Change",
-        "Rate",
-        "Rate Change",
+        "Rate of Sale by Guest Count",
+        "Rate of Sale Change",
         "Ticket Time",
         "Ticket Time Change (Min)",
     ]
@@ -995,7 +1006,11 @@ def write_dashboard_sheet(
             ws.cell(row=start_row + row_offset, column=start_col + col_offset, value=value)
     apply_dashboard_number_formats(ws, start_row + 1, start_row + len(latest_location_rows))
 
-    latest_ranked = [row for row in ranked_rows if row["week_end"] == latest_week_end]
+    latest_ranked = [
+        row
+        for row in ranked_rows
+        if row["week_end"] == latest_week_end and not dashboard_excluded(row, config)
+    ]
     leaderboard_sections = [
         (
             "Highest Check Average",
@@ -1018,12 +1033,12 @@ def write_dashboard_sheet(
             "0.00%",
         ),
         (
-            "Best Rate Of Sale",
+            "Best Rate of Sale by Guest Count",
             lambda rows: sorted(
                 rows,
                 key=lambda row: (row.get("rate_rank") or 9999, row["display_name"]),
             )[:3],
-            "Rate",
+            "Rate of Sale by Guest Count",
             "rate_of_sale_by_guest_count",
             "0.00",
         ),
@@ -1054,19 +1069,13 @@ def write_dashboard_sheet(
                 for row in latest_ranked
                 if row["location"] == location and row.get("guest_count", 0) > 0
             ]
-            for selected in selector(rows):
+            for visible_rank, selected in enumerate(selector(rows), start=1):
                 if value_field == "average_ticket_time_seconds":
                     value = duration_fraction(selected[value_field])
                 else:
                     value = selected[value_field]
-                rank_key = {
-                    "check_average": "check_average_rank",
-                    "wine_pct": "wine_pct_rank",
-                    "rate_of_sale_by_guest_count": "rate_rank",
-                    "average_ticket_time_seconds": "ticket_time_rank",
-                }[value_field]
                 ws.cell(row=write_row, column=1, value=location)
-                ws.cell(row=write_row, column=2, value=selected.get(rank_key))
+                ws.cell(row=write_row, column=2, value=visible_rank)
                 ws.cell(row=write_row, column=3, value=selected["display_name"])
                 ws.cell(row=write_row, column=4, value=selected["guest_count"])
                 ws.cell(row=write_row, column=5, value=value)
@@ -1237,6 +1246,7 @@ def write_master_workbook(
         records,
         weekly_location_rows,
         ranked_rows,
+        config,
         source_dir,
         public_start,
         public_end,
@@ -1605,6 +1615,7 @@ def write_master_workbook(
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
         ("Public Exclude Patterns", ", ".join(config.get("public_exclude_name_contains", []))),
+        ("Dashboard Exclude Patterns", ", ".join(config.get("dashboard_exclude_name_contains", []))),
         ("Ranking Minimum Guest Count", rank_min_guest_count),
         ("Dashboard", "Dashboard summarizes latest weekly location results and current server leaders."),
         ("Trend Tabs", "Weekly Server Rankings ranks each metric by week/location; Server Week Trends adds week-over-week changes."),
