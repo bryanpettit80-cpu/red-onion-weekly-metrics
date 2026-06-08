@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+debug.log
+
+# Excel source data and generated workbooks are business data, not source code.
+*.xls
+*.xlsx
+~$*.xlsx
+
+# Keep the standard workflow folders in GitHub, but ignore their contents.
+outputs/*
+!outputs/.gitkeep
+source_daily_reports/*
+!source_daily_reports/.gitkeep
+sample_outputs/*
+!sample_outputs/.gitkeep

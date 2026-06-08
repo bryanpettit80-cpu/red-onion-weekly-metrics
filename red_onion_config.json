@@ -1,0 +1,30 @@
+{
+  "locations": {
+    "RC Richmond": {
+      "short_code": "RVA"
+    },
+    "RC Virginia Beach": {
+      "short_code": "VB"
+    }
+  },
+  "public_min_guest_count": 1,
+  "public_name_aliases": {
+    "Bar 1 Bar 1": "Bar",
+    "Bar Server": "Bar",
+    "BarPatio Bartender Patio": "Patio"
+  },
+  "public_exclude_name_contains": [
+    "Banquet",
+    "Takeout",
+    "Server Server",
+    "Jonathan Josephs",
+    "Sean Kelly",
+    "Bryan Pettit",
+    "Christina Rivera",
+    "Paul Sorensen",
+    "Paula Friedrich",
+    "Cicily McFadden",
+    "AGM",
+    "manager"
+  ]
+}
