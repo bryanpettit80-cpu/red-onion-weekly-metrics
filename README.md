@@ -59,7 +59,7 @@ That keeps Dropbox clean and lets the same synced project run on different compu
 C:\Users\<your user>\Dropbox\Red Onion Metrics\source_daily_reports
 ```
 
-2. Keep historical raw files in `source_daily_reports` if you want the master workbook to keep long-term history.
+2. Keep historical raw files in `source_daily_reports` if you want the master workbook to keep long-term history. The reporting week is Tuesday through Sunday because Red Onion is closed on Mondays.
 
 3. Open PowerShell.
 
@@ -88,12 +88,12 @@ C:\Users\<your user>\Dropbox\Red Onion Metrics\outputs
 The program reads files in `source_daily_reports` named like:
 
 ```text
-Daily Report - TM (Auto-Run) - Marketing Vitals - 06-08-2026.xls
+Daily Report - TM (Auto-Run) - Marketing Vitals - 06-10-2026.xls
 ```
 
-The filename must start with `Daily Report` and end with `.xls`.
+The filename must start with `Daily Report` and end with `.xls`. The script uses the `Date(s)` value inside the raw workbook as the report date; the filename date is only a fallback. Toast filenames may be one day after the report date.
 
-The weekly public snapshot uses the latest report date found in the source folder and builds the prior 7-day window from the available files. The master workbook rebuilds from every raw daily report found in `source_daily_reports`.
+The weekly public snapshot uses the latest Tuesday-Sunday operating report date found in the source folder and builds the Tuesday-Sunday reporting week that contains it. Mondays are closed and are excluded from public snapshots and weekly rollups. The master workbook rebuilds from every raw daily report found in `source_daily_reports`, while its weekly tabs use Tuesday-Sunday operating weeks.
 
 ## Outputs
 
@@ -102,6 +102,8 @@ The run creates or replaces:
 - `outputs\Check_Wine_RVA<week_end>.xlsx`
 - `outputs\Check_Wine_VB<week_end>.xlsx`
 - `outputs\Red_Onion_Server_Master.xlsx`
+
+The public `week_end` date is the Sunday at the end of the Tuesday-Sunday reporting week.
 
 Close any open output workbook before rerunning. Excel lock files can prevent the script from replacing an open workbook.
 
@@ -126,7 +128,7 @@ Public exclusions are controlled by `red_onion_config.json`. Excluded names are 
 
 ## Master Workbook Logic
 
-The master workbook is rebuilt from every raw daily report found in `source_daily_reports`. It includes rows excluded from public posting so store performance remains accurate.
+The master workbook is rebuilt from every raw daily report found in `source_daily_reports`. It includes rows excluded from public posting so store performance remains accurate. Weekly rollup tabs use Tuesday-Sunday operating weeks and exclude closed Mondays.
 
 The master workbook includes these tabs:
 
@@ -139,7 +141,7 @@ The master workbook includes these tabs:
 - `Daily Server Detail`: daily source rows by server.
 - `Daily Location Detail`: daily source rows by location.
 - `Server Trend Summary`: all-time server summary plus latest/prior week comparisons.
-- `Data Quality`: source file, date coverage, and location coverage checks.
+- `Data Quality`: source file, operating-date coverage, and location coverage checks. A complete reporting week expects six operating source days, Tuesday through Sunday.
 
 Calculated metrics use these rollup rules:
 
@@ -179,4 +181,4 @@ powershell -ExecutionPolicy Bypass -File ".\Run-WeeklySnapshot.ps1"
 
 If an output file cannot be replaced, close the workbook in Excel and rerun the script.
 
-If a source file is missing from the master workbook, confirm it is in `source_daily_reports`, starts with `Daily Report`, ends with `.xls`, and has synced locally in Dropbox.
+If a source file is missing from the master workbook, confirm it is in `source_daily_reports`, starts with `Daily Report`, ends with `.xls`, and has synced locally in Dropbox. Closed Mondays are not required for the weekly public snapshot.

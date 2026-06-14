@@ -42,6 +42,11 @@ METRICS = [
     ("average_ticket_time", "Average Ticket Time"),
 ]
 
+OPERATING_WEEK_START_WEEKDAY = 1  # Tuesday; date.weekday() uses Monday=0.
+OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
+OPERATING_WEEK_DAYS = 6
+OPERATING_WEEK_LABEL = "Tuesday-Sunday"
+
 
 @dataclass(frozen=True)
 class MetricRecord:
@@ -224,9 +229,14 @@ def read_all_reports(input_dir: Path, config: dict[str, Any]) -> list[MetricReco
     return records
 
 
+def is_operating_day(day: date) -> bool:
+    return OPERATING_WEEK_START_WEEKDAY <= day.weekday() <= OPERATING_WEEK_END_WEEKDAY
+
+
 def week_period_for(day: date) -> tuple[date, date]:
-    week_start = day - timedelta(days=day.weekday())
-    return week_start, week_start + timedelta(days=6)
+    days_since_start = (day.weekday() - OPERATING_WEEK_START_WEEKDAY) % 7
+    week_start = day - timedelta(days=days_since_start)
+    return week_start, week_start + timedelta(days=OPERATING_WEEK_DAYS - 1)
 
 
 def selected_public_dates(
@@ -235,18 +245,20 @@ def selected_public_dates(
     all_dates = sorted({record.report_date for record in records})
     if not all_dates:
         raise ValueError("No report dates were found.")
+    operating_dates = [report_date for report_date in all_dates if is_operating_day(report_date)]
+    if not operating_dates:
+        raise ValueError("No Tuesday-Sunday operating report dates were found.")
 
     if week_start and week_end:
         return date.fromisoformat(week_start), date.fromisoformat(week_end)
     if week_start:
         start = date.fromisoformat(week_start)
-        return start, start + timedelta(days=6)
+        return start, start + timedelta(days=OPERATING_WEEK_DAYS - 1)
     if week_end:
         end = date.fromisoformat(week_end)
-        return end - timedelta(days=6), end
+        return end - timedelta(days=OPERATING_WEEK_DAYS - 1), end
 
-    end = max(all_dates)
-    return end - timedelta(days=6), end
+    return week_period_for(max(operating_dates))
 
 
 def aggregate_records(
@@ -460,6 +472,8 @@ def write_public_workbook(
     selected_records: list[MetricRecord],
     output_dir: Path,
     config: dict[str, Any],
+    public_start: date,
+    public_end: date,
 ) -> Path:
     actual_start = min(record.report_date for record in selected_records)
     actual_end = max(record.report_date for record in selected_records)
@@ -484,7 +498,8 @@ def write_public_workbook(
     bullet = "\u25cf"
     ws["A1"] = (
         "FILTERS\n"
-        f"  {bullet}  Date(s):  {format_date_range(actual_start, actual_end)}\n"
+        f"  {bullet}  Week:  {format_date_range(public_start, public_end)} ({OPERATING_WEEK_LABEL})\n"
+        f"  {bullet}  Source Date(s):  {format_date_range(actual_start, actual_end)}\n"
         f"  {bullet}  Location Type:  Store\n"
         f"  {bullet}  Locations:  {location}"
     )
@@ -509,9 +524,9 @@ def write_public_workbook(
     last_row = max(2, len(rows_to_write) + 2)
     style_public_sheet(ws, last_row)
     apply_public_metric_highlights(ws, last_row)
-    write_report_definition(wb.create_sheet("Report Definition"), location, actual_start, actual_end)
+    write_report_definition(wb.create_sheet("Report Definition"), location, public_start, public_end)
 
-    output_path = output_dir / f"Check_Wine_{short_code}{actual_end:%m%d%y}.xlsx"
+    output_path = output_dir / f"Check_Wine_{short_code}{public_end:%m%d%y}.xlsx"
     wb.save(output_path)
     return output_path
 
@@ -610,6 +625,8 @@ def write_table_sheet(
 def weekly_rollups(records: list[MetricRecord]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     grouped: dict[tuple[date, date], list[MetricRecord]] = defaultdict(list)
     for record in records:
+        if not is_operating_day(record.report_date):
+            continue
         grouped[week_period_for(record.report_date)].append(record)
 
     server_rows: list[dict[str, Any]] = []
@@ -1115,6 +1132,8 @@ def write_data_quality_sheet(
     wb: Workbook,
     records: list[MetricRecord],
     weekly_location_rows: list[dict[str, Any]],
+    public_start: date,
+    public_end: date,
 ) -> None:
     source_groups: dict[str, list[MetricRecord]] = defaultdict(list)
     for record in records:
@@ -1174,9 +1193,11 @@ def write_data_quality_sheet(
         cell.font = Font(bold=True)
     expected_dates = []
     if all_dates:
-        current = min(all_dates)
-        while current <= max(all_dates):
-            expected_dates.append(current)
+        current = min(min(all_dates), public_start)
+        coverage_end = max(max(all_dates), public_end)
+        while current <= coverage_end:
+            if is_operating_day(current):
+                expected_dates.append(current)
             current += timedelta(days=1)
 
     location_totals_by_date: dict[date, set[str]] = defaultdict(set)
@@ -1213,7 +1234,7 @@ def write_data_quality_sheet(
         cell.font = Font(bold=True)
     for offset, row in enumerate(sorted(weekly_location_rows, key=lambda item: (item["week_end"], item["location"])), start=2):
         row_index = location_check_row + offset
-        status = "OK" if row["source_days"] >= 5 else "Short Week"
+        status = "OK" if row["source_days"] >= OPERATING_WEEK_DAYS else "Short Week"
         ws.cell(row=row_index, column=1, value=row["week_end"]).number_format = "m/d/yyyy"
         ws.cell(row=row_index, column=2, value=row["location"])
         ws.cell(row=row_index, column=3, value=row["active_days"])
@@ -1598,7 +1619,7 @@ def write_master_workbook(
         },
     )
 
-    write_data_quality_sheet(wb, records, weekly_location_rows)
+    write_data_quality_sheet(wb, records, weekly_location_rows, public_start, public_end)
 
     notes = wb.create_sheet("Run Notes", 1)
     notes.sheet_view.showGridLines = False
@@ -1611,6 +1632,8 @@ def write_master_workbook(
     note_rows = [
         ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Source Folder", str(source_dir)),
+        ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed and excluded from weekly rollups."),
+        ("Report Date Source", "Uses each raw workbook's Date(s) value; filename date is only a fallback."),
         ("Raw Reports Read", len({record.source_file for record in records})),
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
@@ -1642,19 +1665,23 @@ def run(args: argparse.Namespace) -> list[Path]:
     records = read_all_reports(input_dir, config)
     public_start, public_end = selected_public_dates(records, args.week_start, args.week_end)
     selected_records = [
-        record for record in records if public_start <= record.report_date <= public_end
+        record
+        for record in records
+        if public_start <= record.report_date <= public_end and is_operating_day(record.report_date)
     ]
     if not selected_records:
         raise ValueError(f"No records found between {public_start} and {public_end}.")
-    actual_public_start = min(record.report_date for record in selected_records)
-    actual_public_end = max(record.report_date for record in selected_records)
 
     generated: list[Path] = []
     for location in config["locations"]:
         location_records = [record for record in selected_records if record.location == location]
         if not location_records:
             continue
-        generated.append(write_public_workbook(location, selected_records, output_dir, config))
+        generated.append(
+            write_public_workbook(
+                location, selected_records, output_dir, config, public_start, public_end
+            )
+        )
 
     master_path = output_dir / "Red_Onion_Server_Master.xlsx"
     generated.append(
@@ -1663,8 +1690,8 @@ def run(args: argparse.Namespace) -> list[Path]:
             master_path,
             config,
             input_dir,
-            actual_public_start,
-            actual_public_end,
+            public_start,
+            public_end,
         )
     )
     return generated
