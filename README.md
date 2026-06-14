@@ -91,7 +91,7 @@ The program reads files in `source_daily_reports` named like:
 Daily Report - TM (Auto-Run) - Marketing Vitals - 06-10-2026.xls
 ```
 
-The filename must start with `Daily Report` and end with `.xls`. The script uses the `Date(s)` value inside the raw workbook as the report date; the filename date is only a fallback. Toast filenames may be one day after the report date.
+The filename must start with `Daily Report` and end with `.xls`. The script uses the `Date(s)` value inside the raw workbook as the business date. The filename date is only a fallback, and Toast filenames are one day after the business date.
 
 The weekly public snapshot uses the latest Tuesday-Sunday operating report date found in the source folder and builds the Tuesday-Sunday reporting week that contains it. Mondays are closed and are excluded from public snapshots and weekly rollups. The master workbook rebuilds from every raw daily report found in `source_daily_reports`, while its weekly tabs use Tuesday-Sunday operating weeks.
 

@@ -46,6 +46,7 @@ OPERATING_WEEK_START_WEEKDAY = 1  # Tuesday; date.weekday() uses Monday=0.
 OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
 OPERATING_WEEK_DAYS = 6
 OPERATING_WEEK_LABEL = "Tuesday-Sunday"
+FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS = 1
 
 
 @dataclass(frozen=True)
@@ -142,7 +143,7 @@ def parse_report_date(df: pd.DataFrame, path: Path) -> date:
     match = re.search(r"(\d{2})-(\d{2})-(\d{4})", path.name)
     if match:
         month, day, year = map(int, match.groups())
-        return date(year, month, day) - timedelta(days=1)
+        return date(year, month, day) - timedelta(days=FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS)
     raise ValueError(f"Could not find report date in {path.name}")
 
 
@@ -1633,7 +1634,10 @@ def write_master_workbook(
         ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Source Folder", str(source_dir)),
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed and excluded from weekly rollups."),
-        ("Report Date Source", "Uses each raw workbook's Date(s) value; filename date is only a fallback."),
+        (
+            "Report Date Source",
+            "Uses each raw workbook's Date(s) value; filename date fallback is one day after the business date.",
+        ),
         ("Raw Reports Read", len({record.source_file for record in records})),
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
