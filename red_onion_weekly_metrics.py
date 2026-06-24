@@ -163,6 +163,12 @@ def display_name_for(raw_name: str, config: dict[str, Any]) -> str:
     return aliases.get(raw_name, raw_name)
 
 
+def is_numbered_server_placeholder(name: Any) -> bool:
+    text = "" if is_blank(name) else str(name).strip()
+    pattern = r"\d+\s+Server\d*(?:\s+Server\d*)*"
+    return re.fullmatch(pattern, text, re.IGNORECASE) is not None
+
+
 def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]:
     df = pd.ExcelFile(path, engine="xlrd").parse("Report(All)", header=None)
     report_date = parse_report_date(df, path)
@@ -338,6 +344,10 @@ def aggregate_records(
 
 def public_excluded(row: dict[str, Any], config: dict[str, Any]) -> bool:
     if row["guest_count"] < float(config.get("public_min_guest_count", 1)):
+        return True
+    if is_numbered_server_placeholder(row.get("raw_user_name")) or is_numbered_server_placeholder(
+        row.get("display_name")
+    ):
         return True
     haystack = f"{row.get('raw_user_name', '')} {row.get('display_name', '')}".casefold()
     for pattern in config.get("public_exclude_name_contains", []):
