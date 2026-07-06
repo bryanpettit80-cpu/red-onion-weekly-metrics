@@ -630,7 +630,7 @@ def write_public_workbook(
         ws.cell(row=row_index, column=4, value=row["guest_count"])
         ws.cell(row=row_index, column=5, value=row["check_average"])
         ws.cell(row=row_index, column=6, value=row["wine_sales"])
-        ws.cell(row=row_index, column=7, value=f"=F{row_index}/C{row_index}")
+        ws.cell(row=row_index, column=7, value=row["wine_pct"])
 
     last_row = max(2, len(rows_to_write) + 2)
     style_public_sheet(ws, last_row)
