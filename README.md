@@ -1,184 +1,63 @@
-# Red Onion Weekly Metrics Automation
+# Red Onion Weekly Metrics
 
-This program turns the daily Toast/Marketing Vitals `.xls` files into:
-
-- Public weekly check average and wine percentage snapshots for Richmond and Virginia Beach.
-- An internal master workbook with daily detail, weekly server metrics, location metrics, and trend summaries.
-
-The assumed working folder is Dropbox:
-
-```text
-C:\Users\<your user>\Dropbox\Red Onion Metrics
-```
+This folder is the weekly Red Onion metrics workspace. It turns Toast/Marketing Vitals daily `.xls` reports into weekly public snapshots and the internal master workbook.
 
 ## Folder Layout
 
-The Dropbox folder should look like this:
-
 ```text
 Red Onion Metrics\
+  Daily Reports\
+  Output\
+  Archive - Old Files\
+  _program\
+  Run Weekly Snapshot.cmd
   Run-WeeklySnapshot.ps1
-  red_onion_weekly_metrics.py
-  red_onion_config.json
-  requirements.txt
-  README.md
-  source_daily_reports\
-  outputs\
-  sample_outputs\
 ```
 
-Use the folders this way:
+- `Daily Reports`: drop the current Toast daily `.xls` files here.
+- `Output`: generated weekly workbooks appear here.
+- `Archive - Old Files`: processed source files and old local files are preserved here.
+- `_program`: code, config, dependencies, and tests. Operators should not need this folder.
 
-- `source_daily_reports`: put all raw daily Toast/Marketing Vitals `.xls` files here.
-- `outputs`: generated weekly public files and the internal master workbook appear here.
-- `sample_outputs`: reference examples only. Do not put new raw daily reports here.
+## Weekly Run
 
-## First-Time Setup On A Computer
+1. Save the current Toast/Marketing Vitals files into `Daily Reports`.
+2. Double-click `Run Weekly Snapshot.cmd`.
+3. Open the generated workbooks in `Output`.
 
-Each computer needs:
-
-1. Dropbox desktop installed and synced.
-2. Python 3.9 or newer installed.
-3. Internet access for the first run so Python packages can install.
-
-When installing Python, check the box for `Add python.exe to PATH`.
-
-Dependency files should not sync through Dropbox. The runner creates a computer-specific environment here:
-
-```text
-%LOCALAPPDATA%\RedOnionMetrics\.venv
-```
-
-That keeps Dropbox clean and lets the same synced project run on different computers.
-
-## Weekly Run Steps
-
-1. Save the raw daily `.xls` files into:
-
-```text
-C:\Users\<your user>\Dropbox\Red Onion Metrics\source_daily_reports
-```
-
-2. Keep historical raw files in `source_daily_reports` if you want the master workbook to keep long-term history. The reporting week is Tuesday through Sunday because Red Onion is closed on Mondays.
-
-3. Open PowerShell.
-
-4. Run:
-
-```powershell
-cd "$env:USERPROFILE\Dropbox\Red Onion Metrics"
-.\Run-WeeklySnapshot.ps1
-```
-
-If Windows blocks script execution, run this instead:
-
-```powershell
-cd "$env:USERPROFILE\Dropbox\Red Onion Metrics"
-powershell -ExecutionPolicy Bypass -File ".\Run-WeeklySnapshot.ps1"
-```
-
-5. Open the generated files in:
-
-```text
-C:\Users\<your user>\Dropbox\Red Onion Metrics\outputs
-```
-
-## Source File Rules
-
-The program reads files in `source_daily_reports` named like:
+The report files should be named like:
 
 ```text
 Daily Report - TM (Auto-Run) - Marketing Vitals - 06-10-2026.xls
 ```
 
-The filename must start with `Daily Report` and end with `.xls`. The script uses the `Date(s)` value inside the raw workbook as the business date. The filename date is only a fallback, and Toast filenames are one day after the business date.
+The program reads the business date inside the workbook. The filename date is only a fallback.
 
-The weekly public snapshot uses the latest Tuesday-Sunday operating report date found in the source folder and builds the Tuesday-Sunday reporting week that contains it. Mondays are closed and are excluded from public snapshots and weekly rollups. The master workbook rebuilds from every raw daily report found in `source_daily_reports`, while its weekly tabs use Tuesday-Sunday operating weeks.
+## What The Run Does
 
-## Outputs
+- Uses Red Onion's existing Tuesday-Sunday operating week. Mondays are closed and excluded from weekly public snapshots.
+- Stops if `Daily Reports` is empty.
+- Stops if `Daily Reports` contains files from more than one Tuesday-Sunday operating week and lists the files to fix.
+- Creates or replaces:
+  - `Output\Check_Wine_RVA<week_end>.xlsx`
+  - `Output\Check_Wine_VB<week_end>.xlsx`
+  - `Output\Red_Onion_Server_Master.xlsx`
+- Moves successfully processed source files to:
 
-The run creates or replaces:
-
-- `outputs\Check_Wine_RVA<week_end>.xlsx`
-- `outputs\Check_Wine_VB<week_end>.xlsx`
-- `outputs\Red_Onion_Server_Master.xlsx`
-
-The public `week_end` date is the Sunday at the end of the Tuesday-Sunday reporting week.
-
-Close any open output workbook before rerunning. Excel lock files can prevent the script from replacing an open workbook.
-
-## Public Snapshot Rules
-
-The public files show:
-
-- Store
-- Server/display name
-- Check Average
-- Wine %
-
-Gross sales, guest count, and wine sales remain in the workbook for formulas but are hidden from view.
-
-Public snapshot highlighting:
-
-- Top check average is green.
-- Top wine percentage is yellow.
-- Bottom three check averages are light red.
-
-Public exclusions are controlled by `red_onion_config.json`. Excluded names are removed only from the public snapshots. The internal master workbook still includes them.
-
-## Master Workbook Logic
-
-The master workbook is rebuilt from every raw daily report found in `source_daily_reports`. It includes rows excluded from public posting so store performance remains accurate. Weekly rollup tabs use Tuesday-Sunday operating weeks and exclude closed Mondays.
-
-The master workbook includes these tabs:
-
-- `Dashboard`: latest weekly location results, current server leaderboards, and a quick check average chart.
-- `Run Notes`: source folder, date coverage, public snapshot dates, exclusions, and metric rules.
-- `Weekly Server Metrics`: one weekly rollup row per server/location.
-- `Weekly Server Rankings`: weekly server rankings for check average, wine percentage, rate of sale, and ticket time.
-- `Server Week Trends`: week-over-week server changes, rank movement context, and a trend note.
-- `Weekly Location Metrics`: one weekly rollup row per location.
-- `Daily Server Detail`: daily source rows by server.
-- `Daily Location Detail`: daily source rows by location.
-- `Server Trend Summary`: all-time server summary plus latest/prior week comparisons.
-- `Data Quality`: source file, operating-date coverage, and location coverage checks. A complete reporting week expects six operating source days, Tuesday through Sunday.
-
-Calculated metrics use these rollup rules:
-
-- Check average = total gross sales / total guest count.
-- Wine percentage = total wine sales / total gross sales.
-- Rate of sale by guest count = guest-weighted average of the daily rate, displayed as a decimal to match the raw report. Lower values are better.
-- Average ticket time = guest-weighted average of the daily ticket time.
-
-Ranking logic:
-
-- Check average and wine percentage rank highest value as best.
-- Rate of sale by guest count and ticket time rank lowest value as best.
-- Rankings use `master_min_guest_count_for_rankings` from `red_onion_config.json` if present. If that setting is not present, the program uses `public_min_guest_count`.
-
-## Config Updates
-
-Edit `red_onion_config.json` to adjust:
-
-- Location short codes used in public file names.
-- Minimum guest count for public posting.
-- Minimum guest count for internal master rankings.
-- Names or name fragments to keep out of the Dashboard leaderboards.
-- Public display aliases such as `Bar 1 Bar 1` to `Bar`.
-- Names or name fragments to keep out of the public competition snapshot.
-
-After editing the config, rerun `Run-WeeklySnapshot.ps1`.
-
-## Troubleshooting
-
-If Python is missing, install Python 3.9 or newer and check `Add python.exe to PATH`.
-
-If PowerShell blocks the script, use:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File ".\Run-WeeklySnapshot.ps1"
+```text
+Archive - Old Files\processed-daily-reports\week-ending-YYYY-MM-DD\
 ```
 
-If an output file cannot be replaced, close the workbook in Excel and rerun the script.
+The master workbook reads archived daily reports plus the active files in `Daily Reports`, so moving processed source files does not remove historical rows from the master workbook.
 
-If a source file is missing from the master workbook, confirm it is in `source_daily_reports`, starts with `Daily Report`, ends with `.xls`, and has synced locally in Dropbox. Closed Mondays are not required for the weekly public snapshot.
+## If Something Fails
+
+If parsing or workbook creation fails, the source files stay in `Daily Reports` so they can be fixed and rerun.
+
+Close any open output workbook before rerunning. Excel can block replacement while a workbook is open.
+
+If Python is missing, install Python 3.9 or newer and select `Add python.exe to PATH`.
+
+## Configuration
+
+Configuration lives in `_program\red_onion_config.json`. It controls location short codes, minimum guest counts, display aliases, and public/dashboard exclusions.

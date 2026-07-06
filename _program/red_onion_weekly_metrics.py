@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import filecmp
 import json
 import re
+import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -47,6 +49,13 @@ OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
 OPERATING_WEEK_DAYS = 6
 OPERATING_WEEK_LABEL = "Tuesday-Sunday"
 FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS = 1
+DAILY_REPORT_PATTERN = "Daily Report*.xls"
+PROGRAM_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = PROGRAM_DIR.parent
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "Daily Reports"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "Output"
+DEFAULT_ARCHIVE_DIR = PROJECT_ROOT / "Archive - Old Files"
+DEFAULT_CONFIG_PATH = PROGRAM_DIR / "red_onion_config.json"
 
 
 @dataclass(frozen=True)
@@ -225,15 +234,41 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
     return records
 
 
+def daily_report_paths(input_dir: Path) -> list[Path]:
+    if not input_dir.exists():
+        return []
+    return sorted(path for path in input_dir.glob(DAILY_REPORT_PATTERN) if path.is_file())
+
+
+def archived_daily_report_paths(archive_dir: Path) -> list[Path]:
+    if not archive_dir.exists():
+        return []
+    return sorted(path for path in archive_dir.rglob(DAILY_REPORT_PATTERN) if path.is_file())
+
+
+def read_reports_by_path(paths: Iterable[Path], config: dict[str, Any]) -> dict[Path, list[MetricRecord]]:
+    records_by_path: dict[Path, list[MetricRecord]] = {}
+    for path in paths:
+        records = parse_daily_report(path, config)
+        if not records:
+            raise ValueError(f"No metric rows were found in {path}")
+        records_by_path[path] = records
+    return records_by_path
+
+
+def flatten_report_records(records_by_path: dict[Path, list[MetricRecord]]) -> list[MetricRecord]:
+    records: list[MetricRecord] = []
+    for path_records in records_by_path.values():
+        records.extend(path_records)
+    return records
+
+
 def read_all_reports(input_dir: Path, config: dict[str, Any]) -> list[MetricRecord]:
-    paths = sorted(input_dir.glob("Daily Report*.xls"))
+    paths = daily_report_paths(input_dir)
     if not paths:
         raise FileNotFoundError(f"No daily .xls reports found in {input_dir}")
 
-    records: list[MetricRecord] = []
-    for path in paths:
-        records.extend(parse_daily_report(path, config))
-    return records
+    return flatten_report_records(read_reports_by_path(paths, config))
 
 
 def is_operating_day(day: date) -> bool:
@@ -244,6 +279,31 @@ def week_period_for(day: date) -> tuple[date, date]:
     days_since_start = (day.weekday() - OPERATING_WEEK_START_WEEKDAY) % 7
     week_start = day - timedelta(days=days_since_start)
     return week_start, week_start + timedelta(days=OPERATING_WEEK_DAYS - 1)
+
+
+def active_week_for_paths(records_by_path: dict[Path, list[MetricRecord]]) -> tuple[date, date]:
+    groups: dict[tuple[date, date], list[Path]] = defaultdict(list)
+    for path, path_records in records_by_path.items():
+        report_dates = sorted({record.report_date for record in path_records})
+        if len(report_dates) != 1:
+            raise ValueError(f"{path.name} contains multiple report dates: {report_dates}")
+        groups[week_period_for(report_dates[0])].append(path)
+
+    if not groups:
+        raise ValueError("No active daily report files were parsed.")
+
+    if len(groups) > 1:
+        lines = [
+            "Daily Reports contains files from more than one Tuesday-Sunday operating week.",
+            "Move the extra files out of Daily Reports and rerun:",
+        ]
+        for (_, week_end), paths in sorted(groups.items()):
+            lines.append(f"  week-ending-{week_end.isoformat()}:")
+            for path in sorted(paths):
+                lines.append(f"    {path.name}")
+        raise ValueError("\n".join(lines))
+
+    return next(iter(groups))
 
 
 def selected_public_dates(
@@ -266,6 +326,46 @@ def selected_public_dates(
         return end - timedelta(days=OPERATING_WEEK_DAYS - 1), end
 
     return week_period_for(max(operating_dates))
+
+
+def archive_destination_for(source_path: Path, archive_dir: Path) -> tuple[Path, bool]:
+    destination = archive_dir / source_path.name
+    if not destination.exists():
+        return destination, False
+
+    if filecmp.cmp(source_path, destination, shallow=False):
+        return destination, True
+
+    counter = 1
+    while True:
+        candidate = archive_dir / f"{source_path.stem} ({counter}){source_path.suffix}"
+        if not candidate.exists():
+            return candidate, False
+        if filecmp.cmp(source_path, candidate, shallow=False):
+            return candidate, True
+        counter += 1
+
+
+def archive_processed_files(
+    source_paths: Iterable[Path], archive_root: Path, week_end: date
+) -> list[Path]:
+    archive_dir = archive_root / "processed-daily-reports" / f"week-ending-{week_end.isoformat()}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    move_plan: list[tuple[Path, Path, bool]] = []
+    for source_path in source_paths:
+        destination, already_archived = archive_destination_for(source_path, archive_dir)
+        move_plan.append((source_path, destination, already_archived))
+
+    archived_paths: list[Path] = []
+    for source_path, destination, already_archived in move_plan:
+        if already_archived:
+            source_path.unlink()
+        else:
+            shutil.move(str(source_path), str(destination))
+        archived_paths.append(destination)
+
+    return archived_paths
 
 
 def aggregate_records(
@@ -1672,12 +1772,29 @@ def write_master_workbook(
 def run(args: argparse.Namespace) -> list[Path]:
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
+    archive_dir = Path(args.archive_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
-    records = read_all_reports(input_dir, config)
-    public_start, public_end = selected_public_dates(records, args.week_start, args.week_end)
+    active_paths = daily_report_paths(input_dir)
+    if not active_paths:
+        raise FileNotFoundError(
+            f"No active daily .xls reports found in {input_dir}. "
+            "Drop current Toast reports into Daily Reports and rerun."
+        )
+
+    active_records_by_path = read_reports_by_path(active_paths, config)
+    _, active_week_end = active_week_for_paths(active_records_by_path)
+    active_records = flatten_report_records(active_records_by_path)
+    active_path_set = set(active_paths)
+    archived_paths = [
+        path for path in archived_daily_report_paths(archive_dir) if path not in active_path_set
+    ]
+    archived_records_by_path = read_reports_by_path(archived_paths, config) if archived_paths else {}
+    records = flatten_report_records(archived_records_by_path) + active_records
+
+    public_start, public_end = selected_public_dates(active_records, args.week_start, args.week_end)
     selected_records = [
         record
         for record in records
@@ -1708,14 +1825,28 @@ def run(args: argparse.Namespace) -> list[Path]:
             public_end,
         )
     )
+    archive_processed_files(active_paths, archive_dir, active_week_end)
     return generated
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build Red Onion weekly metric workbooks.")
-    parser.add_argument("--input-dir", default=".", help="Folder containing raw daily .xls reports.")
-    parser.add_argument("--output-dir", default="outputs", help="Folder for generated workbooks.")
-    parser.add_argument("--config", default="red_onion_config.json", help="Path to config JSON.")
+    parser.add_argument(
+        "--input-dir",
+        default=str(DEFAULT_INPUT_DIR),
+        help="Folder containing active raw daily .xls reports.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Folder for generated workbooks.",
+    )
+    parser.add_argument(
+        "--archive-dir",
+        default=str(DEFAULT_ARCHIVE_DIR),
+        help="Folder for archived source files.",
+    )
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config JSON.")
     parser.add_argument("--week-start", help="Optional public snapshot start date, YYYY-MM-DD.")
     parser.add_argument("--week-end", help="Optional public snapshot end date, YYYY-MM-DD.")
     return parser
@@ -1723,7 +1854,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    generated = run(args)
+    try:
+        generated = run(args)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     print("Generated:")
     for path in generated:
         print(f"  {path}")

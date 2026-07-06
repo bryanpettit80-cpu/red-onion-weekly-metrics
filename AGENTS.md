@@ -5,16 +5,19 @@ This project builds the Red Onion weekly metrics snapshot. Keep the repository f
 ## Workflow
 
 - Treat raw source files and exported reports as local operating data unless they are already intentionally tracked.
-- Preserve the existing PowerShell launcher and single-script workflow unless a requested change updates the operator flow.
-- Keep dependencies minimal and documented in `requirements.txt`.
+- Keep the root folder operator-friendly: `Daily Reports`, `Output`, `Archive - Old Files`, root launchers, and `_program` for technical files.
+- Preserve the root PowerShell and cmd launchers unless a requested change updates the operator flow.
+- Keep dependencies minimal and documented in `_program\requirements.txt` and `_program\pyproject.toml`.
 - Do not introduce external services or credentials for a simple weekly run.
+- Do not add Darden fiscal calendar logic, gift-card workflows, Gmail import, or monthly close behavior unless explicitly requested.
 
 ## Validation
 
 Run this before committing changes:
 
 ```powershell
-python -m pip install -r requirements.txt
+cd _program
+python -m pip install -e ".[dev]"
+python -m pytest -q
 python -m py_compile red_onion_weekly_metrics.py
 ```
-

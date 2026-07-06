@@ -19,7 +19,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        working-directory: _program
+        run: python -m pip install -e ".[dev]"
+      - name: Run tests
+        working-directory: _program
+        run: python -m pytest -q
       - name: Compile script
-        run: python -m py_compile red_onion_weekly_metrics.py
+        run: python -m py_compile _program/red_onion_weekly_metrics.py
 

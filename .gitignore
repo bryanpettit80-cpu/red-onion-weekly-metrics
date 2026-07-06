@@ -1,18 +1,20 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
 debug.log
 
-# Excel source data and generated workbooks are business data, not source code.
+# Excel source data, generated workbooks, and archives are business data, not source code.
 *.xls
 *.xlsx
 *.lnk
 ~$*.xlsx
 
 # Keep the standard workflow folders in GitHub, but ignore their contents.
-outputs/*
-!outputs/.gitkeep
-source_daily_reports/*
-!source_daily_reports/.gitkeep
-sample_outputs/*
-!sample_outputs/.gitkeep
+Daily Reports/*
+!Daily Reports/.gitkeep
+Output/*
+!Output/.gitkeep
+Archive - Old Files/*
+!Archive - Old Files/.gitkeep

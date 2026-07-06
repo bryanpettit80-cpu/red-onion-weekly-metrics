@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "red-onion-weekly-metrics"
+version = "0.1.0"
+description = "Red Onion weekly Toast metrics workbook builder"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.2",
+    "openpyxl>=3.1",
+    "xlrd>=2.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools]
+py-modules = ["red_onion_weekly_metrics"]
