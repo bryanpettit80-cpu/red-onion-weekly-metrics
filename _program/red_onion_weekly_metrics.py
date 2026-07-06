@@ -1731,6 +1731,7 @@ def write_dashboard_sheet(
         cats = Reference(chart_ws, min_col=helper_location_col, min_row=helper_row + 1, max_row=helper_row + len(latest_location_rows))
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
+        chart.legend = None
         chart.height = 7
         chart.width = 13
         ws.add_chart(chart, f"H{max(18, table_row - 12)}")
