@@ -41,6 +41,10 @@ The command-line defaults are rooted one level above `_program`:
 
 The master workbook is rebuilt from active daily reports plus archived daily reports found under `Archive - Old Files`.
 
+## Master Workbook Trends
+
+The master workbook includes rising/falling server stars, store weekly trends, store trend summaries, all-stores group weekly trends, and an all-stores group summary. Dashboard trend eligibility is controlled by `dashboard_min_guest_count_for_trends` and `dashboard_min_active_days_for_trends` in `red_onion_config.json`.
+
 ## Maintenance Notes
 
 - Keep dependencies small and listed in `pyproject.toml` and `requirements.txt`.

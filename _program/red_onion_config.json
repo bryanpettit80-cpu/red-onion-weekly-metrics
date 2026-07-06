@@ -9,6 +9,8 @@
   },
   "public_min_guest_count": 1,
   "master_min_guest_count_for_rankings": 1,
+  "dashboard_min_guest_count_for_trends": 25,
+  "dashboard_min_active_days_for_trends": 3,
   "dashboard_exclude_name_contains": [
     "Banquet",
     "Server"

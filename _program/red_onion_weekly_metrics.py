@@ -26,13 +26,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "public_min_guest_count": 1,
     "master_min_guest_count_for_rankings": 1,
+    "dashboard_min_guest_count_for_trends": 25,
+    "dashboard_min_active_days_for_trends": 3,
     "dashboard_exclude_name_contains": ["Banquet", "Server"],
     "public_name_aliases": {
         "Bar 1 Bar 1": "Bar",
         "Bar Server": "Bar",
         "BarPatio Bartender Patio": "Patio",
     },
-    "public_exclude_name_contains": ["Banquet", "Takeout", "Server Server"],
+    "public_exclude_name_contains": [
+        "Banquet",
+        "Takeout",
+        "Server Server",
+        "Jonathan Josephs",
+        "Sean Kelly",
+        "Bryan Pettit",
+        "Christina Rivera",
+        "Paul Sorensen",
+        "Paula Friedrich",
+        "Cicily McFadden",
+        "AGM",
+        "manager",
+    ],
 }
 
 METRICS = [
@@ -442,6 +457,30 @@ def aggregate_records(
     return rollups
 
 
+def row_name_haystack(row: dict[str, Any]) -> str:
+    return f"{row.get('raw_user_name', '')} {row.get('display_name', '')}".casefold()
+
+
+def row_matches_name_patterns(row: dict[str, Any], patterns: Iterable[Any]) -> bool:
+    haystack = row_name_haystack(row)
+    return any(str(pattern).casefold() in haystack for pattern in patterns)
+
+
+def dashboard_exclusion_patterns(config: dict[str, Any]) -> list[Any]:
+    patterns: list[Any] = []
+    for key in ("dashboard_exclude_name_contains", "public_exclude_name_contains"):
+        for pattern in config.get(key, []):
+            if pattern not in patterns:
+                patterns.append(pattern)
+    return patterns
+
+
+def dashboard_trend_eligible(row: dict[str, Any], config: dict[str, Any]) -> bool:
+    min_guest_count = float(config.get("dashboard_min_guest_count_for_trends", 25))
+    min_active_days = int(config.get("dashboard_min_active_days_for_trends", 3))
+    return row.get("guest_count", 0) >= min_guest_count or row.get("active_days", 0) >= min_active_days
+
+
 def public_excluded(row: dict[str, Any], config: dict[str, Any]) -> bool:
     if row["guest_count"] < float(config.get("public_min_guest_count", 1)):
         return True
@@ -449,19 +488,15 @@ def public_excluded(row: dict[str, Any], config: dict[str, Any]) -> bool:
         row.get("display_name")
     ):
         return True
-    haystack = f"{row.get('raw_user_name', '')} {row.get('display_name', '')}".casefold()
-    for pattern in config.get("public_exclude_name_contains", []):
-        if str(pattern).casefold() in haystack:
-            return True
-    return False
+    return row_matches_name_patterns(row, config.get("public_exclude_name_contains", []))
 
 
 def dashboard_excluded(row: dict[str, Any], config: dict[str, Any]) -> bool:
-    haystack = str(row.get("display_name") or row.get("raw_user_name", "")).casefold()
-    for pattern in config.get("dashboard_exclude_name_contains", []):
-        if str(pattern).casefold() in haystack:
-            return True
-    return False
+    if is_numbered_server_placeholder(row.get("raw_user_name")) or is_numbered_server_placeholder(
+        row.get("display_name")
+    ):
+        return True
+    return row_matches_name_patterns(row, dashboard_exclusion_patterns(config))
 
 
 def format_date_range(start: date, end: date) -> str:
@@ -670,6 +705,8 @@ def write_table_sheet(
             header = headers[col_index - 1]
             if "Date" in header or header in {"Week Start", "Week End", "Latest Week End"}:
                 cell.number_format = "m/d/yyyy"
+            elif "Composite Score" in header or "Rank Movement" in header:
+                cell.number_format = "0.0"
             elif "Rank" in header:
                 cell.number_format = "#,##0"
             elif "Ticket Time Change (Min)" in header:
@@ -876,6 +913,61 @@ def trend_note(
     return "Mixed"
 
 
+def metric_delta(current: dict[str, Any], previous: dict[str, Any] | None, field: str) -> float | None:
+    if previous is None:
+        return None
+    return current[field] - previous[field]
+
+
+def rank_movement(current_rank: Any, previous_rank: Any) -> float | None:
+    if current_rank is None or previous_rank is None:
+        return None
+    return float(previous_rank) - float(current_rank)
+
+
+def star_score_component(
+    change: float | None, *, lower_is_better: bool, strong_threshold: float
+) -> int:
+    if change is None or abs(change) < 0.000001:
+        return 0
+    directional_change = -change if lower_is_better else change
+    if directional_change >= strong_threshold:
+        return 2
+    if directional_change > 0:
+        return 1
+    if directional_change <= -strong_threshold:
+        return -2
+    return -1
+
+
+def format_change(change: float | None, kind: str) -> str:
+    if change is None:
+        return ""
+    sign = "+" if change > 0 else ""
+    if kind == "currency":
+        return f"{sign}${change:,.2f}"
+    if kind == "pct_points":
+        return f"{sign}{change * 100:.1f} pts"
+    if kind == "minutes":
+        return f"{sign}{change:.1f} min"
+    if kind == "rank":
+        return f"{sign}{change:.1f}"
+    return f"{sign}{change:.2f}"
+
+
+def average_rank_movement(row: dict[str, Any]) -> float | None:
+    movements = [
+        row.get("check_average_rank_movement"),
+        row.get("wine_pct_rank_movement"),
+        row.get("rate_rank_movement"),
+        row.get("ticket_time_rank_movement"),
+    ]
+    available = [movement for movement in movements if movement is not None]
+    if not available:
+        return None
+    return sum(available) / len(available)
+
+
 def server_week_trend_rows(ranked_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in ranked_rows:
@@ -886,20 +978,26 @@ def server_week_trend_rows(ranked_rows: list[dict[str, Any]]) -> list[dict[str, 
         rows.sort(key=lambda row: row["week_end"])
         previous: dict[str, Any] | None = None
         for row in rows:
-            check_change = (
-                row["check_average"] - previous["check_average"] if previous else None
-            )
-            wine_change = row["wine_pct"] - previous["wine_pct"] if previous else None
-            rate_change = (
-                row["rate_of_sale_by_guest_count"] - previous["rate_of_sale_by_guest_count"]
-                if previous
-                else None
-            )
+            check_change = metric_delta(row, previous, "check_average")
+            wine_change = metric_delta(row, previous, "wine_pct")
+            rate_change = metric_delta(row, previous, "rate_of_sale_by_guest_count")
             ticket_change_minutes = (
                 (row["average_ticket_time_seconds"] - previous["average_ticket_time_seconds"]) / 60
                 if previous
                 else None
             )
+            rank_fields = (
+                ("check_average_rank", "check_average_rank_movement"),
+                ("wine_pct_rank", "wine_pct_rank_movement"),
+                ("rate_rank", "rate_rank_movement"),
+                ("ticket_time_rank", "ticket_time_rank_movement"),
+            )
+            rank_values: dict[str, Any] = {}
+            for rank_field, movement_field in rank_fields:
+                prior_field = f"prior_{rank_field}"
+                prior_rank = previous.get(rank_field) if previous else None
+                rank_values[prior_field] = prior_rank
+                rank_values[movement_field] = rank_movement(row.get(rank_field), prior_rank)
             trend_rows.append(
                 {
                     **row,
@@ -907,6 +1005,7 @@ def server_week_trend_rows(ranked_rows: list[dict[str, Any]]) -> list[dict[str, 
                     "wine_pct_change": wine_change,
                     "rate_change": rate_change,
                     "ticket_time_change_minutes": ticket_change_minutes,
+                    **rank_values,
                     "trend_note": trend_note(
                         check_change,
                         wine_change,
@@ -926,6 +1025,274 @@ def server_week_trend_rows(ranked_rows: list[dict[str, Any]]) -> list[dict[str, 
         )
     )
     return trend_rows
+
+
+def star_classification(score: float) -> str:
+    if score >= 2:
+        return "Rising Star"
+    if score <= -2:
+        return "Falling Star"
+    return "Stable"
+
+
+def star_why(row: dict[str, Any], components: list[tuple[str, int, str]]) -> str:
+    drivers = [
+        label
+        for label, score, _ in sorted(
+            components,
+            key=lambda item: (abs(item[1]), item[2]),
+            reverse=True,
+        )
+        if score
+    ]
+    if not drivers:
+        return "Minimal week-over-week movement"
+    return "; ".join(drivers[:4])
+
+
+def server_star_rows(
+    server_trend_detail_rows: list[dict[str, Any]], config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    rows_with_prior = [
+        row
+        for row in server_trend_detail_rows
+        if row.get("check_average_change") is not None
+    ]
+    if not rows_with_prior:
+        return []
+
+    latest_week_end = max(row["week_end"] for row in rows_with_prior)
+    star_rows: list[dict[str, Any]] = []
+    for row in rows_with_prior:
+        if row["week_end"] != latest_week_end:
+            continue
+        if dashboard_excluded(row, config) or not dashboard_trend_eligible(row, config):
+            continue
+
+        metric_components = [
+            (
+                "Check average",
+                star_score_component(
+                    row.get("check_average_change"),
+                    lower_is_better=False,
+                    strong_threshold=5.0,
+                ),
+                f"Check avg {format_change(row.get('check_average_change'), 'currency')}",
+                "check",
+            ),
+            (
+                "Wine %",
+                star_score_component(
+                    row.get("wine_pct_change"),
+                    lower_is_better=False,
+                    strong_threshold=0.01,
+                ),
+                f"Wine {format_change(row.get('wine_pct_change'), 'pct_points')}",
+                "wine",
+            ),
+            (
+                "Rate",
+                star_score_component(
+                    row.get("rate_change"),
+                    lower_is_better=True,
+                    strong_threshold=0.25,
+                ),
+                f"Rate {format_change(row.get('rate_change'), 'number')}",
+                "rate",
+            ),
+            (
+                "Ticket time",
+                star_score_component(
+                    row.get("ticket_time_change_minutes"),
+                    lower_is_better=True,
+                    strong_threshold=5.0,
+                ),
+                f"Ticket {format_change(row.get('ticket_time_change_minutes'), 'minutes')}",
+                "ticket",
+            ),
+        ]
+        avg_rank_move = average_rank_movement(row)
+        rank_score = 0
+        if avg_rank_move is not None:
+            if avg_rank_move >= 5:
+                rank_score = 2
+            elif avg_rank_move >= 2:
+                rank_score = 1
+            elif avg_rank_move <= -5:
+                rank_score = -2
+            elif avg_rank_move <= -2:
+                rank_score = -1
+        score = sum(component[1] for component in metric_components) + rank_score
+        components = [(label, component_score, sort_key) for _, component_score, label, sort_key in metric_components]
+        components.append(
+            (
+                f"Rank {format_change(avg_rank_move, 'rank')}",
+                rank_score,
+                "rank",
+            )
+        )
+        star_rows.append(
+            {
+                "category": star_classification(score),
+                "composite_score": score,
+                "week_start": row["week_start"],
+                "week_end": row["week_end"],
+                "location": row["location"],
+                "raw_user_name": row["raw_user_name"],
+                "display_name": row["display_name"],
+                "guest_count": row["guest_count"],
+                "active_days": row["active_days"],
+                "check_average": row["check_average"],
+                "check_average_change": row["check_average_change"],
+                "wine_pct": row["wine_pct"],
+                "wine_pct_change": row["wine_pct_change"],
+                "rate_of_sale_by_guest_count": row["rate_of_sale_by_guest_count"],
+                "rate_change": row["rate_change"],
+                "average_ticket_time_seconds": row["average_ticket_time_seconds"],
+                "ticket_time_change_minutes": row["ticket_time_change_minutes"],
+                "average_rank_movement": avg_rank_move,
+                "why": star_why(row, components),
+            }
+        )
+
+    category_order = {"Rising Star": 0, "Falling Star": 1, "Stable": 2}
+    star_rows.sort(
+        key=lambda row: (
+            category_order[row["category"]],
+            -row["composite_score"] if row["category"] == "Rising Star" else row["composite_score"],
+            row["location"],
+            row["display_name"],
+        )
+    )
+    return star_rows
+
+
+def weekly_metric_trend_rows(
+    weekly_rows: list[dict[str, Any]], identity_fields: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in weekly_rows:
+        groups[tuple(row[field] for field in identity_fields)].append(row)
+
+    trend_rows: list[dict[str, Any]] = []
+    for rows in groups.values():
+        rows.sort(key=lambda row: row["week_end"])
+        previous: dict[str, Any] | None = None
+        for row in rows:
+            check_change = metric_delta(row, previous, "check_average")
+            wine_change = metric_delta(row, previous, "wine_pct")
+            rate_change = metric_delta(row, previous, "rate_of_sale_by_guest_count")
+            ticket_change_minutes = (
+                (row["average_ticket_time_seconds"] - previous["average_ticket_time_seconds"]) / 60
+                if previous
+                else None
+            )
+            trend_rows.append(
+                {
+                    **row,
+                    "prior_week_end": previous["week_end"] if previous else None,
+                    "gross_sales_change": metric_delta(row, previous, "gross_sales"),
+                    "guest_count_change": metric_delta(row, previous, "guest_count"),
+                    "check_average_change": check_change,
+                    "wine_sales_change": metric_delta(row, previous, "wine_sales"),
+                    "wine_pct_change": wine_change,
+                    "rate_change": rate_change,
+                    "ticket_time_change_minutes": ticket_change_minutes,
+                    "trend_note": trend_note(
+                        check_change,
+                        wine_change,
+                        rate_change,
+                        ticket_change_minutes,
+                    ),
+                }
+            )
+            previous = row
+
+    trend_rows.sort(key=lambda row: (row["week_end"],) + tuple(row[field] for field in identity_fields))
+    return trend_rows
+
+
+def group_weekly_rows(records: list[MetricRecord]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[date, date], list[MetricRecord]] = defaultdict(list)
+    for record in records:
+        if record.is_location_total and is_operating_day(record.report_date):
+            grouped[week_period_for(record.report_date)].append(record)
+
+    rows: list[dict[str, Any]] = []
+    for (week_start, week_end), period_records in sorted(grouped.items()):
+        rows.extend(
+            aggregate_records(
+                period_records,
+                (),
+                {"week_start": week_start, "week_end": week_end, "group": "All Stores"},
+            )
+        )
+    return rows
+
+
+def weekly_metric_summary_rows(
+    weekly_rows: list[dict[str, Any]], identity_fields: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in weekly_rows:
+        groups[tuple(row[field] for field in identity_fields)].append(row)
+
+    summary: list[dict[str, Any]] = []
+    for key, rows in groups.items():
+        rows.sort(key=lambda row: row["week_end"])
+        total_gross = sum(row["gross_sales"] for row in rows)
+        total_guests = sum(row["guest_count"] for row in rows)
+        total_wine = sum(row["wine_sales"] for row in rows)
+        rate_weighted = sum(row["rate_of_sale_by_guest_count"] * row["guest_count"] for row in rows)
+        ticket_weighted = sum(row["average_ticket_time_seconds"] * row["guest_count"] for row in rows)
+        latest = rows[-1]
+        prior = rows[-2] if len(rows) > 1 else None
+        row = {field: value for field, value in zip(identity_fields, key)}
+        row.update(
+            {
+                "weeks_tracked": len(rows),
+                "active_days_tracked": sum(item["active_days"] for item in rows),
+                "source_days_tracked": sum(item["source_days"] for item in rows),
+                "total_gross_sales": total_gross,
+                "total_guest_count": total_guests,
+                "weighted_check_average": total_gross / total_guests if total_guests else 0.0,
+                "total_wine_sales": total_wine,
+                "overall_wine_pct": total_wine / total_gross if total_gross else 0.0,
+                "weighted_rate": rate_weighted / total_guests if total_guests else 0.0,
+                "weighted_ticket_time_seconds": ticket_weighted / total_guests if total_guests else 0.0,
+                "first_week_end": rows[0]["week_end"],
+                "latest_week_end": latest["week_end"],
+                "prior_week_end": prior["week_end"] if prior else None,
+                "latest_gross_sales": latest["gross_sales"],
+                "prior_gross_sales": prior["gross_sales"] if prior else None,
+                "gross_sales_change": metric_delta(latest, prior, "gross_sales"),
+                "latest_guest_count": latest["guest_count"],
+                "prior_guest_count": prior["guest_count"] if prior else None,
+                "guest_count_change": metric_delta(latest, prior, "guest_count"),
+                "latest_check_average": latest["check_average"],
+                "prior_check_average": prior["check_average"] if prior else None,
+                "check_average_change": metric_delta(latest, prior, "check_average"),
+                "latest_wine_pct": latest["wine_pct"],
+                "prior_wine_pct": prior["wine_pct"] if prior else None,
+                "wine_pct_change": metric_delta(latest, prior, "wine_pct"),
+                "latest_rate": latest["rate_of_sale_by_guest_count"],
+                "prior_rate": prior["rate_of_sale_by_guest_count"] if prior else None,
+                "rate_change": metric_delta(latest, prior, "rate_of_sale_by_guest_count"),
+                "latest_ticket_time_seconds": latest["average_ticket_time_seconds"],
+                "prior_ticket_time_seconds": (
+                    prior["average_ticket_time_seconds"] if prior else None
+                ),
+                "ticket_time_change_minutes": (
+                    (latest["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
+                    if prior
+                    else None
+                ),
+            }
+        )
+        summary.append(row)
+
+    summary.sort(key=lambda row: tuple(row[field] for field in identity_fields))
+    return summary
 
 
 def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1015,6 +1382,8 @@ def apply_dashboard_number_formats(ws, row_start: int, row_end: int) -> None:
             cell = ws.cell(row=row, column=col)
             if "Date" in header or "Week End" in header:
                 cell.number_format = "m/d/yyyy"
+            elif "Composite Score" in header or "Rank Movement" in header:
+                cell.number_format = "0.0"
             elif "Wine %" in header:
                 cell.number_format = "0.00%"
             elif "Rate" in header:
@@ -1029,11 +1398,57 @@ def apply_dashboard_number_formats(ws, row_start: int, row_end: int) -> None:
                 cell.number_format = "#,##0"
 
 
+def data_quality_warning_rows(weekly_location_rows: list[dict[str, Any]]) -> list[list[Any]]:
+    short_rows = [
+        row
+        for row in sorted(weekly_location_rows, key=lambda item: (item["week_end"], item["location"]))
+        if row["source_days"] < OPERATING_WEEK_DAYS
+    ]
+    if not short_rows:
+        return [["OK", "All tracked store weeks include a full Tuesday-Sunday source set.", None, None]]
+    return [
+        [
+            "Short Week",
+            row["location"],
+            row["week_end"],
+            f"{row['source_days']} of {OPERATING_WEEK_DAYS} source days",
+        ]
+        for row in short_rows[:6]
+    ]
+
+
+def write_dashboard_table(
+    ws,
+    title: str,
+    row: int,
+    col: int,
+    headers: list[str],
+    rows: list[list[Any]],
+) -> int:
+    end_col = col + len(headers) - 1
+    style_section_header(ws, row, col, end_col, title)
+    for offset, header in enumerate(headers):
+        cell = ws.cell(row=row + 1, column=col + offset, value=header)
+        cell.fill = PatternFill("solid", fgColor="F3F4F6")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_offset, values in enumerate(rows, start=2):
+        for col_offset, value in enumerate(values):
+            cell = ws.cell(row=row + row_offset, column=col + col_offset, value=value)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    if rows:
+        apply_dashboard_number_formats(ws, row + 2, row + len(rows) + 1)
+    return row + len(rows) + 3
+
+
 def write_dashboard_sheet(
     wb: Workbook,
     records: list[MetricRecord],
     weekly_location_rows: list[dict[str, Any]],
     ranked_rows: list[dict[str, Any]],
+    star_rows: list[dict[str, Any]],
+    store_trend_summary_rows: list[dict[str, Any]],
+    group_trend_summary_rows: list[dict[str, Any]],
     config: dict[str, Any],
     source_dir: Path,
     public_start: date,
@@ -1059,19 +1474,10 @@ def write_dashboard_sheet(
         ws.column_dimensions[col].width = width
 
     dates = sorted({record.report_date for record in records})
-    latest_week_end = max(row["week_end"] for row in weekly_location_rows)
+    latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
     latest_location_rows = [
-        row for row in weekly_location_rows if row["week_end"] == latest_week_end
+        row for row in weekly_location_rows if latest_week_end and row["week_end"] == latest_week_end
     ]
-    prior_week_end = max(
-        (row["week_end"] for row in weekly_location_rows if row["week_end"] < latest_week_end),
-        default=None,
-    )
-    prior_by_location = {
-        row["location"]: row
-        for row in weekly_location_rows
-        if prior_week_end and row["week_end"] == prior_week_end
-    }
 
     summary_rows = [
         ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -1087,57 +1493,148 @@ def write_dashboard_sheet(
         ws.cell(row=row_index, column=2, value=value)
         ws.cell(row=row_index, column=2).alignment = Alignment(wrap_text=True)
 
-    start_row = 3
-    start_col = 4
-    headers = [
-        "Week End",
-        "Location",
-        "Gross Sales",
-        "Guest Count",
-        "Check Average",
-        "Check Average Change",
-        "Wine %",
-        "Wine % Change",
-        "Rate of Sale by Guest Count",
-        "Rate of Sale Change",
-        "Ticket Time",
-        "Ticket Time Change (Min)",
-    ]
-    for offset, header in enumerate(headers):
-        cell = ws.cell(row=start_row, column=start_col + offset, value=header)
-        cell.fill = PatternFill("solid", fgColor="E1E1E1")
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for row_offset, row in enumerate(
-        sorted(latest_location_rows, key=lambda item: item["location"]), start=1
-    ):
-        prior = prior_by_location.get(row["location"])
-        values = [
-            row["week_end"],
-            row["location"],
-            row["gross_sales"],
-            row["guest_count"],
-            row["check_average"],
-            row["check_average"] - prior["check_average"] if prior else None,
-            row["wine_pct"],
-            row["wine_pct"] - prior["wine_pct"] if prior else None,
-            row["rate_of_sale_by_guest_count"],
-            row["rate_of_sale_by_guest_count"] - prior["rate_of_sale_by_guest_count"]
-            if prior
-            else None,
-            duration_fraction(row["average_ticket_time_seconds"]),
-            (row["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
-            if prior
-            else None,
+    group_rows = [
+        [
+            row.get("group", "All Stores"),
+            row["latest_week_end"],
+            row["latest_gross_sales"],
+            row["gross_sales_change"],
+            row["latest_guest_count"],
+            row["guest_count_change"],
+            row["latest_check_average"],
+            row["check_average_change"],
+            row["latest_wine_pct"],
+            row["wine_pct_change"],
+            row["rate_change"],
+            row["ticket_time_change_minutes"],
         ]
-        for col_offset, value in enumerate(values):
-            ws.cell(row=start_row + row_offset, column=start_col + col_offset, value=value)
-    apply_dashboard_number_formats(ws, start_row + 1, start_row + len(latest_location_rows))
+        for row in group_trend_summary_rows
+    ]
+    write_dashboard_table(
+        ws,
+        "All-Stores Group Trend",
+        3,
+        4,
+        [
+            "Group",
+            "Latest Week End",
+            "Gross Sales",
+            "Gross Sales Change",
+            "Guest Count",
+            "Guest Count Change",
+            "Check Average",
+            "Check Average Change",
+            "Wine %",
+            "Wine % Change",
+            "Rate Change",
+            "Ticket Time Change (Min)",
+        ],
+        group_rows,
+    )
+
+    store_rows = [
+        [
+            row["location"],
+            row["latest_week_end"],
+            row["latest_gross_sales"],
+            row["gross_sales_change"],
+            row["latest_guest_count"],
+            row["guest_count_change"],
+            row["latest_check_average"],
+            row["check_average_change"],
+            row["latest_wine_pct"],
+            row["wine_pct_change"],
+            row["rate_change"],
+            row["ticket_time_change_minutes"],
+        ]
+        for row in store_trend_summary_rows
+    ]
+    store_end_row = write_dashboard_table(
+        ws,
+        "Latest Store Trend Summary",
+        8,
+        4,
+        [
+            "Location",
+            "Latest Week End",
+            "Gross Sales",
+            "Gross Sales Change",
+            "Guest Count",
+            "Guest Count Change",
+            "Check Average",
+            "Check Average Change",
+            "Wine %",
+            "Wine % Change",
+            "Rate Change",
+            "Ticket Time Change (Min)",
+        ],
+        store_rows,
+    )
+
+    warning_end_row = write_dashboard_table(
+        ws,
+        "Data Quality Warnings",
+        11,
+        1,
+        ["Status", "Location / Note", "Week End", "Detail"],
+        data_quality_warning_rows(weekly_location_rows),
+    )
+
+    star_section_row = max(store_end_row, warning_end_row) + 1
+    rising_rows = [
+        [
+            row["location"],
+            row["display_name"],
+            row["composite_score"],
+            row["why"],
+            row["guest_count"],
+            row["active_days"],
+        ]
+        for row in star_rows
+        if row["category"] == "Rising Star"
+    ][:5]
+    falling_rows = [
+        [
+            row["location"],
+            row["display_name"],
+            row["composite_score"],
+            row["why"],
+            row["guest_count"],
+            row["active_days"],
+        ]
+        for row in sorted(
+            (item for item in star_rows if item["category"] == "Falling Star"),
+            key=lambda item: (item["composite_score"], item["location"], item["display_name"]),
+        )
+    ][:5]
+    if not rising_rows:
+        rising_rows = [["", "No rising stars this week", None, "", None, None]]
+    if not falling_rows:
+        falling_rows = [["", "No falling stars this week", None, "", None, None]]
+    rising_end = write_dashboard_table(
+        ws,
+        "Rising Stars",
+        star_section_row,
+        1,
+        ["Location", "Server", "Composite Score", "Why", "Guest Count", "Active Days"],
+        rising_rows,
+    )
+    falling_end = write_dashboard_table(
+        ws,
+        "Falling Stars",
+        star_section_row,
+        8,
+        ["Location", "Server", "Composite Score", "Why", "Guest Count", "Active Days"],
+        falling_rows,
+    )
 
     latest_ranked = [
         row
         for row in ranked_rows
-        if row["week_end"] == latest_week_end and not dashboard_excluded(row, config)
+        if latest_week_end
+        and row["week_end"] == latest_week_end
+        and not dashboard_excluded(row, config)
+        and dashboard_trend_eligible(row, config)
     ]
     leaderboard_sections = [
         (
@@ -1182,7 +1679,7 @@ def write_dashboard_sheet(
         ),
     ]
 
-    table_row = 12
+    table_row = max(rising_end, falling_end) + 1
     for title, selector, value_label, value_field, number_format in leaderboard_sections:
         style_section_header(ws, table_row, 1, 6, title)
         for col, header in enumerate(["Location", "Rank", "Server", "Guest Count", value_label, "Active Days"], start=1):
@@ -1236,7 +1733,7 @@ def write_dashboard_sheet(
         chart.set_categories(cats)
         chart.height = 7
         chart.width = 13
-        ws.add_chart(chart, "H12")
+        ws.add_chart(chart, f"H{max(18, table_row - 12)}")
 
 
 def write_data_quality_sheet(
@@ -1355,6 +1852,138 @@ def write_data_quality_sheet(
             ws.cell(row=row_index, column=5).fill = PatternFill("solid", fgColor="FFF2CC")
 
 
+def metric_week_trend_headers(entity_label: str) -> list[str]:
+    return [
+        "Week Start",
+        "Week End",
+        entity_label,
+        "Gross Sales",
+        "Gross Sales Change",
+        "Guest Count",
+        "Guest Count Change",
+        "Check Average",
+        "Check Average Change",
+        "Wine Sales",
+        "Wine Sales Change",
+        "Wine %",
+        "Wine % Change",
+        "Rate of Sale by Guest Count",
+        "Rate Change",
+        "Average Ticket Time",
+        "Ticket Time Change (Min)",
+        "Active Days",
+        "Source Days",
+        "Trend Note",
+    ]
+
+
+def metric_week_trend_data(rows: list[dict[str, Any]], entity_field: str) -> list[list[Any]]:
+    return [
+        [
+            row["week_start"],
+            row["week_end"],
+            row[entity_field],
+            row["gross_sales"],
+            row["gross_sales_change"],
+            row["guest_count"],
+            row["guest_count_change"],
+            row["check_average"],
+            row["check_average_change"],
+            row["wine_sales"],
+            row["wine_sales_change"],
+            row["wine_pct"],
+            row["wine_pct_change"],
+            row["rate_of_sale_by_guest_count"],
+            row["rate_change"],
+            duration_fraction(row["average_ticket_time_seconds"]),
+            row["ticket_time_change_minutes"],
+            row["active_days"],
+            row["source_days"],
+            row["trend_note"],
+        ]
+        for row in rows
+    ]
+
+
+def metric_summary_headers(entity_label: str) -> list[str]:
+    return [
+        entity_label,
+        "Weeks Tracked",
+        "Active Days Tracked",
+        "Source Days Tracked",
+        "Total Gross Sales",
+        "Total Guest Count",
+        "Weighted Check Average",
+        "Total Wine Sales",
+        "Wine %",
+        "Rate of Sale by Guest Count",
+        "Average Ticket Time",
+        "First Week End",
+        "Latest Week End",
+        "Prior Week End",
+        "Latest Gross Sales",
+        "Prior Gross Sales",
+        "Gross Sales Change",
+        "Latest Guest Count",
+        "Prior Guest Count",
+        "Guest Count Change",
+        "Latest Check Average",
+        "Prior Check Average",
+        "Check Average Change",
+        "Latest Wine %",
+        "Prior Wine %",
+        "Wine % Change",
+        "Latest Rate of Sale by Guest Count",
+        "Prior Rate of Sale by Guest Count",
+        "Rate Change",
+        "Latest Ticket Time",
+        "Prior Ticket Time",
+        "Ticket Time Change (Min)",
+    ]
+
+
+def metric_summary_data(rows: list[dict[str, Any]], entity_field: str) -> list[list[Any]]:
+    return [
+        [
+            row[entity_field],
+            row["weeks_tracked"],
+            row["active_days_tracked"],
+            row["source_days_tracked"],
+            row["total_gross_sales"],
+            row["total_guest_count"],
+            row["weighted_check_average"],
+            row["total_wine_sales"],
+            row["overall_wine_pct"],
+            row["weighted_rate"],
+            duration_fraction(row["weighted_ticket_time_seconds"]),
+            row["first_week_end"],
+            row["latest_week_end"],
+            row["prior_week_end"],
+            row["latest_gross_sales"],
+            row["prior_gross_sales"],
+            row["gross_sales_change"],
+            row["latest_guest_count"],
+            row["prior_guest_count"],
+            row["guest_count_change"],
+            row["latest_check_average"],
+            row["prior_check_average"],
+            row["check_average_change"],
+            row["latest_wine_pct"],
+            row["prior_wine_pct"],
+            row["wine_pct_change"],
+            row["latest_rate"],
+            row["prior_rate"],
+            row["rate_change"],
+            duration_fraction(row["latest_ticket_time_seconds"]),
+            duration_fraction(row["prior_ticket_time_seconds"])
+            if row["prior_ticket_time_seconds"] is not None
+            else None,
+            row["ticket_time_change_minutes"],
+        ]
+        for row in rows
+    ]
+
+
 def write_master_workbook(
     records: list[MetricRecord],
     output_path: Path,
@@ -1369,7 +1998,13 @@ def write_master_workbook(
     )
     ranked_rows = weekly_server_rank_rows(weekly_server_rows, rank_min_guest_count)
     server_trend_detail_rows = server_week_trend_rows(ranked_rows)
+    server_star_detail_rows = server_star_rows(server_trend_detail_rows, config)
     trend_rows = trend_summary_rows(weekly_server_rows)
+    store_week_trend_detail_rows = weekly_metric_trend_rows(weekly_location_rows, ("location",))
+    store_trend_summary = weekly_metric_summary_rows(weekly_location_rows, ("location",))
+    weekly_group_rows = group_weekly_rows(records)
+    group_week_trend_detail_rows = weekly_metric_trend_rows(weekly_group_rows, ("group",))
+    group_trend_summary = weekly_metric_summary_rows(weekly_group_rows, ("group",))
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -1378,10 +2013,77 @@ def write_master_workbook(
         records,
         weekly_location_rows,
         ranked_rows,
+        server_star_detail_rows,
+        store_trend_summary,
+        group_trend_summary,
         config,
         source_dir,
         public_start,
         public_end,
+    )
+
+    star_headers = [
+        "Category",
+        "Composite Score",
+        "Week Start",
+        "Week End",
+        "Location",
+        "Raw Server",
+        "Display Name",
+        "Guest Count",
+        "Active Days",
+        "Check Average",
+        "Check Average Change",
+        "Wine %",
+        "Wine % Change",
+        "Rate of Sale by Guest Count",
+        "Rate Change",
+        "Average Ticket Time",
+        "Ticket Time Change (Min)",
+        "Average Rank Movement",
+        "Why",
+    ]
+    star_data = [
+        [
+            row["category"],
+            row["composite_score"],
+            row["week_start"],
+            row["week_end"],
+            row["location"],
+            row["raw_user_name"],
+            row["display_name"],
+            row["guest_count"],
+            row["active_days"],
+            row["check_average"],
+            row["check_average_change"],
+            row["wine_pct"],
+            row["wine_pct_change"],
+            row["rate_of_sale_by_guest_count"],
+            row["rate_change"],
+            duration_fraction(row["average_ticket_time_seconds"]),
+            row["ticket_time_change_minutes"],
+            row["average_rank_movement"],
+            row["why"],
+        ]
+        for row in server_star_detail_rows
+    ]
+    write_table_sheet(
+        wb,
+        "Rising & Falling Stars",
+        star_headers,
+        star_data,
+        "RisingFallingStars",
+        widths={
+            "A": 16,
+            "B": 16,
+            "C": 14,
+            "D": 14,
+            "E": 22,
+            "F": 28,
+            "G": 28,
+            "N": 24,
+            "S": 54,
+        },
     )
 
     server_headers = [
@@ -1479,15 +2181,23 @@ def write_master_workbook(
         "Guest Count",
         "Check Average",
         "Check Average Rank",
+        "Prior Check Average Rank",
+        "Check Average Rank Movement",
         "Check Average Change",
         "Wine %",
         "Wine % Rank",
+        "Prior Wine % Rank",
+        "Wine % Rank Movement",
         "Wine % Change",
         "Rate of Sale by Guest Count",
         "Rate Rank",
+        "Prior Rate Rank",
+        "Rate Rank Movement",
         "Rate Change",
         "Average Ticket Time",
         "Ticket Time Rank",
+        "Prior Ticket Time Rank",
+        "Ticket Time Rank Movement",
         "Ticket Time Change (Min)",
         "Active Days",
         "Trend Note",
@@ -1502,15 +2212,23 @@ def write_master_workbook(
             row["guest_count"],
             row["check_average"],
             row["check_average_rank"],
+            row["prior_check_average_rank"],
+            row["check_average_rank_movement"],
             row["check_average_change"],
             row["wine_pct"],
             row["wine_pct_rank"],
+            row["prior_wine_pct_rank"],
+            row["wine_pct_rank_movement"],
             row["wine_pct_change"],
             row["rate_of_sale_by_guest_count"],
             row["rate_rank"],
+            row["prior_rate_rank"],
+            row["rate_rank_movement"],
             row["rate_change"],
             duration_fraction(row["average_ticket_time_seconds"]),
             row["ticket_time_rank"],
+            row["prior_ticket_time_rank"],
+            row["ticket_time_rank_movement"],
             row["ticket_time_change_minutes"],
             row["active_days"],
             row["trend_note"],
@@ -1529,13 +2247,17 @@ def write_master_workbook(
             "C": 22,
             "D": 28,
             "E": 28,
-            "I": 20,
-            "L": 16,
-            "M": 22,
-            "O": 14,
-            "P": 18,
+            "I": 22,
+            "J": 24,
+            "M": 18,
+            "N": 20,
+            "O": 22,
             "R": 20,
-            "T": 16,
+            "S": 20,
+            "T": 22,
+            "W": 22,
+            "X": 24,
+            "Y": 22,
         },
     )
 
@@ -1571,6 +2293,70 @@ def write_master_workbook(
         for row in sorted(weekly_location_rows, key=lambda item: (item["week_end"], item["location"]))
     ]
     write_table_sheet(wb, "Weekly Location Metrics", location_headers, location_data, "WeeklyLocationMetrics")
+
+    trend_tab_widths = {
+        "A": 14,
+        "B": 14,
+        "C": 24,
+        "E": 20,
+        "G": 20,
+        "I": 22,
+        "K": 20,
+        "M": 16,
+        "N": 24,
+        "Q": 22,
+        "T": 16,
+    }
+    write_table_sheet(
+        wb,
+        "Store Week Trends",
+        metric_week_trend_headers("Location"),
+        metric_week_trend_data(store_week_trend_detail_rows, "location"),
+        "StoreWeekTrends",
+        widths=trend_tab_widths,
+    )
+    write_table_sheet(
+        wb,
+        "Store Trend Summary",
+        metric_summary_headers("Location"),
+        metric_summary_data(store_trend_summary, "location"),
+        "StoreTrendSummary",
+        widths={
+            "A": 24,
+            "J": 24,
+            "K": 18,
+            "Q": 20,
+            "W": 22,
+            "AA": 24,
+            "AC": 16,
+            "AF": 22,
+        },
+    )
+    write_table_sheet(
+        wb,
+        "Group Week Trends",
+        metric_week_trend_headers("Group"),
+        metric_week_trend_data(group_week_trend_detail_rows, "group"),
+        "GroupWeekTrends",
+        widths=trend_tab_widths,
+    )
+    write_table_sheet(
+        wb,
+        "Group Trend Summary",
+        metric_summary_headers("Group"),
+        metric_summary_data(group_trend_summary, "group"),
+        "GroupTrendSummary",
+        widths={
+            "A": 18,
+            "J": 24,
+            "K": 18,
+            "Q": 20,
+            "W": 22,
+            "AA": 24,
+            "AC": 16,
+            "AF": 22,
+        },
+    )
 
     daily_server_headers = [
         "Report Date",
@@ -1754,8 +2540,24 @@ def write_master_workbook(
         ("Public Exclude Patterns", ", ".join(config.get("public_exclude_name_contains", []))),
         ("Dashboard Exclude Patterns", ", ".join(config.get("dashboard_exclude_name_contains", []))),
         ("Ranking Minimum Guest Count", rank_min_guest_count),
-        ("Dashboard", "Dashboard summarizes latest weekly location results and current server leaders."),
-        ("Trend Tabs", "Weekly Server Rankings ranks each metric by week/location; Server Week Trends adds week-over-week changes."),
+        (
+            "Dashboard Trend Eligibility",
+            "Server trend lists include rows with guest count >= "
+            f"{config.get('dashboard_min_guest_count_for_trends', 25)} or active days >= "
+            f"{config.get('dashboard_min_active_days_for_trends', 3)}.",
+        ),
+        (
+            "Dashboard",
+            "Dashboard highlights rising/falling servers, latest store trends, all-stores group trends, and current metric leaders.",
+        ),
+        (
+            "Rising/Falling Stars",
+            "Composite score balances check average, wine percent, rate of sale, ticket time, and rank movement.",
+        ),
+        (
+            "Trend Tabs",
+            "Server, store, and group trend tabs show week-over-week changes plus latest/prior/total-period summaries.",
+        ),
         ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
         ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
     ]

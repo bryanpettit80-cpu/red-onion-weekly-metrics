@@ -42,6 +42,7 @@ The program reads the business date inside the workbook. The filename date is on
   - `Output\Check_Wine_RVA<week_end>.xlsx`
   - `Output\Check_Wine_VB<week_end>.xlsx`
   - `Output\Red_Onion_Server_Master.xlsx`
+- The master workbook includes rising/falling server trends, store trend summaries, and an all-stores group trend summary.
 - Moves successfully processed source files to:
 
 ```text
@@ -60,7 +61,7 @@ If Python is missing, install Python 3.9 or newer and select `Add python.exe to 
 
 ## Configuration
 
-Configuration lives in `_program\red_onion_config.json`. It controls location short codes, minimum guest counts, display aliases, and public/dashboard exclusions.
+Configuration lives in `_program\red_onion_config.json`. It controls location short codes, minimum guest counts, dashboard trend eligibility, display aliases, and public/dashboard exclusions.
 
 ## What Is Not Redundant
 
