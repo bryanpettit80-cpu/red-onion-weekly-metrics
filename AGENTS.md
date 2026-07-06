@@ -5,8 +5,8 @@ This project builds the Red Onion weekly metrics snapshot. Keep the repository f
 ## Workflow
 
 - Treat raw source files and exported reports as local operating data unless they are already intentionally tracked.
-- Keep the root folder operator-friendly: `Daily Reports`, `Output`, `Archive - Old Files`, root launchers, and `_program` for technical files.
-- Preserve the root PowerShell and cmd launchers unless a requested change updates the operator flow.
+- Keep the root folder operator-friendly: `Daily Reports`, `Output`, `Archive - Old Files`, one root cmd launcher, and `_program` for technical files.
+- Preserve `Run Weekly Snapshot.cmd` as the root operator launcher unless a requested change updates the operator flow.
 - Keep dependencies minimal and documented in `_program\requirements.txt` and `_program\pyproject.toml`.
 - Do not introduce external services or credentials for a simple weekly run.
 - Do not add Darden fiscal calendar logic, gift-card workflows, Gmail import, or monthly close behavior unless explicitly requested.

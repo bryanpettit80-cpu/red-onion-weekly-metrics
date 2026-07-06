@@ -11,13 +11,13 @@ Red Onion Metrics\
   Archive - Old Files\
   _program\
   Run Weekly Snapshot.cmd
-  Run-WeeklySnapshot.ps1
 ```
 
 - `Daily Reports`: drop the current Toast daily `.xls` files here.
 - `Output`: generated weekly workbooks appear here.
 - `Archive - Old Files`: processed source files and old local files are preserved here.
-- `_program`: code, config, dependencies, and tests. Operators should not need this folder.
+- `_program`: code, config, dependencies, tests, and the internal PowerShell runner. Operators should not need this folder.
+- `Run Weekly Snapshot.cmd`: the only root file operators need to run.
 
 ## Weekly Run
 
@@ -61,3 +61,9 @@ If Python is missing, install Python 3.9 or newer and select `Add python.exe to 
 ## Configuration
 
 Configuration lives in `_program\red_onion_config.json`. It controls location short codes, minimum guest counts, display aliases, and public/dashboard exclusions.
+
+## What Is Not Redundant
+
+- `Run Weekly Snapshot.cmd` is the operator launcher to double-click.
+- `_program\Run-WeeklySnapshot.ps1` is the internal runner used by the launcher.
+- `_program\red_onion_weekly_metrics.py` is the actual workbook-building program.
