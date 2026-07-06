@@ -684,8 +684,9 @@ def write_table_sheet(
     rows: list[list[Any]],
     table_name: str,
     widths: dict[str, float] | None = None,
-) -> None:
-    ws = wb.create_sheet(title)
+    index: int | None = None,
+):
+    ws = wb.create_sheet(title, index=index)
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A4"
     ws.cell(row=1, column=1, value=title)
@@ -768,6 +769,7 @@ def write_table_sheet(
     default_widths.update(widths or {})
     for col, width in default_widths.items():
         ws.column_dimensions[col].width = width
+    return ws
 
 
 def weekly_rollups(records: list[MetricRecord]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -943,16 +945,17 @@ def star_score_component(
 def format_change(change: float | None, kind: str) -> str:
     if change is None:
         return ""
-    sign = "+" if change > 0 else ""
+    sign = "+" if change > 0 else "-" if change < 0 else ""
+    value = abs(change)
     if kind == "currency":
-        return f"{sign}${change:,.2f}"
+        return f"{sign}${value:,.2f}"
     if kind == "pct_points":
-        return f"{sign}{change * 100:.1f} pts"
+        return f"{sign}{value * 100:.1f} pts"
     if kind == "minutes":
-        return f"{sign}{change:.1f} min"
+        return f"{sign}{value:.1f} min"
     if kind == "rank":
-        return f"{sign}{change:.1f}"
-    return f"{sign}{change:.2f}"
+        return f"{sign}{value:.1f}"
+    return f"{sign}{value:.2f}"
 
 
 def average_rank_movement(row: dict[str, Any]) -> float | None:
@@ -1167,6 +1170,197 @@ def server_star_rows(
     return star_rows
 
 
+def compact_money(value: float | None, *, signed: bool = False) -> str:
+    if value is None:
+        return ""
+    sign = ""
+    if signed:
+        sign = "+" if value > 0 else "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.0f}"
+
+
+def compact_count(value: float | None, *, signed: bool = False) -> str:
+    if value is None:
+        return ""
+    sign = "+" if signed and value > 0 else ""
+    return f"{sign}{value:,.0f}"
+
+
+def compact_pct_points(value: float | None) -> str:
+    if value is None:
+        return ""
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    return f"{sign}{abs(value) * 100:.1f} pts"
+
+
+def compact_minutes(value: float | None) -> str:
+    if value is None:
+        return ""
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    return f"{sign}{abs(value):.1f} min"
+
+
+def star_action(row: dict[str, Any]) -> tuple[str, str, str]:
+    if row["category"] == "Falling Star":
+        priority = "High" if row["composite_score"] <= -5 else "Medium"
+        return priority, "Coach", "Review recent shifts and coach the drivers shown in Evidence."
+    if row["category"] == "Rising Star":
+        priority = "Recognize" if row["composite_score"] >= 5 else "Share"
+        return priority, "Recognize", "Recognize the improvement and ask what changed so the tactic can be shared."
+    return "Monitor", "Monitor", "Keep watching next week before acting."
+
+
+def store_status(row: dict[str, Any]) -> tuple[str, str, str]:
+    gross_down = (row.get("gross_sales_change") or 0) < 0
+    guests_down = (row.get("guest_count_change") or 0) < 0
+    check_down = (row.get("check_average_change") or 0) < 0
+    wine_down = (row.get("wine_pct_change") or 0) < 0
+    ticket_slower = (row.get("ticket_time_change_minutes") or 0) > 0
+    negative_count = sum([gross_down, guests_down, check_down, wine_down, ticket_slower])
+
+    if gross_down and guests_down:
+        return "High", "Traffic Watch", "Sales and guest count both fell; review traffic, staffing, and event calendar."
+    if check_down and wine_down:
+        return "Medium", "Upsell Watch", "Guests held better than spend; coach check average and wine attachment."
+    if ticket_slower and negative_count >= 2:
+        return "Medium", "Service Watch", "Ticket time worsened with other declines; review service flow."
+    if negative_count >= 2:
+        return "Medium", "Mixed Watch", "Multiple metrics moved the wrong way; review manager notes."
+    return "Monitor", "Stable / Mixed", "No urgent store action; monitor next run."
+
+
+def trend_evidence(row: dict[str, Any]) -> str:
+    return (
+        f"Sales {compact_money(row.get('gross_sales_change'), signed=True)}; "
+        f"guests {compact_count(row.get('guest_count_change'), signed=True)}; "
+        f"check {compact_money(row.get('check_average_change'), signed=True)}; "
+        f"wine {compact_pct_points(row.get('wine_pct_change'))}; "
+        f"ticket {compact_minutes(row.get('ticket_time_change_minutes'))}"
+    )
+
+
+def build_action_board_rows(
+    star_rows: list[dict[str, Any]],
+    store_trend_summary_rows: list[dict[str, Any]],
+    group_trend_summary_rows: list[dict[str, Any]],
+    weekly_location_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    sort_order = {
+        "High": 0,
+        "Medium": 1,
+        "Recognize": 2,
+        "Share": 3,
+        "Monitor": 4,
+        "Review": 5,
+    }
+
+    for star in sorted(
+        (row for row in star_rows if row["category"] == "Falling Star"),
+        key=lambda row: (row["composite_score"], row["location"], row["display_name"]),
+    )[:6]:
+        priority, action, follow_up = star_action(star)
+        rows.append(
+            {
+                "priority": priority,
+                "action": action,
+                "location": star["location"],
+                "subject": star["display_name"],
+                "signal": "Falling Star",
+                "impact": f"Score {star['composite_score']:+.0f}",
+                "evidence": star["why"],
+                "recommended_follow_up": follow_up,
+                "week_end": star["week_end"],
+                "guest_count": star["guest_count"],
+                "active_days": star["active_days"],
+                "_sort": sort_order[priority],
+            }
+        )
+
+    for star in sorted(
+        (row for row in star_rows if row["category"] == "Rising Star"),
+        key=lambda row: (-row["composite_score"], row["location"], row["display_name"]),
+    )[:6]:
+        priority, action, follow_up = star_action(star)
+        rows.append(
+            {
+                "priority": priority,
+                "action": action,
+                "location": star["location"],
+                "subject": star["display_name"],
+                "signal": "Rising Star",
+                "impact": f"Score {star['composite_score']:+.0f}",
+                "evidence": star["why"],
+                "recommended_follow_up": follow_up,
+                "week_end": star["week_end"],
+                "guest_count": star["guest_count"],
+                "active_days": star["active_days"],
+                "_sort": sort_order[priority],
+            }
+        )
+
+    for store in store_trend_summary_rows:
+        priority, signal, follow_up = store_status(store)
+        rows.append(
+            {
+                "priority": priority,
+                "action": "Store Review",
+                "location": store["location"],
+                "subject": store["location"],
+                "signal": signal,
+                "impact": trend_evidence(store),
+                "evidence": f"Latest week {store['latest_week_end']:%m/%d/%Y}",
+                "recommended_follow_up": follow_up,
+                "week_end": store["latest_week_end"],
+                "guest_count": store["latest_guest_count"],
+                "active_days": None,
+                "_sort": sort_order[priority] + 0.5,
+            }
+        )
+
+    for group in group_trend_summary_rows:
+        priority, signal, follow_up = store_status(group)
+        rows.append(
+            {
+                "priority": priority,
+                "action": "Group Review",
+                "location": group.get("group", "All Stores"),
+                "subject": group.get("group", "All Stores"),
+                "signal": signal,
+                "impact": trend_evidence(group),
+                "evidence": f"Latest week {group['latest_week_end']:%m/%d/%Y}",
+                "recommended_follow_up": follow_up,
+                "week_end": group["latest_week_end"],
+                "guest_count": group["latest_guest_count"],
+                "active_days": None,
+                "_sort": sort_order[priority] + 0.25,
+            }
+        )
+
+    for status, location, week_end, detail in data_quality_warning_rows(weekly_location_rows):
+        if status == "OK":
+            continue
+        rows.append(
+            {
+                "priority": "Review",
+                "action": "Data Quality",
+                "location": location,
+                "subject": location,
+                "signal": status,
+                "impact": detail,
+                "evidence": "Short weeks can distort trends and star movement.",
+                "recommended_follow_up": "Confirm whether missing source days are expected before coaching from that week.",
+                "week_end": week_end,
+                "guest_count": None,
+                "active_days": None,
+                "_sort": sort_order["Review"],
+            }
+        )
+
+    rows.sort(key=lambda row: (row["_sort"], row["action"], row["location"], row["subject"]))
+    return rows
+
+
 def weekly_metric_trend_rows(
     weekly_rows: list[dict[str, Any]], identity_fields: tuple[str, ...]
 ) -> list[dict[str, Any]]:
@@ -1375,6 +1569,25 @@ def style_section_header(ws, row: int, start_col: int, end_col: int, label: str)
     ws.cell(row=row, column=start_col, value=label)
 
 
+def soft_fill(color: str) -> PatternFill:
+    return PatternFill("solid", fgColor=color)
+
+
+def priority_fill(value: Any) -> PatternFill | None:
+    text = str(value or "").casefold()
+    if text in {"high", "coach", "falling star", "traffic watch"}:
+        return soft_fill("F4CCCC")
+    if text in {"medium", "store review", "group review", "upsell watch", "service watch", "mixed watch"}:
+        return soft_fill("FFF2CC")
+    if text in {"recognize", "share", "rising star"}:
+        return soft_fill("D9EAD3")
+    if text in {"review", "data quality", "short week"}:
+        return soft_fill("D9EAF7")
+    if text in {"monitor", "stable / mixed"}:
+        return soft_fill("EDEDED")
+    return None
+
+
 def apply_dashboard_number_formats(ws, row_start: int, row_end: int) -> None:
     for row in range(row_start, row_end + 1):
         for col in range(1, ws.max_column + 1):
@@ -1447,6 +1660,7 @@ def write_dashboard_sheet(
     weekly_location_rows: list[dict[str, Any]],
     ranked_rows: list[dict[str, Any]],
     star_rows: list[dict[str, Any]],
+    action_rows: list[dict[str, Any]],
     store_trend_summary_rows: list[dict[str, Any]],
     group_trend_summary_rows: list[dict[str, Any]],
     config: dict[str, Any],
@@ -1455,21 +1669,22 @@ def write_dashboard_sheet(
     public_end: date,
 ) -> None:
     ws = wb.create_sheet("Dashboard", 0)
-    style_title(ws, "Red Onion Weekly Performance Dashboard", 12)
+    style_title(ws, "Red Onion Weekly Performance Dashboard", 13)
     ws.freeze_panes = "A4"
     for col, width in {
-        "A": 18,
+        "A": 15,
         "B": 18,
-        "C": 16,
-        "D": 16,
-        "E": 16,
-        "F": 14,
-        "G": 14,
-        "H": 16,
-        "I": 16,
-        "J": 16,
-        "K": 16,
-        "L": 18,
+        "C": 20,
+        "D": 12,
+        "E": 30,
+        "F": 34,
+        "G": 16,
+        "H": 15,
+        "I": 18,
+        "J": 18,
+        "K": 18,
+        "L": 34,
+        "M": 30,
     }.items():
         ws.column_dimensions[col].width = width
 
@@ -1480,152 +1695,133 @@ def write_dashboard_sheet(
     ]
 
     summary_rows = [
-        ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ("Source Folder", str(source_dir)),
-        ("Raw Reports Read", len({record.source_file for record in records})),
-        ("Date Coverage", format_date_range(min(dates), max(dates))),
-        ("Public Snapshot Dates", format_date_range(public_start, public_end)),
-        ("Weeks Tracked", len({row["week_end"] for row in weekly_location_rows})),
+        ["Latest Week", public_end],
+        ["Reports Read", len({record.source_file for record in records})],
+        ["Date Coverage", format_date_range(min(dates), max(dates))],
+        ["Weeks Tracked", len({row["week_end"] for row in weekly_location_rows})],
     ]
-    style_section_header(ws, 3, 1, 2, "Run Summary")
-    for row_index, (label, value) in enumerate(summary_rows, start=4):
-        ws.cell(row=row_index, column=1, value=label).font = Font(bold=True)
-        ws.cell(row=row_index, column=2, value=value)
-        ws.cell(row=row_index, column=2).alignment = Alignment(wrap_text=True)
+    snapshot_end = write_dashboard_table(ws, "Snapshot", 3, 1, ["Item", "Value"], summary_rows)
 
-    group_rows = [
-        [
-            row.get("group", "All Stores"),
-            row["latest_week_end"],
-            row["latest_gross_sales"],
-            row["gross_sales_change"],
-            row["latest_guest_count"],
-            row["guest_count_change"],
-            row["latest_check_average"],
-            row["check_average_change"],
-            row["latest_wine_pct"],
-            row["wine_pct_change"],
-            row["rate_change"],
-            row["ticket_time_change_minutes"],
-        ]
-        for row in group_trend_summary_rows
-    ]
-    write_dashboard_table(
+    group_rows = []
+    for row in group_trend_summary_rows:
+        _, status, focus = store_status(row)
+        group_rows.append(
+            [
+                row.get("group", "All Stores"),
+                status,
+                compact_money(row["latest_gross_sales"]),
+                compact_money(row["gross_sales_change"], signed=True),
+                compact_count(row["guest_count_change"], signed=True),
+                compact_money(row["check_average_change"], signed=True),
+                compact_pct_points(row["wine_pct_change"]),
+                compact_minutes(row["ticket_time_change_minutes"]),
+                focus,
+            ]
+        )
+    group_end = write_dashboard_table(
         ws,
-        "All-Stores Group Trend",
+        "All-Stores Group Pulse",
         3,
         4,
         [
             "Group",
-            "Latest Week End",
-            "Gross Sales",
-            "Gross Sales Change",
-            "Guest Count",
-            "Guest Count Change",
-            "Check Average",
-            "Check Average Change",
-            "Wine %",
-            "Wine % Change",
-            "Rate Change",
-            "Ticket Time Change (Min)",
+            "Status",
+            "Sales",
+            "Sales Change",
+            "Guest Change",
+            "Check Change",
+            "Wine Change",
+            "Ticket Change",
+            "Focus",
         ],
         group_rows,
     )
 
-    store_rows = [
-        [
-            row["location"],
-            row["latest_week_end"],
-            row["latest_gross_sales"],
-            row["gross_sales_change"],
-            row["latest_guest_count"],
-            row["guest_count_change"],
-            row["latest_check_average"],
-            row["check_average_change"],
-            row["latest_wine_pct"],
-            row["wine_pct_change"],
-            row["rate_change"],
-            row["ticket_time_change_minutes"],
-        ]
-        for row in store_trend_summary_rows
-    ]
-    store_end_row = write_dashboard_table(
+    write_dashboard_table(
         ws,
-        "Latest Store Trend Summary",
-        8,
-        4,
-        [
-            "Location",
-            "Latest Week End",
-            "Gross Sales",
-            "Gross Sales Change",
-            "Guest Count",
-            "Guest Count Change",
-            "Check Average",
-            "Check Average Change",
-            "Wine %",
-            "Wine % Change",
-            "Rate Change",
-            "Ticket Time Change (Min)",
-        ],
-        store_rows,
-    )
-
-    warning_end_row = write_dashboard_table(
-        ws,
-        "Data Quality Warnings",
-        11,
+        "Data Quality",
+        max(snapshot_end, group_end) + 1,
         1,
         ["Status", "Location / Note", "Week End", "Detail"],
         data_quality_warning_rows(weekly_location_rows),
     )
 
-    star_section_row = max(store_end_row, warning_end_row) + 1
-    rising_rows = [
+    coach_rows = [
         [
+            row["priority"],
             row["location"],
-            row["display_name"],
-            row["composite_score"],
-            row["why"],
-            row["guest_count"],
-            row["active_days"],
+            row["subject"],
+            row["impact"],
+            row["evidence"],
+            row["recommended_follow_up"],
         ]
-        for row in star_rows
-        if row["category"] == "Rising Star"
+        for row in action_rows
+        if row["action"] == "Coach"
     ][:5]
-    falling_rows = [
+    recognize_rows = [
         [
+            row["priority"],
             row["location"],
-            row["display_name"],
-            row["composite_score"],
-            row["why"],
-            row["guest_count"],
-            row["active_days"],
+            row["subject"],
+            row["impact"],
+            row["evidence"],
+            row["recommended_follow_up"],
         ]
-        for row in sorted(
-            (item for item in star_rows if item["category"] == "Falling Star"),
-            key=lambda item: (item["composite_score"], item["location"], item["display_name"]),
-        )
+        for row in action_rows
+        if row["action"] == "Recognize"
     ][:5]
-    if not rising_rows:
-        rising_rows = [["", "No rising stars this week", None, "", None, None]]
-    if not falling_rows:
-        falling_rows = [["", "No falling stars this week", None, "", None, None]]
-    rising_end = write_dashboard_table(
+    if not coach_rows:
+        coach_rows = [["", "", "No coach-now items", "", "", ""]]
+    if not recognize_rows:
+        recognize_rows = [["", "", "No recognition items", "", "", ""]]
+    coach_end = write_dashboard_table(
         ws,
-        "Rising Stars",
-        star_section_row,
+        "Coach First",
+        max(snapshot_end, group_end) + 7,
         1,
-        ["Location", "Server", "Composite Score", "Why", "Guest Count", "Active Days"],
-        rising_rows,
+        ["Priority", "Location", "Server", "Impact", "Evidence", "Recommended Follow-Up"],
+        coach_rows,
     )
-    falling_end = write_dashboard_table(
+    recognize_end = write_dashboard_table(
         ws,
-        "Falling Stars",
-        star_section_row,
+        "Recognize / Replicate",
+        max(snapshot_end, group_end) + 7,
         8,
-        ["Location", "Server", "Composite Score", "Why", "Guest Count", "Active Days"],
-        falling_rows,
+        ["Priority", "Location", "Server", "Impact", "Evidence", "Recommended Follow-Up"],
+        recognize_rows,
+    )
+
+    store_rows = []
+    for row in store_trend_summary_rows:
+        _, status, focus = store_status(row)
+        store_rows.append(
+            [
+                row["location"],
+                status,
+                compact_money(row["gross_sales_change"], signed=True),
+                compact_count(row["guest_count_change"], signed=True),
+                compact_money(row["check_average_change"], signed=True),
+                compact_pct_points(row["wine_pct_change"]),
+                compact_minutes(row["ticket_time_change_minutes"]),
+                focus,
+            ]
+        )
+    store_end = write_dashboard_table(
+        ws,
+        "Store Action Pulse",
+        max(coach_end, recognize_end) + 1,
+        1,
+        [
+            "Location",
+            "Status",
+            "Sales Change",
+            "Guest Count",
+            "Check Change",
+            "Wine Change",
+            "Ticket Change",
+            "Recommended Focus",
+        ],
+        store_rows,
     )
 
     latest_ranked = [
@@ -1679,7 +1875,7 @@ def write_dashboard_sheet(
         ),
     ]
 
-    table_row = max(rising_end, falling_end) + 1
+    table_row = store_end + 1
     for title, selector, value_label, value_field, number_format in leaderboard_sections:
         style_section_header(ws, table_row, 1, 6, title)
         for col, header in enumerate(["Location", "Rank", "Server", "Guest Count", value_label, "Active Days"], start=1):
@@ -1709,6 +1905,17 @@ def write_dashboard_sheet(
                 write_row += 1
         table_row = write_row + 2
 
+    for row_index in range(4, ws.max_row + 1):
+        for col_index in range(1, min(ws.max_column, 13) + 1):
+            cell = ws.cell(row=row_index, column=col_index)
+            fill = priority_fill(cell.value)
+            if fill:
+                cell.fill = fill
+        if row_index <= store_end:
+            ws.row_dimensions[row_index].height = 42 if row_index >= max(snapshot_end, group_end) + 9 else 32
+        else:
+            ws.row_dimensions[row_index].height = 18
+
     if latest_location_rows:
         chart_ws = wb.create_sheet("_Dashboard Chart Data")
         chart_ws.sheet_state = "hidden"
@@ -1734,7 +1941,8 @@ def write_dashboard_sheet(
         chart.legend = None
         chart.height = 7
         chart.width = 13
-        ws.add_chart(chart, f"H{max(18, table_row - 12)}")
+        ws.add_chart(chart, f"H{max(store_end + 2, table_row - 12)}")
+
 
 
 def write_data_quality_sheet(
@@ -1985,6 +2193,71 @@ def metric_summary_data(rows: list[dict[str, Any]], entity_field: str) -> list[l
     ]
 
 
+def write_action_board_sheet(wb: Workbook, action_rows: list[dict[str, Any]]) -> None:
+    headers = [
+        "Priority",
+        "Action",
+        "Location",
+        "Person / Area",
+        "Signal",
+        "Score / Impact",
+        "Evidence",
+        "Recommended Follow-Up",
+        "Week End",
+        "Guest Count",
+        "Active Days",
+    ]
+    data = [
+        [
+            row["priority"],
+            row["action"],
+            row["location"],
+            row["subject"],
+            row["signal"],
+            row["impact"],
+            row["evidence"],
+            row["recommended_follow_up"],
+            row["week_end"],
+            row["guest_count"],
+            row["active_days"],
+        ]
+        for row in action_rows
+    ]
+    ws = write_table_sheet(
+        wb,
+        "Action Board",
+        headers,
+        data,
+        "ActionBoard",
+        widths={
+            "A": 13,
+            "B": 16,
+            "C": 20,
+            "D": 24,
+            "E": 18,
+            "F": 32,
+            "G": 44,
+            "H": 56,
+            "I": 14,
+            "J": 12,
+            "K": 12,
+        },
+        index=1,
+    )
+    ws.sheet_properties.tabColor = "7A1E1E"
+    for row in range(4, len(data) + 4):
+        priority = ws.cell(row=row, column=1).value
+        action = ws.cell(row=row, column=2).value
+        signal = ws.cell(row=row, column=5).value
+        fill = priority_fill(priority) or priority_fill(action) or priority_fill(signal)
+        if fill:
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row, column=col).fill = fill
+        for col in (6, 7, 8):
+            ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[row].height = 42
+
+
 def write_master_workbook(
     records: list[MetricRecord],
     output_path: Path,
@@ -2006,6 +2279,12 @@ def write_master_workbook(
     weekly_group_rows = group_weekly_rows(records)
     group_week_trend_detail_rows = weekly_metric_trend_rows(weekly_group_rows, ("group",))
     group_trend_summary = weekly_metric_summary_rows(weekly_group_rows, ("group",))
+    action_board_rows = build_action_board_rows(
+        server_star_detail_rows,
+        store_trend_summary,
+        group_trend_summary,
+        weekly_location_rows,
+    )
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -2015,6 +2294,7 @@ def write_master_workbook(
         weekly_location_rows,
         ranked_rows,
         server_star_detail_rows,
+        action_board_rows,
         store_trend_summary,
         group_trend_summary,
         config,
@@ -2022,9 +2302,12 @@ def write_master_workbook(
         public_start,
         public_end,
     )
+    write_action_board_sheet(wb, action_board_rows)
 
     star_headers = [
         "Category",
+        "Suggested Action",
+        "Priority",
         "Composite Score",
         "Week Start",
         "Week End",
@@ -2047,6 +2330,8 @@ def write_master_workbook(
     star_data = [
         [
             row["category"],
+            star_action(row)[1],
+            star_action(row)[0],
             row["composite_score"],
             row["week_start"],
             row["week_end"],
@@ -2068,7 +2353,7 @@ def write_master_workbook(
         ]
         for row in server_star_detail_rows
     ]
-    write_table_sheet(
+    star_ws = write_table_sheet(
         wb,
         "Rising & Falling Stars",
         star_headers,
@@ -2078,14 +2363,29 @@ def write_master_workbook(
             "A": 16,
             "B": 16,
             "C": 14,
-            "D": 14,
-            "E": 22,
-            "F": 28,
-            "G": 28,
-            "N": 24,
-            "S": 54,
+            "D": 16,
+            "E": 14,
+            "F": 14,
+            "G": 22,
+            "H": 28,
+            "I": 28,
+            "P": 24,
+            "U": 54,
         },
     )
+    for row_index in range(4, len(star_data) + 4):
+        fill = (
+            priority_fill(star_ws.cell(row=row_index, column=1).value)
+            or priority_fill(star_ws.cell(row=row_index, column=2).value)
+            or priority_fill(star_ws.cell(row=row_index, column=3).value)
+        )
+        if fill:
+            for col_index in range(1, len(star_headers) + 1):
+                star_ws.cell(row=row_index, column=col_index).fill = fill
+        star_ws.cell(row=row_index, column=len(star_headers)).alignment = Alignment(
+            wrap_text=True, vertical="top"
+        )
+        star_ws.row_dimensions[row_index].height = 32
 
     server_headers = [
         "Week Start",
@@ -2519,7 +2819,7 @@ def write_master_workbook(
 
     write_data_quality_sheet(wb, records, weekly_location_rows, public_start, public_end)
 
-    notes = wb.create_sheet("Run Notes", 1)
+    notes = wb.create_sheet("Run Notes", 2)
     notes.sheet_view.showGridLines = False
     notes.column_dimensions["A"].width = 28
     notes.column_dimensions["B"].width = 90
@@ -2549,7 +2849,11 @@ def write_master_workbook(
         ),
         (
             "Dashboard",
-            "Dashboard highlights rising/falling servers, latest store trends, all-stores group trends, and current metric leaders.",
+            "Dashboard highlights coach-first items, recognition opportunities, store action pulses, group pulse, and current metric leaders.",
+        ),
+        (
+            "Action Board",
+            "Prioritized follow-up list for coaching, recognition, store review, group review, and data-quality checks.",
         ),
         (
             "Rising/Falling Stars",

@@ -531,6 +531,8 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     )
 
     wb = load_workbook(output_path)
+    assert wb.sheetnames[:3] == ["Dashboard", "Action Board", "Run Notes"]
+    assert "Action Board" in wb.sheetnames
     assert "Rising & Falling Stars" in wb.sheetnames
     assert "Store Week Trends" in wb.sheetnames
     assert "Store Trend Summary" in wb.sheetnames
@@ -544,9 +546,18 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for value in row
         if isinstance(value, str)
     }
-    assert "Rising Stars" in dashboard_values
-    assert "Falling Stars" in dashboard_values
-    assert "Latest Store Trend Summary" in dashboard_values
-    assert "All-Stores Group Trend" in dashboard_values
-    assert "Data Quality Warnings" in dashboard_values
+    assert "Coach First" in dashboard_values
+    assert "Recognize / Replicate" in dashboard_values
+    assert "Store Action Pulse" in dashboard_values
+    assert "All-Stores Group Pulse" in dashboard_values
+    assert "Data Quality" in dashboard_values
     assert "Short Week" in dashboard_values
+
+    action_values = {
+        value
+        for row in wb["Action Board"].iter_rows(values_only=True)
+        for value in row
+        if isinstance(value, str)
+    }
+    assert "Recommended Follow-Up" in action_values
+    assert "Store Review" in action_values
