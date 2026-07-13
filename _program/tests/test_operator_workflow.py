@@ -88,6 +88,50 @@ def ranked_row(week_end: date, *, ranks: tuple[int, int, int, int], **kwargs) ->
     return row
 
 
+def full_week_records(
+    week_end: date,
+    *,
+    location: str,
+    server: str = "Server One",
+    weekly_gross: float = 1200.0,
+    weekly_guests: float = 60.0,
+    weekly_wine: float = 120.0,
+    rate: float = 0.20,
+    ticket_seconds: float = 80 * 60,
+) -> list[metrics.MetricRecord]:
+    records: list[metrics.MetricRecord] = []
+    for offset in range(metrics.OPERATING_WEEK_DAYS):
+        day = week_end - timedelta(days=metrics.OPERATING_WEEK_DAYS - 1 - offset)
+        source_file = f"{location}-{day.isoformat()}.xls"
+        records.append(
+            make_record(
+                day,
+                location,
+                is_location_total=True,
+                gross_sales=weekly_gross / metrics.OPERATING_WEEK_DAYS,
+                guest_count=weekly_guests / metrics.OPERATING_WEEK_DAYS,
+                wine_sales=weekly_wine / metrics.OPERATING_WEEK_DAYS,
+                rate=rate,
+                ticket_seconds=ticket_seconds,
+                source_file=source_file,
+            )
+        )
+        records.append(
+            make_record(
+                day,
+                location,
+                raw_user_name=server,
+                gross_sales=weekly_gross / metrics.OPERATING_WEEK_DAYS,
+                guest_count=weekly_guests / metrics.OPERATING_WEEK_DAYS,
+                wine_sales=weekly_wine / metrics.OPERATING_WEEK_DAYS,
+                rate=rate,
+                ticket_seconds=ticket_seconds,
+                source_file=source_file,
+            )
+        )
+    return records
+
+
 def args_for(tmp_path: Path) -> Namespace:
     return Namespace(
         input_dir=str(tmp_path / "Daily Reports"),
@@ -386,6 +430,139 @@ def test_star_rows_exclude_low_volume_admin_takeout_and_placeholders(tmp_path: P
     assert [row["display_name"] for row in stars] == ["Real Person"]
 
 
+def test_management_scoring_uses_full_baseline_level_and_capped_rank(tmp_path: Path) -> None:
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    weeks = [date(2026, 6, 7), date(2026, 6, 14), date(2026, 6, 21)]
+    weekly_servers = [
+        weekly_row(weeks[0], display_name="Alex Rising", gross_sales=1000, guest_count=50, wine_sales=100, rate=0.20, ticket_seconds=80 * 60, active_days=6),
+        weekly_row(weeks[1], display_name="Alex Rising", gross_sales=1000, guest_count=50, wine_sales=100, rate=0.20, ticket_seconds=80 * 60, active_days=6),
+        weekly_row(weeks[2], display_name="Alex Rising", gross_sales=1500, guest_count=50, wine_sales=180, rate=0.18, ticket_seconds=70 * 60, active_days=6),
+    ]
+    weekly_locations = [dict(row) for row in weekly_servers]
+    ranked = [
+        {**weekly_servers[0], "check_average_rank": 5, "wine_pct_rank": 5, "rate_rank": 5, "ticket_time_rank": 5},
+        {**weekly_servers[1], "check_average_rank": 5, "wine_pct_rank": 5, "rate_rank": 5, "ticket_time_rank": 5},
+        {**weekly_servers[2], "check_average_rank": 1, "wine_pct_rank": 1, "rate_rank": 1, "ticket_time_rank": 1},
+    ]
+
+    rows = metrics.management_server_rows(
+        weekly_servers, weekly_locations, ranked, {}, config
+    )
+
+    assert len(rows) == 1
+    result = rows[0]
+    assert result["prominent"] is True
+    assert result["momentum"] == "Rising"
+    assert result["performance_level"] == "Above Benchmark"
+    assert result["rank_modifier"] == 1
+    assert result["composite_score"] == 9
+    assert result["action"] == "Recognize & Replicate"
+
+
+def test_management_confidence_requires_both_thresholds_and_excludes_service_areas(
+    tmp_path: Path,
+) -> None:
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    weeks = [date(2026, 6, 7), date(2026, 6, 14), date(2026, 6, 21)]
+    servers: list[dict] = []
+    ranked: list[dict] = []
+    for name, guests, days in (("Bar", 100, 6), ("Patio", 40, 4), ("Low Sample", 24, 6), ("Real Person", 25, 3)):
+        for index, week_end in enumerate(weeks):
+            row = weekly_row(
+                week_end,
+                display_name=name,
+                gross_sales=1000 + index * 300,
+                guest_count=guests,
+                wine_sales=100 + index * 40,
+                rate=0.20 - index * 0.01,
+                ticket_seconds=(80 - index * 5) * 60,
+                active_days=days,
+            )
+            servers.append(row)
+            ranked.append(
+                {**row, "check_average_rank": 5 - index, "wine_pct_rank": 5 - index,
+                 "rate_rank": 5 - index, "ticket_time_rank": 5 - index}
+            )
+    locations = [
+        weekly_row(week_end, display_name="", gross_sales=5000, guest_count=250, active_days=6)
+        for week_end in weeks
+    ]
+
+    rows = metrics.management_server_rows(servers, locations, ranked, {}, config)
+    by_name = {row["display_name"]: row for row in rows}
+
+    assert "Bar" not in by_name
+    assert "Patio" not in by_name
+    assert by_name["Low Sample"]["prominent"] is False
+    assert by_name["Low Sample"]["action"] == "Monitor"
+    assert by_name["Real Person"]["prominent"] is True
+
+
+def test_management_baseline_excludes_short_weeks_and_target_takes_precedence(
+    tmp_path: Path,
+) -> None:
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    rows = [
+        weekly_row(date(2026, 6, 7), gross_sales=100, guest_count=5, active_days=2),
+        weekly_row(date(2026, 6, 14), gross_sales=1000, guest_count=50, active_days=6),
+        weekly_row(date(2026, 6, 21), gross_sales=1200, guest_count=60, active_days=6),
+        weekly_row(date(2026, 6, 28), gross_sales=1500, guest_count=60, active_days=6),
+    ]
+    full_by_location, _ = metrics.full_week_ends_by_location(rows)
+    targets = {"RC Richmond": {"check_average": 30.0}}
+
+    result = metrics.management_entity_rows(
+        rows, "location", targets, config, full_by_location
+    )[0]
+
+    assert result["baseline_weeks"] == 2
+    assert result["baseline"]["gross_sales"] == 1100
+    assert result["baseline"]["guest_count"] == 55
+    assert result["benchmark_values"]["check_average"] == 30.0
+    assert result["benchmark_sources"]["check_average"] == "Target"
+    assert result["benchmark_sources"]["gross_sales"] == "2-week baseline"
+
+
+def test_action_tracking_carries_manual_fields_and_moves_cleared_items_to_history() -> None:
+    signal = {
+        "Entity Key": "server|richmond|server one|coaching",
+        "Priority": "High",
+        "Location": "RC Richmond",
+        "Person / Area": "Server One",
+        "Action": "Coach Now",
+        "Signal": "Falling / Below Benchmark",
+        "Why It Matters": "Watch: check average",
+        "Recommended Next Step": "Coach check building.",
+        "Performance Level": "Below Benchmark",
+        "Momentum": "Falling",
+        "Confidence": "High",
+        "Last Seen": date(2026, 6, 21),
+    }
+    current, history = metrics.merge_management_actions([signal], {})
+    assert not history
+    current[0]["Status"] = "In Progress"
+    current[0]["Owner"] = "Pat Manager"
+    current[0]["Due Date"] = date(2026, 6, 30)
+    current[0]["Manager Notes"] = "Review Friday"
+    next_signal = {**signal, "Last Seen": date(2026, 6, 28)}
+
+    carried, history = metrics.merge_management_actions(
+        [next_signal], {"active_actions": current, "action_history": []}
+    )
+
+    assert carried[0]["Action ID"] == current[0]["Action ID"]
+    assert carried[0]["Status"] == "In Progress"
+    assert carried[0]["Owner"] == "Pat Manager"
+    assert carried[0]["Due Date"] == date(2026, 6, 30)
+    assert carried[0]["Manager Notes"] == "Review Friday"
+    assert carried[0]["Weeks Open"] == 2
+    cleared, history = metrics.merge_management_actions(
+        [], {"active_actions": carried, "action_history": []}
+    )
+    assert cleared == []
+    assert history[0]["Signal State"] == "Cleared"
+
+
 def test_store_week_trend_deltas() -> None:
     prior_week = weekly_row(
         date(2026, 6, 7),
@@ -488,35 +665,22 @@ def test_all_stores_group_aggregation_and_trend_deltas() -> None:
 def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_path: Path) -> None:
     config = metrics.load_config(tmp_path / "missing-config.json")
     records: list[metrics.MetricRecord] = []
-    for report_date, gross, wine, rate, ticket_seconds in (
-        (date(2026, 6, 7), 1000, 100, 2.0, 25 * 60),
-        (date(2026, 6, 14), 1500, 180, 1.5, 20 * 60),
+    for week_end, gross, wine, rate, ticket_seconds in (
+        (date(2026, 6, 7), 1000, 100, 0.20, 80 * 60),
+        (date(2026, 6, 14), 1100, 110, 0.20, 80 * 60),
+        (date(2026, 6, 21), 1600, 200, 0.18, 70 * 60),
     ):
         for location in ("RC Richmond", "RC Virginia Beach"):
-            records.append(
-                make_record(
-                    report_date,
-                    location,
-                    is_location_total=True,
-                    gross_sales=gross * 2,
-                    guest_count=100,
-                    wine_sales=wine * 2,
+            records.extend(
+                full_week_records(
+                    week_end,
+                    location=location,
+                    weekly_gross=gross,
+                    weekly_guests=60,
+                    weekly_wine=wine,
                     rate=rate,
                     ticket_seconds=ticket_seconds,
-                    source_file=f"{location}-{report_date}.xls",
-                )
-            )
-            records.append(
-                make_record(
-                    report_date,
-                    location,
-                    raw_user_name="Server One",
-                    gross_sales=gross,
-                    guest_count=50,
-                    wine_sales=wine,
-                    rate=rate,
-                    ticket_seconds=ticket_seconds,
-                    source_file=f"{location}-{report_date}.xls",
+                    server="Alex Rising",
                 )
             )
 
@@ -526,19 +690,17 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         output_path,
         config,
         tmp_path / "Daily Reports",
-        date(2026, 6, 9),
-        date(2026, 6, 14),
+        date(2026, 6, 16),
+        date(2026, 6, 21),
     )
 
     wb = load_workbook(output_path)
-    assert wb.sheetnames[:3] == ["Dashboard", "Action Board", "Run Notes"]
-    assert "Action Board" in wb.sheetnames
-    assert "Rising & Falling Stars" in wb.sheetnames
-    assert "Store Week Trends" in wb.sheetnames
-    assert "Store Trend Summary" in wb.sheetnames
-    assert "Group Week Trends" in wb.sheetnames
-    assert "Group Trend Summary" in wb.sheetnames
+    assert wb.sheetnames[:9] == metrics.VISIBLE_MANAGEMENT_SHEETS
     assert wb["_Dashboard Chart Data"].sheet_state == "hidden"
+    assert wb["Weekly Server Metrics"].sheet_state == "hidden"
+    assert wb["Store Week Trends"].sheet_state == "hidden"
+    assert wb["Dashboard"].sheet_state == "visible"
+    assert wb["Action Board"].sheet_state == "visible"
 
     dashboard_values = {
         value
@@ -546,12 +708,11 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for value in row
         if isinstance(value, str)
     }
-    assert "Coach First" in dashboard_values
+    assert "Act First" in dashboard_values
     assert "Recognize / Replicate" in dashboard_values
-    assert "Store Action Pulse" in dashboard_values
-    assert "All-Stores Group Pulse" in dashboard_values
-    assert "Data Quality" in dashboard_values
-    assert "Short Week" in dashboard_values
+    assert "Store Pulse" in dashboard_values
+    assert any("LATEST WEEK COMPLETE" in value for value in dashboard_values)
+    assert len(wb["Dashboard"]._charts) == 2
 
     action_values = {
         value
@@ -559,5 +720,85 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for value in row
         if isinstance(value, str)
     }
-    assert "Recommended Follow-Up" in action_values
-    assert "Store Review" in action_values
+    assert "Owner" in action_values
+    assert "Due Date" in action_values
+    assert "Status" in action_values
+    assert "Recommended Next Step" in action_values
+    assert len(wb["Action Board"].data_validations.dataValidation) == 2
+    assert len(wb["Action Board"].conditional_formatting) >= 3
+    assert "ManagementTargets" in wb["Management Setup"].tables
+
+
+def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path: Path) -> None:
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    records: list[metrics.MetricRecord] = []
+    for week_end, gross, wine in (
+        (date(2026, 6, 7), 1000, 100),
+        (date(2026, 6, 14), 1100, 110),
+        (date(2026, 6, 21), 1600, 200),
+    ):
+        for location in ("RC Richmond", "RC Virginia Beach"):
+            records.extend(
+                full_week_records(
+                    week_end,
+                    location=location,
+                    weekly_gross=gross,
+                    weekly_guests=60,
+                    weekly_wine=wine,
+                    rate=0.18 if week_end == date(2026, 6, 21) else 0.20,
+                    ticket_seconds=(70 if week_end == date(2026, 6, 21) else 80) * 60,
+                    server="Alex Rising",
+                )
+            )
+    output_path = tmp_path / "Red_Onion_Server_Master.xlsx"
+    metrics.write_master_workbook(
+        records, output_path, config, tmp_path / "Daily Reports",
+        date(2026, 6, 16), date(2026, 6, 21),
+    )
+    wb = load_workbook(output_path)
+    setup = wb["Management Setup"]
+    setup["D7"] = 28.0
+    setup["J6"] = "Pat Manager"
+    actions = wb["Action Board"]
+    assert actions.max_row >= 5
+    actions["D5"] = "In Progress"
+    actions["E5"] = "Pat Manager"
+    actions["F5"] = date(2026, 6, 30)
+    actions["N5"] = "Follow up Friday"
+    action_id = actions["A5"].value
+    wb.save(output_path)
+    wb.close()
+
+    metrics.write_master_workbook(
+        records, output_path, config, tmp_path / "Daily Reports",
+        date(2026, 6, 16), date(2026, 6, 21),
+    )
+
+    regenerated = load_workbook(output_path, data_only=False)
+    assert regenerated["Management Setup"]["D7"].value == 28.0
+    assert regenerated["Management Setup"]["J6"].value == "Pat Manager"
+    action_rows = metrics.records_from_sheet(regenerated["Action Board"], "Action ID")
+    carried = next(row for row in action_rows if row["Action ID"] == action_id)
+    assert carried["Status"] == "In Progress"
+    assert carried["Owner"] == "Pat Manager"
+    assert carried["Due Date"].date() == date(2026, 6, 30)
+    assert carried["Manager Notes"] == "Follow up Friday"
+    regenerated.close()
+
+
+def test_unreadable_existing_master_fails_without_overwriting(tmp_path: Path) -> None:
+    output_path = tmp_path / "Red_Onion_Server_Master.xlsx"
+    output_path.write_text("not an xlsx", encoding="utf-8")
+    original = output_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="Could not read the existing master workbook"):
+        metrics.write_master_workbook(
+            [make_record(date(2026, 6, 7))],
+            output_path,
+            metrics.load_config(tmp_path / "missing-config.json"),
+            tmp_path,
+            date(2026, 6, 3),
+            date(2026, 6, 7),
+        )
+
+    assert output_path.read_bytes() == original

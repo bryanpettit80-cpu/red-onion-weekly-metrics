@@ -11,10 +11,49 @@
   "master_min_guest_count_for_rankings": 1,
   "dashboard_min_guest_count_for_trends": 25,
   "dashboard_min_active_days_for_trends": 3,
+  "dashboard_min_prior_full_weeks": 2,
+  "dashboard_min_prior_guest_count": 50,
+  "dashboard_baseline_full_weeks": 4,
   "dashboard_exclude_name_contains": [
     "Banquet",
     "Server"
   ],
+  "dashboard_exclude_exact_names": [
+    "Bar",
+    "Patio",
+    "Banquet",
+    "Takeout"
+  ],
+  "management_score_thresholds": {
+    "check_average": {
+      "neutral": 2.5,
+      "strong": 5.0,
+      "lower_is_better": false
+    },
+    "wine_pct": {
+      "neutral": 0.005,
+      "strong": 0.01,
+      "lower_is_better": false
+    },
+    "rate_of_sale_by_guest_count": {
+      "neutral": 0.005,
+      "strong": 0.01,
+      "lower_is_better": true
+    },
+    "average_ticket_time_seconds": {
+      "neutral": 150.0,
+      "strong": 300.0,
+      "lower_is_better": true
+    }
+  },
+  "management_materiality": {
+    "sales_pct": 0.05,
+    "guest_pct": 0.05,
+    "check_average": 2.5,
+    "wine_pct": 0.005,
+    "rate": 0.005,
+    "ticket_minutes": 2.5
+  },
   "public_name_aliases": {
     "Bar 1 Bar 1": "Bar",
     "Bar Server": "Bar",

@@ -41,9 +41,18 @@ The command-line defaults are rooted one level above `_program`:
 
 The master workbook is rebuilt from active daily reports plus archived daily reports found under `Archive - Old Files`.
 
-## Master Workbook Trends
+## Master Workbook Management Layer
 
-The master workbook includes rising/falling server stars, store weekly trends, store trend summaries, all-stores group weekly trends, and an all-stores group summary. Dashboard trend eligibility is controlled by `dashboard_min_guest_count_for_trends` and `dashboard_min_active_days_for_trends` in `red_onion_config.json`.
+The master workbook separates performance level from momentum:
+
+- Momentum compares the latest full week with up to four prior full weeks across check average, wine percentage, rate of sale, and ticket time.
+- Performance level compares the latest values with optional management targets, falling back to the store rolling baseline.
+- Average rank movement is capped at a one-point modifier so it does not double-count the underlying metrics.
+- Prominent server actions require both the current-week volume thresholds and enough prior full-week history.
+
+`Management Setup` targets, owner names, and manual `Action Board` fields are read from the existing master before regeneration. The new workbook is written to a temporary file and atomically replaces the prior master only after validation succeeds.
+
+Technical calculation and raw-detail sheets remain in the workbook but are hidden by default. Do not delete them from the generator; they provide auditability and chart sources.
 
 ## Maintenance Notes
 

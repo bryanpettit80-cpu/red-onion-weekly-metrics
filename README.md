@@ -42,7 +42,10 @@ The program reads the business date inside the workbook. The filename date is on
   - `Output\Check_Wine_RVA<week_end>.xlsx`
   - `Output\Check_Wine_VB<week_end>.xlsx`
   - `Output\Red_Onion_Server_Master.xlsx`
-- The master workbook includes rising/falling server trends, store trend summaries, and an all-stores group trend summary.
+- The master workbook opens to a management dashboard with current KPIs, store and group trends, selective rising/falling stars, and prioritized follow-up actions.
+- Server actions require a credible sample: at least 25 guests, 3 active days, 2 prior full weeks, and 50 prior-period guests.
+- Partial weeks stay visible in Data Quality but are excluded from management baselines and prominent server actions.
+- Management can assign action owners, due dates, status, and notes in the master workbook. Those fields carry forward on the next successful run.
 - Moves successfully processed source files to:
 
 ```text
@@ -57,11 +60,17 @@ If parsing or workbook creation fails, the source files stay in `Daily Reports` 
 
 Close any open output workbook before rerunning. Excel can block replacement while a workbook is open.
 
+If the master workbook cannot be read or replaced, the run stops before moving the daily reports. Existing targets and action notes are never intentionally discarded.
+
 If Python is missing, install Python 3.9 or newer and select `Add python.exe to PATH`.
 
 ## Configuration
 
-Configuration lives in `_program\red_onion_config.json`. It controls location short codes, minimum guest counts, dashboard trend eligibility, display aliases, and public/dashboard exclusions.
+Configuration lives in `_program\red_onion_config.json`. It controls location short codes, confidence rules, scoring thresholds, materiality thresholds, display aliases, and exclusions.
+
+The master workbook also contains a `Management Setup` sheet. Blue cells hold optional store/group targets and the owner dropdown list. Blank targets use the rolling baseline of up to four prior full Tuesday-Sunday weeks. Setup edits take effect on the next weekly run.
+
+The management tabs are shown first. Raw daily, weekly, ranking, and calculation tabs remain in the workbook but are hidden by default for a cleaner management view.
 
 ## What Is Not Redundant
 
