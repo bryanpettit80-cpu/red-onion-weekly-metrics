@@ -5,8 +5,8 @@ This project builds the Red Onion weekly metrics snapshot. Keep the repository f
 ## Workflow
 
 - Treat raw source files and exported reports as local operating data unless they are already intentionally tracked.
-- Keep the root folder operator-friendly: `Daily Reports`, `Output`, `Archive - Old Files`, one root cmd launcher, and `_program` for technical files.
-- Preserve `Run Weekly Snapshot.cmd` as the root operator launcher unless a requested change updates the operator flow.
+- Keep the deployed Dropbox parent operator-friendly: `01 Daily Reports - Drop Here`, `02 Finished Reports`, `03 Archive`, one root cmd launcher, and `Red Onion Weekly Metrics Automation` for the Git repository.
+- Preserve `Run Weekly Snapshot.cmd` as the outer operator launcher. The tracked launcher must also work when the repository is used standalone.
 - Keep dependencies minimal and documented in `_program\requirements.txt` and `_program\pyproject.toml`.
 - Do not introduce external services or credentials for a simple weekly run.
 - Do not add Darden fiscal calendar logic, gift-card workflows, Gmail import, or monthly close behavior unless explicitly requested.

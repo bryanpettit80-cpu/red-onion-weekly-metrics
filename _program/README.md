@@ -33,13 +33,15 @@ python -m py_compile _program\red_onion_weekly_metrics.py
 
 ## Runtime Folders
 
-The command-line defaults are rooted one level above `_program`:
+In the deployed Dropbox layout, runtime folders are rooted one level above the `Red Onion Weekly Metrics Automation` repository:
 
-- `..\Daily Reports`
-- `..\Output`
-- `..\Archive - Old Files`
+- `..\01 Daily Reports - Drop Here`
+- `..\02 Finished Reports`
+- `..\03 Archive`
 
-The master workbook is rebuilt from active daily reports plus archived daily reports found under `Archive - Old Files`.
+When the repository is used outside that named Dropbox folder, the same numbered folders default to the repository root. The outer launcher passes `-OperationsRoot` explicitly.
+
+The master workbook is rebuilt from active daily reports plus archived daily reports found under `03 Archive`.
 
 ## Master Workbook Management Layer
 

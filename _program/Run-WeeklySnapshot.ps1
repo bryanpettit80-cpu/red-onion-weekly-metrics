@@ -1,4 +1,5 @@
 param(
+    [string]$OperationsRoot,
     [string]$InputDir,
     [string]$OutputDir,
     [string]$ArchiveDir
@@ -7,10 +8,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ProgramDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ProjectDir = Split-Path -Parent $ProgramDir
-$DefaultInputDir = Join-Path $ProjectDir "Daily Reports"
-$DefaultOutputDir = Join-Path $ProjectDir "Output"
-$DefaultArchiveDir = Join-Path $ProjectDir "Archive - Old Files"
+$RepositoryRoot = Split-Path -Parent $ProgramDir
+if (-not $OperationsRoot) {
+    if ((Split-Path -Leaf $RepositoryRoot) -eq "Red Onion Weekly Metrics Automation") {
+        $OperationsRoot = Split-Path -Parent $RepositoryRoot
+    } else {
+        $OperationsRoot = $RepositoryRoot
+    }
+}
+$OperationsRoot = [System.IO.Path]::GetFullPath($OperationsRoot)
+$DefaultInputDir = Join-Path $OperationsRoot "01 Daily Reports - Drop Here"
+$DefaultOutputDir = Join-Path $OperationsRoot "02 Finished Reports"
+$DefaultArchiveDir = Join-Path $OperationsRoot "03 Archive"
 $VenvDir = Join-Path $env:LOCALAPPDATA "RedOnionMetrics\.venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 

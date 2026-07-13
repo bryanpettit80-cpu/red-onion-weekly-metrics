@@ -1,29 +1,30 @@
 # Red Onion Weekly Metrics
 
-This folder is the weekly Red Onion metrics workspace. It turns Toast/Marketing Vitals daily `.xls` reports into weekly public snapshots and the internal master workbook.
+This repository contains the Red Onion weekly metrics automation. In Dropbox it lives inside the operator workspace as `Red Onion Weekly Metrics Automation`; operators use the numbered folders and launcher one level above it.
 
 ## Folder Layout
 
 ```text
 Red Onion Metrics\
-  Daily Reports\
-  Output\
-  Archive - Old Files\
-  _program\
+  00 START HERE - Red Onion Weekly Metrics.txt
+  01 Daily Reports - Drop Here\
+  02 Finished Reports\
+  03 Archive\
+  Red Onion Weekly Metrics Automation\
   Run Weekly Snapshot.cmd
 ```
 
-- `Daily Reports`: drop the current Toast daily `.xls` files here.
-- `Output`: generated weekly workbooks appear here.
-- `Archive - Old Files`: processed source files and old local files are preserved here.
-- `_program`: code, config, dependencies, tests, and the internal PowerShell runner. Operators should not need this folder.
+- `01 Daily Reports - Drop Here`: drop the current Toast daily `.xls` files here.
+- `02 Finished Reports`: generated weekly workbooks appear here.
+- `03 Archive`: processed reports, prior layouts, and historical workbooks are preserved here.
+- `Red Onion Weekly Metrics Automation`: Git repository, code, config, tests, and technical documentation. Operators should not edit this folder.
 - `Run Weekly Snapshot.cmd`: the only root file operators need to run.
 
 ## Weekly Run
 
-1. Save the current Toast/Marketing Vitals files into `Daily Reports`.
+1. Save the current Toast/Marketing Vitals files into `01 Daily Reports - Drop Here`.
 2. Double-click `Run Weekly Snapshot.cmd`.
-3. Open the generated workbooks in `Output`.
+3. Open the generated workbooks in `02 Finished Reports`.
 
 The report files should be named like:
 
@@ -36,12 +37,12 @@ The program reads the business date inside the workbook. The filename date is on
 ## What The Run Does
 
 - Uses Red Onion's existing Tuesday-Sunday operating week. Mondays are closed and excluded from weekly public snapshots.
-- Stops if `Daily Reports` is empty.
-- Stops if `Daily Reports` contains files from more than one Tuesday-Sunday operating week and lists the files to fix.
+- Stops if `01 Daily Reports - Drop Here` is empty.
+- Stops if the drop folder contains files from more than one Tuesday-Sunday operating week and lists the files to fix.
 - Creates or replaces:
-  - `Output\Check_Wine_RVA<week_end>.xlsx`
-  - `Output\Check_Wine_VB<week_end>.xlsx`
-  - `Output\Red_Onion_Server_Master.xlsx`
+  - `02 Finished Reports\Check_Wine_RVA<week_end>.xlsx`
+  - `02 Finished Reports\Check_Wine_VB<week_end>.xlsx`
+  - `02 Finished Reports\Red_Onion_Server_Master.xlsx`
 - The master workbook opens to a management dashboard with current KPIs, store and group trends, selective rising/falling stars, and prioritized follow-up actions.
 - Server actions require a credible sample: at least 25 guests, 3 active days, 2 prior full weeks, and 50 prior-period guests.
 - Partial weeks stay visible in Data Quality but are excluded from management baselines and prominent server actions.
@@ -49,14 +50,14 @@ The program reads the business date inside the workbook. The filename date is on
 - Moves successfully processed source files to:
 
 ```text
-Archive - Old Files\processed-daily-reports\week-ending-YYYY-MM-DD\
+03 Archive\processed-daily-reports\week-ending-YYYY-MM-DD\
 ```
 
-The master workbook reads archived daily reports plus the active files in `Daily Reports`, so moving processed source files does not remove historical rows from the master workbook.
+The master workbook reads archived daily reports plus the active files in the drop folder, so moving processed source files does not remove historical rows from the master workbook.
 
 ## If Something Fails
 
-If parsing or workbook creation fails, the source files stay in `Daily Reports` so they can be fixed and rerun.
+If parsing or workbook creation fails, the source files stay in `01 Daily Reports - Drop Here` so they can be fixed and rerun.
 
 Close any open output workbook before rerunning. Excel can block replacement while a workbook is open.
 
@@ -75,5 +76,5 @@ The management tabs are shown first. Raw daily, weekly, ranking, and calculation
 ## What Is Not Redundant
 
 - `Run Weekly Snapshot.cmd` is the operator launcher to double-click.
-- `_program\Run-WeeklySnapshot.ps1` is the internal runner used by the launcher.
-- `_program\red_onion_weekly_metrics.py` is the actual workbook-building program.
+- `Red Onion Weekly Metrics Automation\_program\Run-WeeklySnapshot.ps1` is the internal runner used by the root launcher.
+- `Red Onion Weekly Metrics Automation\_program\red_onion_weekly_metrics.py` is the workbook-building program.

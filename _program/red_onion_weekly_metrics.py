@@ -150,10 +150,15 @@ OPERATING_WEEK_LABEL = "Tuesday-Sunday"
 FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS = 1
 DAILY_REPORT_PATTERN = "Daily Report*.xls"
 PROGRAM_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = PROGRAM_DIR.parent
-DEFAULT_INPUT_DIR = PROJECT_ROOT / "Daily Reports"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "Output"
-DEFAULT_ARCHIVE_DIR = PROJECT_ROOT / "Archive - Old Files"
+REPOSITORY_ROOT = PROGRAM_DIR.parent
+PROJECT_ROOT = (
+    REPOSITORY_ROOT.parent
+    if REPOSITORY_ROOT.name == "Red Onion Weekly Metrics Automation"
+    else REPOSITORY_ROOT
+)
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "01 Daily Reports - Drop Here"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "02 Finished Reports"
+DEFAULT_ARCHIVE_DIR = PROJECT_ROOT / "03 Archive"
 DEFAULT_CONFIG_PATH = PROGRAM_DIR / "red_onion_config.json"
 
 
@@ -393,8 +398,8 @@ def active_week_for_paths(records_by_path: dict[Path, list[MetricRecord]]) -> tu
 
     if len(groups) > 1:
         lines = [
-            "Daily Reports contains files from more than one Tuesday-Sunday operating week.",
-            "Move the extra files out of Daily Reports and rerun:",
+            "The daily-report drop folder contains files from more than one Tuesday-Sunday operating week.",
+            "Move the extra files out of 01 Daily Reports - Drop Here and rerun:",
         ]
         for (_, week_end), paths in sorted(groups.items()):
             lines.append(f"  week-ending-{week_end.isoformat()}:")
@@ -4525,7 +4530,7 @@ def run(args: argparse.Namespace) -> list[Path]:
     if not active_paths:
         raise FileNotFoundError(
             f"No active daily .xls reports found in {input_dir}. "
-            "Drop current Toast reports into Daily Reports and rerun."
+            "Drop current Toast reports into 01 Daily Reports - Drop Here and rerun."
         )
 
     active_records_by_path = read_reports_by_path(active_paths, config)

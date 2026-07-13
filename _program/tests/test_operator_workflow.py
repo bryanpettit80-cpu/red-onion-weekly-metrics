@@ -316,11 +316,26 @@ def test_duplicate_archive_handling_removes_identical_active_copy(tmp_path: Path
 def test_parser_defaults_point_to_operator_root_folders() -> None:
     args = metrics.build_parser().parse_args([])
 
-    assert Path(args.input_dir).name == "Daily Reports"
-    assert Path(args.output_dir).name == "Output"
-    assert Path(args.archive_dir).name == "Archive - Old Files"
+    assert Path(args.input_dir).name == "01 Daily Reports - Drop Here"
+    assert Path(args.output_dir).name == "02 Finished Reports"
+    assert Path(args.archive_dir).name == "03 Archive"
     assert Path(args.input_dir).parent == metrics.PROJECT_ROOT
     assert Path(args.config).parent == metrics.PROGRAM_DIR
+
+
+def test_launchers_route_to_named_operator_workspace() -> None:
+    root_launcher = (metrics.REPOSITORY_ROOT / "Run Weekly Snapshot.cmd").read_text(
+        encoding="utf-8"
+    )
+    powershell_runner = (metrics.PROGRAM_DIR / "Run-WeeklySnapshot.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Red Onion Weekly Metrics Automation" in root_launcher
+    assert "-OperationsRoot" in root_launcher
+    assert "01 Daily Reports - Drop Here" in powershell_runner
+    assert "02 Finished Reports" in powershell_runner
+    assert "03 Archive" in powershell_runner
 
 
 def test_star_scoring_uses_all_metric_families_and_rank_movement(tmp_path: Path) -> None:

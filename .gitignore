@@ -11,10 +11,13 @@ debug.log
 *.lnk
 ~$*.xlsx
 
-# Keep the standard workflow folders in GitHub, but ignore their contents.
+# Runtime folders are outside the deployed automation repository. Ignore local
+# standalone copies when the repository is used outside Dropbox.
+01 Daily Reports - Drop Here/*
+02 Finished Reports/*
+03 Archive/*
+
+# Legacy local layouts remain ignored until an operator workspace is migrated.
 Daily Reports/*
-!Daily Reports/.gitkeep
 Output/*
-!Output/.gitkeep
 Archive - Old Files/*
-!Archive - Old Files/.gitkeep
