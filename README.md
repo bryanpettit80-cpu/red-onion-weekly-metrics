@@ -59,6 +59,8 @@ The master workbook reads archived daily reports plus the active files in the dr
 
 If parsing or workbook creation fails, the source files stay in `01 Daily Reports - Drop Here` so they can be fixed and rerun.
 
+If the window identifies a file containing `No Data Available`, replace that file with a complete Toast Daily Report export. The program does not create a partial workbook or archive any current files when an input report is invalid.
+
 Close any open output workbook before rerunning. Excel can block replacement while a workbook is open.
 
 If the master workbook cannot be read or replaced, the run stops before moving the daily reports. Existing targets and action notes are never intentionally discarded.

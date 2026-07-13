@@ -151,6 +151,36 @@ def test_zero_active_files_stop_with_clear_message(tmp_path: Path) -> None:
         metrics.run(args)
 
 
+def test_no_data_export_stops_with_file_specific_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = args_for(tmp_path)
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    source = input_dir / "Daily Report - TM - 07-12-2026.xls"
+    source.write_text("no data", encoding="utf-8")
+
+    class NoDataWorkbook:
+        sheet_names = ["No Data Available"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setattr(metrics.pd, "ExcelFile", lambda *args, **kwargs: NoDataWorkbook())
+
+    with pytest.raises(ValueError) as exc_info:
+        metrics.run(args)
+
+    message = str(exc_info.value)
+    assert source.name in message
+    assert "No Data Available" in message
+    assert "No workbooks were created and no source files were moved" in message
+    assert source.exists()
+
+
 def test_mixed_active_weeks_stop_with_exact_file_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -336,6 +366,8 @@ def test_launchers_route_to_named_operator_workspace() -> None:
     assert "01 Daily Reports - Drop Here" in powershell_runner
     assert "02 Finished Reports" in powershell_runner
     assert "03 Archive" in powershell_runner
+    assert "$ReportExitCode = $LASTEXITCODE" in powershell_runner
+    assert "exit $ReportExitCode" in powershell_runner
 
 
 def test_star_scoring_uses_all_metric_families_and_rank_movement(tmp_path: Path) -> None:

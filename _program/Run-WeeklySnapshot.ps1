@@ -62,8 +62,20 @@ if (-not (Test-Path $VenvPython)) {
     } else {
         & $BasePython[0] -m venv $VenvDir
     }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create the Red Onion Python environment (exit code $LASTEXITCODE)."
+    }
 }
 
-& $VenvPython -m pip install --upgrade pip
-& $VenvPython -m pip install -r (Join-Path $ProgramDir "requirements.txt")
+& $VenvPython -m pip install --disable-pip-version-check --quiet -r (Join-Path $ProgramDir "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not install the Red Onion program requirements (exit code $LASTEXITCODE)."
+}
+
 & $VenvPython (Join-Path $ProgramDir "red_onion_weekly_metrics.py") --input-dir $InputDir --output-dir $OutputDir --archive-dir $ArchiveDir --config (Join-Path $ProgramDir "red_onion_config.json")
+$ReportExitCode = $LASTEXITCODE
+if ($ReportExitCode -ne 0) {
+    exit $ReportExitCode
+}
+
+exit 0

@@ -283,7 +283,21 @@ def is_numbered_server_placeholder(name: Any) -> bool:
 
 
 def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]:
-    df = pd.ExcelFile(path, engine="xlrd").parse("Report(All)", header=None)
+    with pd.ExcelFile(path, engine="xlrd") as workbook:
+        if "Report(All)" not in workbook.sheet_names:
+            if "No Data Available" in workbook.sheet_names:
+                raise ValueError(
+                    "the Toast export contains a 'No Data Available' worksheet instead of report "
+                    "data. Replace it with a complete Daily Report export, then rerun. No "
+                    "workbooks were created and no source files were moved."
+                )
+            available_sheets = ", ".join(workbook.sheet_names) or "none"
+            raise ValueError(
+                "the required 'Report(All)' worksheet is missing "
+                f"(worksheets found: {available_sheets}). Replace the file with a complete Toast "
+                "Daily Report export, then rerun."
+            )
+        df = workbook.parse("Report(All)", header=None)
     report_date = parse_report_date(df, path)
     header_row, location_col, block_starts = find_header_row(df)
     location_names = set(config["locations"])
@@ -353,7 +367,10 @@ def archived_daily_report_paths(archive_dir: Path) -> list[Path]:
 def read_reports_by_path(paths: Iterable[Path], config: dict[str, Any]) -> dict[Path, list[MetricRecord]]:
     records_by_path: dict[Path, list[MetricRecord]] = {}
     for path in paths:
-        records = parse_daily_report(path, config)
+        try:
+            records = parse_daily_report(path, config)
+        except Exception as exc:
+            raise ValueError(f"Could not process {path.name}: {exc}") from exc
         if not records:
             raise ValueError(f"No metric rows were found in {path}")
         records_by_path[path] = records
