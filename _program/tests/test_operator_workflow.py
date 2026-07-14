@@ -610,6 +610,15 @@ def test_action_tracking_carries_manual_fields_and_moves_cleared_items_to_histor
     assert history[0]["Signal State"] == "Cleared"
 
 
+def test_action_episode_id_uses_stable_sha256_identifier() -> None:
+    action_id = metrics.action_episode_id(
+        "server|richmond|server one|coaching", date(2026, 6, 21)
+    )
+
+    assert action_id == "56AFCB611719"
+    assert len(action_id) == 12
+
+
 def test_store_week_trend_deltas() -> None:
     prior_week = weekly_row(
         date(2026, 6, 7),

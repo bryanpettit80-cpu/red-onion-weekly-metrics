@@ -3516,7 +3516,7 @@ def read_management_state(output_path: Path) -> dict[str, Any]:
 
 
 def action_episode_id(entity_key: str, first_seen: date) -> str:
-    digest = hashlib.sha1(f"{entity_key}|{first_seen.isoformat()}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{entity_key}|{first_seen.isoformat()}".encode("utf-8")).hexdigest()
     return digest[:12].upper()
 
 
