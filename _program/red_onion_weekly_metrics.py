@@ -17,6 +17,7 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.data_source import AxDataSource, StrRef
+from openpyxl.chart.series import SeriesLabel
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -36,6 +37,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dashboard_min_prior_full_weeks": 2,
     "dashboard_min_prior_guest_count": 50,
     "dashboard_baseline_full_weeks": 4,
+    "dashboard_long_term_full_weeks": 8,
+    "dashboard_long_term_block_weeks": 4,
+    "dashboard_long_term_full_min_recent_guests": 100,
+    "dashboard_long_term_full_min_earlier_guests": 100,
+    "dashboard_long_term_developing_min_total_weeks": 6,
+    "dashboard_long_term_developing_min_recent_weeks": 3,
+    "dashboard_long_term_developing_min_earlier_weeks": 2,
+    "dashboard_long_term_developing_min_recent_guests": 75,
+    "dashboard_long_term_developing_min_earlier_guests": 50,
     "dashboard_exclude_name_contains": ["Banquet", "Server"],
     "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout"],
     "management_score_thresholds": {
@@ -108,6 +118,13 @@ TARGET_FIELDS: tuple[tuple[str, str], ...] = (
     ("average_ticket_time_seconds", "Ticket Time Target (Min)"),
 )
 
+SERVER_TREND_FIELDS: tuple[str, ...] = (
+    "check_average",
+    "wine_pct",
+    "rate_of_sale_by_guest_count",
+    "average_ticket_time_seconds",
+)
+
 ACTION_HEADERS = [
     "Action ID",
     "Entity Key",
@@ -148,7 +165,10 @@ OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
 OPERATING_WEEK_DAYS = 6
 OPERATING_WEEK_LABEL = "Tuesday-Sunday"
 FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS = 1
-DAILY_REPORT_PATTERN = "Daily Report*.xls"
+DAILY_REPORT_PREFIX = "daily report"
+DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
+DAILY_REPORT_FORMAT_LABEL = ".xls or .xlsx"
+CANONICAL_DAILY_ARCHIVE_FOLDER = "processed-daily-reports"
 PROGRAM_DIR = Path(__file__).resolve().parent
 REPOSITORY_ROOT = PROGRAM_DIR.parent
 PROJECT_ROOT = (
@@ -177,6 +197,28 @@ class MetricRecord:
     wine_pct: float
     rate_of_sale_by_guest_count: float
     average_ticket_time_seconds: float
+
+
+@dataclass(frozen=True)
+class ReportResolution:
+    records_by_path: dict[Path, list[MetricRecord]]
+    duplicate_paths: tuple[Path, ...]
+    business_dates: tuple[date, ...]
+
+
+@dataclass(frozen=True)
+class HistoryMigrationPlan:
+    copy_pairs: tuple[tuple[Path, Path], ...]
+    effective_records_by_path: dict[Path, list[MetricRecord]]
+    duplicate_paths: tuple[Path, ...]
+    business_dates: tuple[date, ...]
+
+
+@dataclass(frozen=True)
+class HistoryMigrationResult:
+    copied_paths: tuple[Path, ...]
+    duplicate_files_ignored: int
+    business_dates_considered: int
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -282,8 +324,19 @@ def is_numbered_server_placeholder(name: Any) -> bool:
     return re.fullmatch(pattern, text, re.IGNORECASE) is not None
 
 
+def daily_report_excel_engine(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".xls":
+        return "xlrd"
+    if suffix == ".xlsx":
+        return "openpyxl"
+    raise ValueError(
+        f"Unsupported daily report format for {path.name}. Use {DAILY_REPORT_FORMAT_LABEL}."
+    )
+
+
 def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]:
-    with pd.ExcelFile(path, engine="xlrd") as workbook:
+    with pd.ExcelFile(path, engine=daily_report_excel_engine(path)) as workbook:
         if "Report(All)" not in workbook.sheet_names:
             if "No Data Available" in workbook.sheet_names:
                 raise ValueError(
@@ -352,16 +405,35 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
     return records
 
 
-def daily_report_paths(input_dir: Path) -> list[Path]:
-    if not input_dir.exists():
+def is_daily_report_path(path: Path) -> bool:
+    return (
+        path.is_file()
+        and not path.name.startswith("~$")
+        and path.name.casefold().startswith(DAILY_REPORT_PREFIX)
+        and path.suffix.lower() in DAILY_REPORT_EXTENSIONS
+    )
+
+
+def find_daily_report_paths(root: Path, *, recursive: bool) -> list[Path]:
+    if not root.exists() or not root.is_dir():
         return []
-    return sorted(path for path in input_dir.glob(DAILY_REPORT_PATTERN) if path.is_file())
+    candidates = root.rglob("*") if recursive else root.iterdir()
+    return sorted(
+        (path for path in candidates if is_daily_report_path(path)),
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def daily_report_paths(input_dir: Path) -> list[Path]:
+    return find_daily_report_paths(input_dir, recursive=False)
+
+
+def canonical_daily_archive_dir(archive_dir: Path) -> Path:
+    return archive_dir / CANONICAL_DAILY_ARCHIVE_FOLDER
 
 
 def archived_daily_report_paths(archive_dir: Path) -> list[Path]:
-    if not archive_dir.exists():
-        return []
-    return sorted(path for path in archive_dir.rglob(DAILY_REPORT_PATTERN) if path.is_file())
+    return find_daily_report_paths(canonical_daily_archive_dir(archive_dir), recursive=True)
 
 
 def read_reports_by_path(paths: Iterable[Path], config: dict[str, Any]) -> dict[Path, list[MetricRecord]]:
@@ -377,6 +449,74 @@ def read_reports_by_path(paths: Iterable[Path], config: dict[str, Any]) -> dict[
     return records_by_path
 
 
+def report_date_for_records(path: Path, records: list[MetricRecord]) -> date:
+    report_dates = sorted({record.report_date for record in records})
+    if len(report_dates) != 1:
+        raise ValueError(f"{path.name} contains multiple report dates: {report_dates}")
+    return report_dates[0]
+
+
+def semantic_report_signature(records: list[MetricRecord]) -> tuple[tuple[Any, ...], ...]:
+    def normalized_number(value: float) -> float:
+        number = round(float(value), 6)
+        return 0.0 if number == 0 else number
+
+    return tuple(
+        sorted(
+            (
+                record.location.strip(),
+                record.raw_user_name.strip(),
+                bool(record.is_location_total),
+                normalized_number(record.gross_sales),
+                normalized_number(record.guest_count),
+                normalized_number(record.wine_sales),
+                normalized_number(record.rate_of_sale_by_guest_count),
+                normalized_number(record.average_ticket_time_seconds),
+            )
+            for record in records
+        )
+    )
+
+
+def resolve_report_duplicates(
+    records_by_path: dict[Path, list[MetricRecord]],
+) -> ReportResolution:
+    reports_by_date: dict[date, list[tuple[Path, list[MetricRecord]]]] = defaultdict(list)
+    for path, records in records_by_path.items():
+        reports_by_date[report_date_for_records(path, records)].append((path, records))
+
+    resolved: dict[Path, list[MetricRecord]] = {}
+    duplicates: list[Path] = []
+    for report_date, reports in sorted(reports_by_date.items()):
+        reports.sort(key=lambda item: str(item[0]).casefold())
+        selected_path, selected_records = reports[0]
+        selected_signature = semantic_report_signature(selected_records)
+        conflicting_paths = [
+            path
+            for path, records in reports[1:]
+            if semantic_report_signature(records) != selected_signature
+        ]
+        if conflicting_paths:
+            paths = [selected_path, *conflicting_paths]
+            path_lines = "\n".join(f"  - {path}" for path in paths)
+            raise ValueError(
+                "Conflicting daily reports were found for business date "
+                f"{report_date.isoformat()}. These files contain different metric data:\n"
+                f"{path_lines}\n"
+                "Keep only the correct source or reconcile the reports before rerunning. "
+                "No history files were copied, no workbooks were created, and no active "
+                "source files were moved."
+            )
+        resolved[selected_path] = selected_records
+        duplicates.extend(path for path, _ in reports[1:])
+
+    return ReportResolution(
+        records_by_path=resolved,
+        duplicate_paths=tuple(duplicates),
+        business_dates=tuple(sorted(reports_by_date)),
+    )
+
+
 def flatten_report_records(records_by_path: dict[Path, list[MetricRecord]]) -> list[MetricRecord]:
     records: list[MetricRecord] = []
     for path_records in records_by_path.values():
@@ -387,9 +527,12 @@ def flatten_report_records(records_by_path: dict[Path, list[MetricRecord]]) -> l
 def read_all_reports(input_dir: Path, config: dict[str, Any]) -> list[MetricRecord]:
     paths = daily_report_paths(input_dir)
     if not paths:
-        raise FileNotFoundError(f"No daily .xls reports found in {input_dir}")
+        raise FileNotFoundError(
+            f"No daily reports ({DAILY_REPORT_FORMAT_LABEL}) found in {input_dir}"
+        )
 
-    return flatten_report_records(read_reports_by_path(paths, config))
+    resolution = resolve_report_duplicates(read_reports_by_path(paths, config))
+    return flatten_report_records(resolution.records_by_path)
 
 
 def is_operating_day(day: date) -> bool:
@@ -470,7 +613,7 @@ def archive_destination_for(source_path: Path, archive_dir: Path) -> tuple[Path,
 def archive_processed_files(
     source_paths: Iterable[Path], archive_root: Path, week_end: date
 ) -> list[Path]:
-    archive_dir = archive_root / "processed-daily-reports" / f"week-ending-{week_end.isoformat()}"
+    archive_dir = canonical_daily_archive_dir(archive_root) / f"week-ending-{week_end.isoformat()}"
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     move_plan: list[tuple[Path, Path, bool]] = []
@@ -487,6 +630,99 @@ def archive_processed_files(
         archived_paths.append(destination)
 
     return archived_paths
+
+
+def migration_daily_report_paths(source_dirs: Iterable[Path]) -> list[Path]:
+    paths: dict[Path, None] = {}
+    for source_dir in source_dirs:
+        source_dir = source_dir.resolve()
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise FileNotFoundError(f"History migration source folder was not found: {source_dir}")
+        source_paths = find_daily_report_paths(source_dir, recursive=True)
+        if not source_paths:
+            raise FileNotFoundError(
+                f"No daily reports ({DAILY_REPORT_FORMAT_LABEL}) were found under history "
+                f"migration source: {source_dir}"
+            )
+        for path in source_paths:
+            paths[path.resolve()] = None
+    return sorted(paths, key=lambda path: str(path).casefold())
+
+
+def build_history_migration_plan(
+    source_dirs: Iterable[Path],
+    archive_root: Path,
+    config: dict[str, Any],
+) -> HistoryMigrationPlan:
+    source_paths = migration_daily_report_paths(source_dirs)
+    source_records_by_path = read_reports_by_path(source_paths, config)
+    canonical_paths = archived_daily_report_paths(archive_root)
+    canonical_records_by_path = (
+        read_reports_by_path(canonical_paths, config) if canonical_paths else {}
+    )
+
+    combined_records_by_path = dict(canonical_records_by_path)
+    combined_records_by_path.update(source_records_by_path)
+    resolution = resolve_report_duplicates(combined_records_by_path)
+
+    canonical_dates = {
+        report_date_for_records(path, records)
+        for path, records in canonical_records_by_path.items()
+    }
+    source_paths_by_date: dict[date, list[Path]] = defaultdict(list)
+    for path, records in source_records_by_path.items():
+        source_paths_by_date[report_date_for_records(path, records)].append(path)
+
+    copy_pairs: list[tuple[Path, Path]] = []
+    for report_date, paths in sorted(source_paths_by_date.items()):
+        if report_date in canonical_dates:
+            continue
+        source_path = min(
+            paths,
+            key=lambda path: (path.suffix.lower() != ".xlsx", str(path).casefold()),
+        )
+        _, week_end = week_period_for(report_date)
+        destination_dir = canonical_daily_archive_dir(archive_root) / (
+            f"week-ending-{week_end.isoformat()}"
+        )
+        destination, already_present = archive_destination_for(source_path, destination_dir)
+        if not already_present:
+            copy_pairs.append((source_path, destination))
+
+    return HistoryMigrationPlan(
+        copy_pairs=tuple(copy_pairs),
+        effective_records_by_path=resolution.records_by_path,
+        duplicate_paths=resolution.duplicate_paths,
+        business_dates=resolution.business_dates,
+    )
+
+
+def apply_history_migration_plan(plan: HistoryMigrationPlan) -> tuple[Path, ...]:
+    copied_paths: list[Path] = []
+    for source_path, destination in plan.copy_pairs:
+        if destination.exists():
+            raise RuntimeError(
+                f"History migration destination appeared after preflight: {destination}. "
+                "Nothing was overwritten; rerun the migration."
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination)
+        copied_paths.append(destination)
+    return tuple(copied_paths)
+
+
+def migrate_history_files(
+    source_dirs: Iterable[Path],
+    archive_root: Path,
+    config: dict[str, Any],
+) -> HistoryMigrationResult:
+    plan = build_history_migration_plan(source_dirs, archive_root, config)
+    copied_paths = apply_history_migration_plan(plan)
+    return HistoryMigrationResult(
+        copied_paths=copied_paths,
+        duplicate_files_ignored=len(plan.duplicate_paths),
+        business_dates_considered=len(plan.business_dates),
+    )
 
 
 def aggregate_records(
@@ -1687,15 +1923,25 @@ def soft_fill(color: str) -> PatternFill:
 
 def priority_fill(value: Any) -> PatternFill | None:
     text = str(value or "").casefold()
-    if text in {"high", "coach", "falling star", "traffic watch"}:
+    if text in {
+        "high", "coach", "coach now", "falling", "declining", "falling star",
+        "below benchmark", "traffic watch", "incomplete week",
+    }:
         return soft_fill("F4CCCC")
-    if text in {"medium", "store review", "group review", "upsell watch", "service watch", "mixed watch"}:
+    if text in {
+        "medium", "coach fundamentals", "protect performance", "reinforce improvement",
+        "store review", "group review", "upsell watch", "service watch", "mixed watch",
+        "building history", "low sample",
+    }:
         return soft_fill("FFF2CC")
-    if text in {"recognize", "share", "rising star"}:
+    if text in {
+        "recognize", "recognize & replicate", "share", "rising", "improving",
+        "rising star", "above benchmark",
+    }:
         return soft_fill("D9EAD3")
     if text in {"review", "data quality", "short week"}:
         return soft_fill("D9EAF7")
-    if text in {"monitor", "stable / mixed"}:
+    if text in {"monitor", "stable", "stable / mixed", "on track", "not scored"}:
         return soft_fill("EDEDED")
     return None
 
@@ -2650,7 +2896,7 @@ def _write_master_workbook_base(
     ]
     write_table_sheet(
         wb,
-        "Server Week Trends",
+        "Server Week-over-Week Detail",
         trend_detail_headers,
         trend_detail_data,
         "ServerWeekTrends",
@@ -3067,6 +3313,77 @@ def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, float] | 
     }
 
 
+def management_trend_classification(
+    metric_scores: dict[str, int],
+    rank_modifier: int,
+    *,
+    improving_label: str,
+    declining_label: str,
+) -> tuple[str, int]:
+    composite_score = sum(metric_scores.values()) + rank_modifier
+    positive_count = sum(score > 0 for score in metric_scores.values())
+    negative_count = sum(score < 0 for score in metric_scores.values())
+    if composite_score >= 3 and positive_count >= 2:
+        return improving_label, composite_score
+    if composite_score <= -3 and negative_count >= 2:
+        return declining_label, composite_score
+    return "Stable", composite_score
+
+
+def management_rank_block_movement(
+    recent_rows: list[dict[str, Any]],
+    comparison_rows: list[dict[str, Any]],
+    rank_lookup: dict[tuple[date, str, str], dict[str, Any]],
+) -> tuple[float | None, int]:
+    movements: list[float] = []
+    for rank_field in (
+        "check_average_rank",
+        "wine_pct_rank",
+        "rate_rank",
+        "ticket_time_rank",
+    ):
+        recent_ranks = [
+            rank_lookup[(row["week_end"], row["location"], row["raw_user_name"])].get(rank_field)
+            for row in recent_rows
+            if (row["week_end"], row["location"], row["raw_user_name"]) in rank_lookup
+            and rank_lookup[(row["week_end"], row["location"], row["raw_user_name"])].get(rank_field)
+            is not None
+        ]
+        comparison_ranks = [
+            rank_lookup[(row["week_end"], row["location"], row["raw_user_name"])].get(rank_field)
+            for row in comparison_rows
+            if (row["week_end"], row["location"], row["raw_user_name"]) in rank_lookup
+            and rank_lookup[(row["week_end"], row["location"], row["raw_user_name"])].get(rank_field)
+            is not None
+        ]
+        if recent_ranks and comparison_ranks:
+            movements.append(
+                sum(float(value) for value in comparison_ranks) / len(comparison_ranks)
+                - sum(float(value) for value in recent_ranks) / len(recent_ranks)
+            )
+    average_movement = sum(movements) / len(movements) if movements else None
+    modifier = (
+        1
+        if average_movement is not None and average_movement >= 3
+        else -1
+        if average_movement is not None and average_movement <= -3
+        else 0
+    )
+    return average_movement, modifier
+
+
+def server_trend_context(recent_momentum: str, long_term_direction: str) -> str:
+    contexts = {
+        ("Rising", "Improving"): "The recent gain continues a sustained longer-term improvement.",
+        ("Rising", "Declining"): "This is a recent rebound against a softer longer-term trend.",
+        ("Falling", "Improving"): "This is recent softening within a stronger longer-term trend.",
+        ("Falling", "Declining"): "The recent decline continues a sustained longer-term decline.",
+        ("Stable", "Improving"): "Recent results are stable while the longer-term direction is improving.",
+        ("Stable", "Declining"): "Recent results are stable while the longer-term direction is declining.",
+    }
+    return contexts.get((recent_momentum, long_term_direction), "")
+
+
 def full_week_ends_by_location(
     weekly_location_rows: list[dict[str, Any]],
 ) -> tuple[dict[str, set[date]], set[date]]:
@@ -3138,6 +3455,29 @@ def management_server_rows(
     baseline_limit = int(config.get("dashboard_baseline_full_weeks", 4))
     min_prior_weeks = int(config.get("dashboard_min_prior_full_weeks", 2))
     min_prior_guests = float(config.get("dashboard_min_prior_guest_count", 50))
+    long_term_limit = int(config.get("dashboard_long_term_full_weeks", 8))
+    long_term_block = int(config.get("dashboard_long_term_block_weeks", 4))
+    full_min_recent_guests = float(
+        config.get("dashboard_long_term_full_min_recent_guests", 100)
+    )
+    full_min_earlier_guests = float(
+        config.get("dashboard_long_term_full_min_earlier_guests", 100)
+    )
+    developing_min_total = int(
+        config.get("dashboard_long_term_developing_min_total_weeks", 6)
+    )
+    developing_min_recent = int(
+        config.get("dashboard_long_term_developing_min_recent_weeks", 3)
+    )
+    developing_min_earlier = int(
+        config.get("dashboard_long_term_developing_min_earlier_weeks", 2)
+    )
+    developing_min_recent_guests = float(
+        config.get("dashboard_long_term_developing_min_recent_guests", 75)
+    )
+    developing_min_earlier_guests = float(
+        config.get("dashboard_long_term_developing_min_earlier_guests", 50)
+    )
     full_by_location, _ = full_week_ends_by_location(weekly_location_rows)
     rank_lookup = {
         (row["week_end"], row["location"], row["raw_user_name"]): row for row in ranked_rows
@@ -3171,9 +3511,10 @@ def management_server_rows(
         )
         prior_guest_count = sum(float(row.get("guest_count", 0) or 0) for row in prior_rows)
         full_latest = latest_week_end in full_by_location.get(location, set())
+        current_sample_eligible = dashboard_trend_eligible(current, config)
         prominent = (
             full_latest
-            and dashboard_trend_eligible(current, config)
+            and current_sample_eligible
             and len(prior_rows) >= min_prior_weeks
             and prior_guest_count >= min_prior_guests
         )
@@ -3182,12 +3523,7 @@ def management_server_rows(
         changes: dict[str, float | None] = {}
         positive_drivers: list[str] = []
         negative_drivers: list[str] = []
-        for field in (
-            "check_average",
-            "wine_pct",
-            "rate_of_sale_by_guest_count",
-            "average_ticket_time_seconds",
-        ):
+        for field in SERVER_TREND_FIELDS:
             change = current[field] - baseline[field] if baseline else None
             score = directional_score(change, management_threshold(config, field))
             changes[field] = change
@@ -3197,46 +3533,108 @@ def management_server_rows(
             elif change is not None and score < 0:
                 negative_drivers.append(metric_driver(field, change))
 
-        latest_rank = rank_lookup.get((latest_week_end, location, current["raw_user_name"]))
-        rank_movements: list[float] = []
-        for rank_field in (
-            "check_average_rank",
-            "wine_pct_rank",
-            "rate_rank",
-            "ticket_time_rank",
-        ):
-            prior_ranks = [
-                rank_lookup[(row["week_end"], location, current["raw_user_name"])].get(rank_field)
-                for row in prior_rows
-                if (row["week_end"], location, current["raw_user_name"]) in rank_lookup
-                and rank_lookup[(row["week_end"], location, current["raw_user_name"])].get(rank_field)
-                is not None
-            ]
-            latest_value = latest_rank.get(rank_field) if latest_rank else None
-            if prior_ranks and latest_value is not None:
-                rank_movements.append(sum(prior_ranks) / len(prior_ranks) - latest_value)
-        average_rank_move = sum(rank_movements) / len(rank_movements) if rank_movements else None
-        rank_score = 1 if average_rank_move is not None and average_rank_move >= 3 else -1 if average_rank_move is not None and average_rank_move <= -3 else 0
-        core_score = sum(metric_scores.values())
-        composite_score = core_score + rank_score
-        positive_count = sum(score > 0 for score in metric_scores.values())
-        negative_count = sum(score < 0 for score in metric_scores.values())
-        if composite_score >= 3 and positive_count >= 2:
-            momentum = "Rising"
-        elif composite_score <= -3 and negative_count >= 2:
-            momentum = "Falling"
-        else:
-            momentum = "Stable"
+        average_rank_move, rank_score = management_rank_block_movement(
+            [current], prior_rows, rank_lookup
+        )
+        scored_momentum, composite_score = management_trend_classification(
+            metric_scores,
+            rank_score,
+            improving_label="Rising",
+            declining_label="Falling",
+        )
+        momentum = scored_momentum if prominent else "Not Scored"
+
+        history_week_ends = sorted(
+            week_end
+            for week_end in full_by_location.get(location, set())
+            if week_end <= latest_week_end
+        )[-long_term_limit:]
+        recent_history_ends = set(history_week_ends[-long_term_block:])
+        earlier_history_ends = set(
+            history_week_ends[-(long_term_block * 2) : -long_term_block]
+        )
+        server_history_rows = [
+            row
+            for row in weekly_server_rows
+            if row["location"] == location
+            and row["raw_user_name"] == current["raw_user_name"]
+            and row["week_end"] in set(history_week_ends)
+        ]
+        recent_history_rows = [
+            row for row in server_history_rows if row["week_end"] in recent_history_ends
+        ]
+        earlier_history_rows = [
+            row for row in server_history_rows if row["week_end"] in earlier_history_ends
+        ]
+        recent_history_guests = sum(
+            float(row.get("guest_count", 0) or 0) for row in recent_history_rows
+        )
+        earlier_history_guests = sum(
+            float(row.get("guest_count", 0) or 0) for row in earlier_history_rows
+        )
+        history_total_weeks = len(server_history_rows)
+        history_total_guests = recent_history_guests + earlier_history_guests
+        full_history = (
+            len(recent_history_rows) == long_term_block
+            and len(earlier_history_rows) == long_term_block
+            and history_total_weeks == long_term_block * 2
+            and recent_history_guests >= full_min_recent_guests
+            and earlier_history_guests >= full_min_earlier_guests
+        )
+        developing_history = (
+            history_total_weeks >= developing_min_total
+            and len(recent_history_rows) >= developing_min_recent
+            and len(earlier_history_rows) >= developing_min_earlier
+            and recent_history_guests >= developing_min_recent_guests
+            and earlier_history_guests >= developing_min_earlier_guests
+        )
+        history_label = (
+            "Full" if full_history else "Developing" if developing_history else "Building History"
+        )
+        history_through = max(
+            (row["week_end"] for row in server_history_rows), default=None
+        )
+        history_used = (
+            f"{history_total_weeks} weeks / {history_total_guests:,.0f} guests"
+            + (f" through {history_through:%m/%d/%Y}" if history_through else "")
+            + (
+                f" (recent {len(recent_history_rows)}w / {recent_history_guests:,.0f}g; "
+                f"earlier {len(earlier_history_rows)}w / {earlier_history_guests:,.0f}g)"
+            )
+        )
+        recent_history = aggregate_weekly_rows(recent_history_rows)
+        earlier_history = aggregate_weekly_rows(earlier_history_rows)
+        long_term_changes: dict[str, float | None] = {}
+        long_term_metric_scores: dict[str, int] = {}
+        for field in SERVER_TREND_FIELDS:
+            change = (
+                recent_history[field] - earlier_history[field]
+                if recent_history and earlier_history
+                else None
+            )
+            long_term_changes[field] = change
+            long_term_metric_scores[field] = directional_score(
+                change, management_threshold(config, field)
+            )
+        long_term_average_rank_move, long_term_rank_modifier = management_rank_block_movement(
+            recent_history_rows, earlier_history_rows, rank_lookup
+        )
+        scored_long_term_direction, long_term_composite_score = management_trend_classification(
+            long_term_metric_scores,
+            long_term_rank_modifier,
+            improving_label="Improving",
+            declining_label="Declining",
+        )
+        long_term_direction = (
+            scored_long_term_direction
+            if full_latest and history_label in {"Full", "Developing"}
+            else "Not Scored"
+        )
 
         benchmark_values: dict[str, float | None] = {}
         benchmark_sources: dict[str, str] = {}
         level_statuses: dict[str, str] = {}
-        for field in (
-            "check_average",
-            "wine_pct",
-            "rate_of_sale_by_guest_count",
-            "average_ticket_time_seconds",
-        ):
+        for field in SERVER_TREND_FIELDS:
             target_value = targets.get(location, {}).get(field)
             benchmark_value = target_value if target_value is not None else (
                 location_baseline.get(field) if location_baseline else None
@@ -3266,8 +3664,12 @@ def management_server_rows(
         else:
             performance_level = "On Track"
 
-        if not prominent:
+        if not full_latest:
+            priority, action, confidence = "Monitor", "Monitor", "Incomplete Week"
+        elif not current_sample_eligible:
             priority, action, confidence = "Monitor", "Monitor", "Low Sample"
+        elif not prominent:
+            priority, action, confidence = "Monitor", "Monitor", "Building History"
         elif momentum == "Falling" and performance_level == "Below Benchmark":
             priority, action, confidence = "High", "Coach Now", "High"
         elif momentum == "Falling":
@@ -3288,6 +3690,8 @@ def management_server_rows(
             why_parts.append("Watch: " + "; ".join(negative_drivers[:3]))
         if average_rank_move is not None and rank_score:
             why_parts.append(f"Rank movement {average_rank_move:+.1f}")
+        if long_term_direction != "Not Scored":
+            why_parts.append(f"8-week direction {long_term_direction} ({history_label})")
         row = {
             **current,
             "prior_weeks": len(prior_rows),
@@ -3299,6 +3703,14 @@ def management_server_rows(
             "average_rank_movement": average_rank_move,
             "composite_score": composite_score,
             "momentum": momentum,
+            "long_term_direction": long_term_direction,
+            "long_term_history_label": history_label,
+            "history_used": history_used,
+            "long_term_changes": long_term_changes,
+            "long_term_metric_scores": long_term_metric_scores,
+            "long_term_rank_modifier": long_term_rank_modifier,
+            "long_term_average_rank_movement": long_term_average_rank_move,
+            "long_term_composite_score": long_term_composite_score,
             "performance_level": performance_level,
             "benchmark_values": benchmark_values,
             "benchmark_sources": benchmark_sources,
@@ -3312,6 +3724,9 @@ def management_server_rows(
             "why": " | ".join(why_parts) if why_parts else "No material movement",
         }
         row["recommended_next_step"] = recommended_server_follow_up(row)
+        context = server_trend_context(momentum, long_term_direction)
+        if context:
+            row["recommended_next_step"] = f"{row['recommended_next_step']} {context}"
         output.append(row)
 
     priority_order = {"High": 0, "Medium": 1, "Recognize": 2, "Monitor": 3}
@@ -3526,6 +3941,10 @@ def compact_server_evidence(row: dict[str, Any]) -> str:
         parts.append("Improving: " + "; ".join(row["positive_drivers"][:2]))
     if row["negative_drivers"]:
         parts.append("Watch: " + "; ".join(row["negative_drivers"][:2]))
+    if row.get("long_term_direction") != "Not Scored":
+        parts.append(
+            f"8-week {row['long_term_direction']} ({row['long_term_history_label']})"
+        )
     parts.append(f"{row['guest_count']:,.0f} guests / {row['active_days']} days")
     return " | ".join(parts)
 
@@ -3551,7 +3970,10 @@ def build_management_action_signals(
                 "Location": row["location"],
                 "Person / Area": row["display_name"],
                 "Action": row["action"],
-                "Signal": f"{row['momentum']} / {row['performance_level']}",
+                "Signal": (
+                    f"{row['momentum']} / {row['performance_level']} / "
+                    f"8-week {row['long_term_direction']}"
+                ),
                 "Why It Matters": compact_server_evidence(row),
                 "Recommended Next Step": row["recommended_next_step"],
                 "Performance Level": row["performance_level"],
@@ -3798,7 +4220,7 @@ def write_management_setup_sheet(
         ws.cell(row=row, column=2, value=neutral)
         ws.cell(row=row, column=3, value=strong)
         ws.cell(row=row, column=4, value="Lower" if threshold.get("lower_is_better") else "Higher")
-        ws.cell(row=row, column=5, value="Momentum scoring and benchmark status")
+        ws.cell(row=row, column=5, value="Recent and 8-week trend scoring; benchmark status")
         if field == "wine_pct":
             ws.cell(row=row, column=2).number_format = "0.0%"
             ws.cell(row=row, column=3).number_format = "0.0%"
@@ -3908,78 +4330,107 @@ def write_action_tracking_sheet(
 def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     remove_sheet_if_present(wb, "Server Scorecard")
     headers = [
-        "Priority", "Location", "Server", "Guest Count", "Active Days", "Confidence",
-        "Performance Level", "Momentum", "Action", "Score", "Check Average", "Check vs Benchmark",
-        "Wine %", "Wine vs Benchmark", "Rate of Sale", "Rate vs Benchmark", "Ticket Time",
-        "Ticket vs Benchmark (Min)", "Positive Drivers", "Watch Drivers", "Recommended Next Step",
+        "Action",
+        "Location",
+        "Server",
+        "Current Sample",
+        "Confidence",
+        "Performance",
+        "Recent Momentum",
+        "8-Week Direction",
+        "History Used",
+        "Positive Drivers",
+        "Watch Drivers",
+        "Recommended Next Step",
     ]
     data = []
     for row in rows:
-        benchmark = row["benchmark_values"]
         data.append(
             [
-                row["priority"], row["location"], row["display_name"], row["guest_count"],
-                row["active_days"], row["confidence"], row["performance_level"], row["momentum"],
-                row["action"], row["composite_score"], row["check_average"],
-                row["check_average"] - benchmark["check_average"] if benchmark["check_average"] is not None else None,
-                row["wine_pct"], row["wine_pct"] - benchmark["wine_pct"] if benchmark["wine_pct"] is not None else None,
-                row["rate_of_sale_by_guest_count"],
-                row["rate_of_sale_by_guest_count"] - benchmark["rate_of_sale_by_guest_count"] if benchmark["rate_of_sale_by_guest_count"] is not None else None,
-                duration_fraction(row["average_ticket_time_seconds"]),
-                (row["average_ticket_time_seconds"] - benchmark["average_ticket_time_seconds"]) / 60 if benchmark["average_ticket_time_seconds"] is not None else None,
-                "; ".join(row["positive_drivers"]), "; ".join(row["negative_drivers"]), row["recommended_next_step"],
+                row["action"],
+                row["location"],
+                row["display_name"],
+                f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
+                row["confidence"],
+                row["performance_level"],
+                row["momentum"],
+                row["long_term_direction"],
+                row["history_used"],
+                "; ".join(row["positive_drivers"]),
+                "; ".join(row["negative_drivers"]),
+                row["recommended_next_step"],
             ]
         )
     ws = write_table_sheet(
         wb, "Server Scorecard", headers, data, "ServerScorecard",
-        widths={"A": 12, "B": 20, "C": 24, "F": 14, "G": 20, "H": 12, "I": 22,
-                "S": 40, "T": 40, "U": 48}
+        widths={
+            "A": 24, "B": 20, "C": 24, "D": 22, "E": 16, "F": 20,
+            "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
+        },
     )
     ws.freeze_panes = "D4"
-    ws.sheet_view.zoomScale = 75
+    ws.sheet_view.zoomScale = 80
     for row in range(4, 4 + len(data)):
-        for col in (1, 6, 7, 8, 9):
+        for col in (1, 5, 6, 7, 8):
             fill = priority_fill(ws.cell(row=row, column=col).value)
             if fill:
                 ws.cell(row=row, column=col).fill = fill
-        for col in (19, 20, 21):
+        for col in (4, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 32
+        ws.row_dimensions[row].height = 42
 
 
 def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     remove_sheet_if_present(wb, "Rising & Falling Stars")
     star_rows = [row for row in rows if row["prominent"] and row["momentum"] in {"Rising", "Falling"}]
     headers = [
-        "Category", "Action", "Priority", "Location", "Server", "Performance Level", "Score",
-        "Guest Count", "Active Days", "Check vs Baseline", "Wine vs Baseline", "Rate vs Baseline",
-        "Ticket vs Baseline (Min)", "Positive Drivers", "Watch Drivers", "Recommended Next Step",
+        "Category",
+        "Action",
+        "Location",
+        "Server",
+        "Current Sample",
+        "Performance",
+        "Recent Momentum",
+        "8-Week Direction",
+        "History Used",
+        "Positive Drivers",
+        "Watch Drivers",
+        "Recommended Next Step",
     ]
     data = [
         [
-            f"{row['momentum']} Star", row["action"], row["priority"], row["location"], row["display_name"],
-            row["performance_level"], row["composite_score"], row["guest_count"], row["active_days"],
-            row["changes"]["check_average"], row["changes"]["wine_pct"], row["changes"]["rate_of_sale_by_guest_count"],
-            row["changes"]["average_ticket_time_seconds"] / 60 if row["changes"]["average_ticket_time_seconds"] is not None else None,
-            "; ".join(row["positive_drivers"]), "; ".join(row["negative_drivers"]), row["recommended_next_step"],
+            f"{row['momentum']} Star",
+            row["action"],
+            row["location"],
+            row["display_name"],
+            f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
+            row["performance_level"],
+            row["momentum"],
+            row["long_term_direction"],
+            row["history_used"],
+            "; ".join(row["positive_drivers"]),
+            "; ".join(row["negative_drivers"]),
+            row["recommended_next_step"],
         ]
         for row in star_rows
     ]
     ws = write_table_sheet(
         wb, "Rising & Falling Stars", headers, data, "RisingFallingStarsV2",
-        widths={"A": 15, "B": 24, "C": 12, "D": 20, "E": 24, "F": 20,
-                "N": 40, "O": 40, "P": 48}
+        widths={
+            "A": 15, "B": 24, "C": 20, "D": 24, "E": 22, "F": 20,
+            "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
+        },
     )
-    ws.freeze_panes = "F4"
+    ws.freeze_panes = "E4"
     ws.sheet_view.zoomScale = 80
     for row in range(4, 4 + len(data)):
-        for col in (1, 2, 3, 6):
+        for col in (1, 2, 6, 7, 8):
             fill = priority_fill(ws.cell(row=row, column=col).value)
             if fill:
                 ws.cell(row=row, column=col).fill = fill
-        for col in (14, 15, 16):
+        for col in (5, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 34
+        ws.row_dimensions[row].height = 42
 
 
 def format_management_value(field: str, value: float | None) -> tuple[Any, str]:
@@ -4016,7 +4467,11 @@ def management_metric_status(field: str, item: dict[str, Any], config: dict[str,
 
 
 def write_store_group_scorecards_sheet(
-    wb: Workbook, rows: list[dict[str, Any]], config: dict[str, Any]
+    wb: Workbook,
+    rows: list[dict[str, Any]],
+    config: dict[str, Any],
+    weekly_location_rows: list[dict[str, Any]],
+    weekly_group_rows: list[dict[str, Any]],
 ) -> None:
     remove_sheet_if_present(wb, "Store & Group Scorecards")
     ws = wb.create_sheet("Store & Group Scorecards")
@@ -4066,11 +4521,15 @@ def write_store_group_scorecards_sheet(
         current_row += 10
     for column, width in {"A": 24, "B": 16, "C": 16, "D": 18, "E": 16, "F": 20, "G": 14}.items():
         ws.column_dimensions[column].width = width
+    ws.column_dimensions["H"].width = 3
+    ws.sheet_view.zoomScale = 80
+    add_management_scorecard_charts(wb, ws, weekly_location_rows, weekly_group_rows)
 
 
 def write_management_data_quality_sheet(
     wb: Workbook,
     weekly_location_rows: list[dict[str, Any]],
+    config: dict[str, Any],
 ) -> None:
     remove_sheet_if_present(wb, "Data Quality")
     ws = wb.create_sheet("Data Quality")
@@ -4086,6 +4545,14 @@ def write_management_data_quality_sheet(
         if latest_complete and latest_week_end
         else "Latest week is incomplete. Management trends are preliminary and server actions are suppressed."
     )
+    report_audit = config.get("_report_audit", {})
+    if report_audit:
+        ws["A3"] = (
+            f"{ws['A3'].value} Input audit: "
+            f"{report_audit.get('unique_business_days', 0)} unique business days used; "
+            f"{report_audit.get('duplicate_files_ignored', 0)} semantic duplicate files ignored; "
+            "no report conflicts."
+        )
     ws["A3"].fill = PatternFill("solid", fgColor="D9EAD3" if latest_complete else "F4CCCC")
     ws["A3"].font = Font(bold=True)
     ws["A3"].alignment = Alignment(wrap_text=True)
@@ -4134,7 +4601,8 @@ def write_management_chart_data(
     remove_sheet_if_present(wb, "_Dashboard Chart Data")
     ws = wb.create_sheet("_Dashboard Chart Data")
     locations = sorted({row["location"] for row in weekly_location_rows})
-    week_ends = sorted({row["week_end"] for row in weekly_location_rows})[-5:]
+    _, global_full_week_ends = full_week_ends_by_location(weekly_location_rows)
+    week_ends = sorted(global_full_week_ends)[-8:]
     ws.cell(row=1, column=1, value="Week End")
     for col, location in enumerate(locations, start=2):
         ws.cell(row=1, column=col, value=location.replace("RC ", ""))
@@ -4147,7 +4615,8 @@ def write_management_chart_data(
             row = location_lookup.get((week_end, location))
             ws.cell(row=row_index, column=col, value=row["gross_sales"] if row else None)
 
-    group_rows = sorted(weekly_group_rows, key=lambda row: row["week_end"])[-5:]
+    group_lookup = {row["week_end"]: row for row in weekly_group_rows}
+    group_rows = [group_lookup[week_end] for week_end in week_ends if week_end in group_lookup]
     ws.cell(row=1, column=6, value="Week End")
     ws.cell(row=1, column=7, value="Guest Count")
     for row_index, row in enumerate(group_rows, start=2):
@@ -4155,6 +4624,68 @@ def write_management_chart_data(
         ws.cell(row=row_index, column=7, value=row["guest_count"])
     ws.sheet_state = "hidden"
     return len(week_ends), len(group_rows)
+
+
+def add_management_scorecard_charts(
+    wb: Workbook,
+    ws,
+    weekly_location_rows: list[dict[str, Any]],
+    weekly_group_rows: list[dict[str, Any]],
+) -> None:
+    location_points, group_points = write_management_chart_data(
+        wb, weekly_location_rows, weekly_group_rows
+    )
+    chart_ws = wb["_Dashboard Chart Data"]
+    if location_points:
+        locations = sorted({row["location"] for row in weekly_location_rows})
+        chart = LineChart()
+        chart.title = "Complete-Week Sales Trend by Store"
+        chart.y_axis.title = "Gross Sales"
+        chart.y_axis.numFmt = "$#,##0"
+        chart.x_axis.tickLblPos = "low"
+        chart.height = 7
+        chart.width = 12.5
+        data = Reference(
+            chart_ws,
+            min_col=2,
+            max_col=1 + len(locations),
+            min_row=1,
+            max_row=1 + location_points,
+        )
+        cats = Reference(chart_ws, min_col=1, min_row=2, max_row=1 + location_points)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        category_formula = f"'_Dashboard Chart Data'!$A$2:$A${1 + location_points}"
+        for series in chart.series:
+            series.cat = AxDataSource(strRef=StrRef(f=category_formula))
+        for series, location, color in zip(
+            chart.series, locations, ("4472C4", "C0504D")
+        ):
+            series.tx = SeriesLabel(v=location.replace("RC ", ""))
+            series.graphicalProperties.line.solidFill = color
+            series.graphicalProperties.line.width = 28575
+        chart.legend.position = "r"
+        ws.add_chart(chart, "I4")
+    if group_points:
+        chart = LineChart()
+        chart.title = "Complete-Week All-Stores Guest Trend"
+        chart.y_axis.title = "Guests"
+        chart.y_axis.numFmt = "#,##0"
+        chart.x_axis.tickLblPos = "low"
+        chart.height = 7
+        chart.width = 12.5
+        data = Reference(chart_ws, min_col=7, min_row=1, max_row=1 + group_points)
+        cats = Reference(chart_ws, min_col=6, min_row=2, max_row=1 + group_points)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        category_formula = f"'_Dashboard Chart Data'!$F$2:$F${1 + group_points}"
+        for series in chart.series:
+            series.cat = AxDataSource(strRef=StrRef(f=category_formula))
+        if chart.series:
+            chart.series[0].graphicalProperties.line.solidFill = "7A1E1E"
+            chart.series[0].graphicalProperties.line.width = 28575
+        chart.legend = None
+        ws.add_chart(chart, "I20")
 
 
 def signed_management_delta(field: str, value: float | None) -> str:
@@ -4173,6 +4704,96 @@ def signed_management_delta(field: str, value: float | None) -> str:
     return compact_minutes(value / 60)
 
 
+def latest_week_report_coverage(
+    records: list[MetricRecord], latest_week_end: date | None
+) -> tuple[list[date], set[date], list[date]]:
+    if latest_week_end is None:
+        return [], set(), []
+    week_start = latest_week_end - timedelta(days=OPERATING_WEEK_DAYS - 1)
+    expected = [week_start + timedelta(days=offset) for offset in range(OPERATING_WEEK_DAYS)]
+    received = {
+        record.report_date
+        for record in records
+        if week_start <= record.report_date <= latest_week_end
+        and is_operating_day(record.report_date)
+    }
+    missing = [report_date for report_date in expected if report_date not in received]
+    return expected, received, missing
+
+
+def deduplicated_dashboard_actions(
+    action_rows: list[dict[str, Any]],
+    priorities: set[str],
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    priority_order = {"High": 0, "Medium": 1, "Review": 2, "Recognize": 3, "Share": 4}
+    candidates = [
+        row
+        for row in action_rows
+        if str(row.get("Priority") or "") in priorities
+        and str(row.get("Status") or "Open").casefold() not in {"complete", "dismissed"}
+    ]
+    candidates.sort(
+        key=lambda row: (
+            priority_order.get(str(row.get("Priority") or ""), 9),
+            str(row.get("Location") or ""),
+            str(row.get("Person / Area") or ""),
+        )
+    )
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in candidates:
+        identity = str(row.get("Entity Key") or "").strip().casefold()
+        if not identity:
+            identity = "|".join(
+                str(row.get(field) or "").strip().casefold()
+                for field in ("Location", "Person / Area", "Action", "Signal")
+            )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(row)
+        if limit is not None and len(selected) >= limit:
+            break
+    return selected
+
+
+def dashboard_management_move(item: dict[str, Any]) -> str:
+    signal = str(item.get("Signal") or "").strip().rstrip(".:")
+    evidence = str(item.get("Why It Matters") or "").split(" | ")[0].strip().rstrip(".")
+    next_step = str(item.get("Recommended Next Step") or "").strip().rstrip(".")
+    context = ". ".join(part for part in (signal, evidence) if part)
+    if next_step:
+        return f"{context}. Next: {next_step}." if context else f"Next: {next_step}."
+    return f"{context}." if context else "Review and assign the next management step."
+
+
+def write_dashboard_card(
+    ws,
+    start_col: int,
+    title: str,
+    value: str | int,
+    note: str,
+    accent_color: str,
+) -> None:
+    end_col = start_col + 3
+    ws.merge_cells(start_row=6, start_column=start_col, end_row=6, end_column=end_col)
+    ws.merge_cells(start_row=7, start_column=start_col, end_row=8, end_column=end_col)
+    ws.merge_cells(start_row=9, start_column=start_col, end_row=9, end_column=end_col)
+    title_cell = ws.cell(row=6, column=start_col, value=title)
+    title_cell.fill = PatternFill("solid", fgColor=accent_color)
+    title_cell.font = Font(bold=True, color="FFFFFF", size=10)
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    value_cell = ws.cell(row=7, column=start_col, value=value)
+    value_cell.fill = PatternFill("solid", fgColor="F7F7F7")
+    value_cell.font = Font(bold=True, color="7A1E1E", size=20)
+    value_cell.alignment = Alignment(horizontal="center", vertical="center")
+    note_cell = ws.cell(row=9, column=start_col, value=note)
+    note_cell.fill = PatternFill("solid", fgColor="F7F7F7")
+    note_cell.font = Font(color="595959", size=9)
+    note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
 def write_management_dashboard_sheet(
     wb: Workbook,
     records: list[MetricRecord],
@@ -4185,213 +4806,242 @@ def write_management_dashboard_sheet(
 ) -> None:
     remove_sheet_if_present(wb, "Dashboard")
     ws = wb.create_sheet("Dashboard")
-    style_management_title(ws, "Red Onion Management Dashboard", 12)
-    for column in range(1, 13):
-        ws.column_dimensions[get_column_letter(column)].width = 15
+    style_management_title(ws, "Red Onion Weekly Brief", 12)
+    widths = {
+        "A": 11, "B": 11, "C": 12, "D": 12, "E": 12, "F": 12,
+        "G": 12, "H": 12, "I": 12, "J": 16, "K": 14, "L": 14,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
     latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
     latest_location_rows = [row for row in weekly_location_rows if row["week_end"] == latest_week_end]
+    expected_dates, received_dates, missing_dates = latest_week_report_coverage(records, latest_week_end)
     latest_complete = bool(latest_location_rows) and all(
         row.get("source_days", 0) >= OPERATING_WEEK_DAYS for row in latest_location_rows
-    )
+    ) and not missing_dates
+    missing_text = ", ".join(f"{report_date:%b} {report_date.day}" for report_date in missing_dates)
+    _, global_full = full_week_ends_by_location(weekly_location_rows)
+
     ws.merge_cells("A3:L3")
     ws["A3"] = (
-        f"Week ending {latest_week_end:%m/%d/%Y} | {len({record.source_file for record in records})} reports | "
-        f"{len({row['week_end'] for row in weekly_location_rows})} weeks tracked"
+        f"Week ending {latest_week_end:%m/%d/%Y} | {len(received_dates)} of {len(expected_dates)} daily reports | "
+        f"{len(global_full)} complete weeks available"
         if latest_week_end
         else "No management data available"
     )
     ws["A3"].font = Font(bold=True, color="595959")
+    ws["A3"].alignment = Alignment(vertical="center")
     ws.merge_cells("A4:L4")
     ws["A4"] = (
-        "LATEST WEEK COMPLETE - trends and actions are management-ready"
+        "READY FOR MANAGEMENT REVIEW - comparisons, actions, and recognition are active"
         if latest_complete
-        else "PRELIMINARY - latest week is incomplete; server actions are suppressed"
+        else f"PRELIMINARY - missing {missing_text or 'daily reports'}; comparisons, actions, and recognition are paused"
     )
     ws["A4"].fill = PatternFill("solid", fgColor="D9EAD3" if latest_complete else "F4CCCC")
     ws["A4"].font = Font(bold=True)
-    ws["A4"].alignment = Alignment(horizontal="center")
+    ws["A4"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[3].height = 22
+    ws.row_dimensions[4].height = 28
 
     group = group_rows[0] if group_rows else None
-    kpi_fields = [
-        ("gross_sales", "Sales"), ("guest_count", "Guests"), ("check_average", "Check Avg"),
-        ("wine_pct", "Wine %"), ("rate_of_sale_by_guest_count", "Rate of Sale"),
-        ("average_ticket_time_seconds", "Ticket Time"),
-    ]
-    for index, (field, label) in enumerate(kpi_fields):
-        start_col = index * 2 + 1
-        ws.merge_cells(start_row=6, start_column=start_col, end_row=6, end_column=start_col + 1)
-        ws.merge_cells(start_row=7, start_column=start_col, end_row=7, end_column=start_col + 1)
-        label_cell = ws.cell(row=6, column=start_col, value=label)
-        label_cell.fill = PatternFill("solid", fgColor="E7E6E6")
-        label_cell.font = Font(bold=True)
-        label_cell.alignment = Alignment(horizontal="center")
-        if group:
-            current_value, number_format = format_management_value(field, group["latest"][field])
-            value_cell = ws.cell(row=7, column=start_col, value=current_value)
-            value_cell.number_format = number_format
-            value_cell.font = Font(size=16, bold=True, color="7A1E1E")
-            value_cell.alignment = Alignment(horizontal="center")
-            ws.cell(row=8, column=start_col, value="vs prior")
-            prior_text = signed_management_delta(field, group["prior_changes"][field])
-            benchmark_text = signed_management_delta(field, group["benchmark_changes"][field])
-            if field in {"gross_sales", "guest_count"}:
-                prior_pct = safe_pct_delta(
-                    group["latest"][field], group["prior"][field] if group["prior"] else None
-                )
-                benchmark_pct = safe_pct_delta(
-                    group["latest"][field], group["benchmark_values"][field]
-                )
-                if prior_pct is not None:
-                    prior_text += f" ({prior_pct:+.1%})"
-                if benchmark_pct is not None:
-                    benchmark_text += f" ({benchmark_pct:+.1%})"
-            ws.cell(row=8, column=start_col + 1, value=prior_text)
-            ws.cell(row=9, column=start_col, value="vs benchmark")
-            ws.cell(row=9, column=start_col + 1, value=benchmark_text)
-        for row in (8, 9):
-            ws.cell(row=row, column=start_col).font = Font(size=9, color="666666")
-            ws.cell(row=row, column=start_col + 1).alignment = Alignment(horizontal="right")
+    all_action_items = deduplicated_dashboard_actions(
+        action_rows, {"High", "Medium", "Review"}
+    )
+    selected_actions = all_action_items[:3]
+    reports_value = f"{len(received_dates)} of {len(expected_dates)}" if expected_dates else "0 of 0"
+    reports_note = (
+        "All Tuesday-Sunday reports received"
+        if latest_complete
+        else f"Missing {missing_text or 'daily reports'}"
+    )
+    write_dashboard_card(
+        ws, 1, "Reports Received", reports_value, reports_note,
+        "548235" if latest_complete else "C00000",
+    )
+
+    traffic_delta = None
+    traffic_source = "benchmark"
+    if group:
+        traffic_delta = safe_pct_delta(
+            group["latest"]["guest_count"], group["benchmark_values"].get("guest_count")
+        )
+        traffic_source = str(group.get("benchmark_sources", {}).get("guest_count") or "benchmark")
+    if not latest_complete:
+        traffic_value, traffic_note, traffic_color = "PAUSED", f"Missing {missing_text or 'daily reports'}", "7F7F7F"
+    elif traffic_delta is None:
+        traffic_value, traffic_note, traffic_color = "NO BASELINE", "Guest traffic benchmark is not available", "7F7F7F"
+    else:
+        traffic_value = f"{traffic_delta:+.1%}"
+        traffic_note = f"Guest traffic vs {traffic_source.lower()}"
+        traffic_color = "548235" if traffic_delta >= 0 else "C00000" if traffic_delta <= -0.05 else "BF9000"
+    write_dashboard_card(ws, 5, "Traffic vs Benchmark", traffic_value, traffic_note, traffic_color)
+
+    if latest_complete:
+        action_value: str | int = len(all_action_items)
+        action_note = "Open coaching and review items"
+        action_color = "C00000" if all_action_items else "548235"
+    else:
+        action_value, action_note, action_color = "PAUSED", f"Missing {missing_text or 'daily reports'}", "7F7F7F"
+    write_dashboard_card(
+        ws, 9, "High-Priority Actions", action_value, action_note, action_color
+    )
 
     ws.merge_cells("A11:L11")
-    ws["A11"] = "Store Pulse"
+    ws["A11"] = "TOP THREE ACTIONS"
     ws["A11"].fill = PatternFill("solid", fgColor="E7E6E6")
-    ws["A11"].font = Font(bold=True)
-    store_headers = ["Location", "Status", "Sales vs Benchmark", "Guests vs Benchmark", "Check", "Wine", "Ticket"]
-    for col, header in enumerate(store_headers, start=1):
-        cell = ws.cell(row=12, column=col, value=header)
+    ws["A11"].font = Font(bold=True, color="7A1E1E")
+    action_headers = [
+        (1, 2, "Priority"), (3, 5, "Person / Location"), (6, 10, "Management Move"),
+        (11, 11, "Owner"), (12, 12, "Due"),
+    ]
+    for start_col, end_col, header in action_headers:
+        if end_col > start_col:
+            ws.merge_cells(start_row=12, start_column=start_col, end_row=12, end_column=end_col)
+        cell = ws.cell(row=12, column=start_col, value=header)
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-    ws.merge_cells("H12:L12")
-    ws["H12"] = "Management Focus"
-    ws["H12"].fill = PatternFill("solid", fgColor="D9E1F2")
-    ws["H12"].font = Font(bold=True)
-    ws["H12"].alignment = Alignment(horizontal="center")
-    for row_index, item in enumerate(store_rows, start=13):
-        latest = item["latest"]
-        values = [
-            item["entity"], item["status"],
-            safe_pct_delta(latest["gross_sales"], item["benchmark_values"]["gross_sales"]),
-            safe_pct_delta(latest["guest_count"], item["benchmark_values"]["guest_count"]),
-            item["benchmark_changes"]["check_average"], item["benchmark_changes"]["wine_pct"],
-            item["benchmark_changes"]["average_ticket_time_seconds"] / 60 if item["benchmark_changes"]["average_ticket_time_seconds"] is not None else None,
-        ]
-        for col, value in enumerate(values, start=1):
-            ws.cell(row=row_index, column=col, value=value)
-        ws.merge_cells(start_row=row_index, start_column=8, end_row=row_index, end_column=12)
-        ws.cell(row=row_index, column=8, value=item["recommended_focus"])
-        ws.cell(row=row_index, column=3).number_format = "0.0%"
-        ws.cell(row=row_index, column=4).number_format = "0.0%"
-        ws.cell(row=row_index, column=5).number_format = "$0.00"
-        ws.cell(row=row_index, column=6).number_format = "0.0%"
-        ws.cell(row=row_index, column=7).number_format = "0.0"
-        ws.cell(row=row_index, column=8).alignment = Alignment(wrap_text=True)
-        fill = priority_fill(item["priority"])
-        if fill:
-            ws.cell(row=row_index, column=2).fill = fill
-        ws.row_dimensions[row_index].height = 38
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    if latest_complete:
+        for row_index in range(13, 16):
+            item = selected_actions[row_index - 13] if row_index - 13 < len(selected_actions) else None
+            ws.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=2)
+            ws.merge_cells(start_row=row_index, start_column=3, end_row=row_index, end_column=5)
+            ws.merge_cells(start_row=row_index, start_column=6, end_row=row_index, end_column=10)
+            if item:
+                priority = str(item.get("Priority") or "Review")
+                person = str(item.get("Person / Area") or "").strip()
+                location = str(item.get("Location") or "").strip()
+                person_location = person if person.casefold() == location.casefold() else " | ".join(
+                    part for part in (person, location) if part
+                )
+                owner = str(item.get("Owner") or "Unassigned")
+                due_date = as_date(item.get("Due Date"))
+                ws.cell(row=row_index, column=1, value=priority)
+                ws.cell(row=row_index, column=3, value=person_location)
+                ws.cell(row=row_index, column=6, value=dashboard_management_move(item))
+                ws.cell(row=row_index, column=11, value=owner)
+                if due_date:
+                    ws.cell(row=row_index, column=12, value=due_date).number_format = "m/d/yyyy"
+                else:
+                    ws.cell(row=row_index, column=12, value="Not set")
+                fill = priority_fill(priority)
+                if fill:
+                    ws.cell(row=row_index, column=1).fill = fill
+                if owner == "Unassigned":
+                    ws.cell(row=row_index, column=11).fill = PatternFill("solid", fgColor="FFF2CC")
+                if not due_date:
+                    ws.cell(row=row_index, column=12).fill = PatternFill("solid", fgColor="FFF2CC")
+            else:
+                ws.cell(row=row_index, column=1, value="—")
+                ws.cell(row=row_index, column=3, value="No additional priority item")
+            for col in (1, 3, 6, 11, 12):
+                ws.cell(row=row_index, column=col).alignment = Alignment(
+                    wrap_text=True, vertical="center"
+                )
+            ws.row_dimensions[row_index].height = 42
+    else:
+        ws.merge_cells("A13:L15")
+        ws["A13"] = (
+            f"Actions are paused until the latest week is complete. Missing: {missing_text or 'daily reports'}."
+        )
+        ws["A13"].fill = PatternFill("solid", fgColor="FCE8E6")
+        ws["A13"].font = Font(bold=True, color="9C0006")
+        ws["A13"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    for start_col, title, selected in (
-        (1, "Act First", [row for row in action_rows if row.get("Priority") in {"High", "Medium", "Review"}][:3]),
-        (7, "Recognize / Replicate", [row for row in action_rows if row.get("Priority") in {"Recognize", "Share"}][:3]),
-    ):
-        ws.merge_cells(start_row=17, start_column=start_col, end_row=17, end_column=start_col + 5)
-        ws.cell(row=17, column=start_col, value=title).fill = PatternFill("solid", fgColor="E7E6E6")
-        ws.cell(row=17, column=start_col).font = Font(bold=True)
-        ws.cell(row=18, column=start_col, value="Priority")
-        ws.merge_cells(start_row=18, start_column=start_col + 1, end_row=18, end_column=start_col + 2)
-        ws.cell(row=18, column=start_col + 1, value="Person / Location")
-        ws.merge_cells(start_row=18, start_column=start_col + 3, end_row=18, end_column=start_col + 5)
-        ws.cell(row=18, column=start_col + 3, value="Management Move")
-        for col in range(start_col, start_col + 6):
-            cell = ws.cell(row=18, column=col)
-            cell.fill = PatternFill("solid", fgColor="D9E1F2")
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", wrap_text=True)
-        if not selected:
-            selected = [{"Priority": "Monitor", "Location": "", "Person / Area": "No current items", "Signal": "", "Why It Matters": "", "Recommended Next Step": ""}]
-        for row_offset, item in enumerate(selected, start=19):
-            ws.cell(row=row_offset, column=start_col, value=item.get("Priority"))
-            ws.merge_cells(start_row=row_offset, start_column=start_col + 1, end_row=row_offset, end_column=start_col + 2)
-            ws.cell(
-                row=row_offset,
-                column=start_col + 1,
-                value=f"{item.get('Person / Area', '')}\n{item.get('Location', '')}".strip(),
+    ws.merge_cells("A17:L17")
+    ws["A17"] = "STORE SNAPSHOT"
+    ws["A17"].fill = PatternFill("solid", fgColor="E7E6E6")
+    ws["A17"].font = Font(bold=True, color="7A1E1E")
+    store_headers = [
+        (1, 2, "Location"), (3, 4, "Status"), (5, 5, "Sales"), (6, 6, "Guests"),
+        (7, 7, "Check Avg"), (8, 9, "Service Pace"), (10, 12, "Management Focus"),
+    ]
+    for start_col, end_col, header in store_headers:
+        if end_col > start_col:
+            ws.merge_cells(start_row=18, start_column=start_col, end_row=18, end_column=end_col)
+        cell = ws.cell(row=18, column=start_col, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_index in range(19, 21):
+        item = store_rows[row_index - 19] if row_index - 19 < len(store_rows) else None
+        ws.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=2)
+        ws.merge_cells(start_row=row_index, start_column=3, end_row=row_index, end_column=4)
+        ws.merge_cells(start_row=row_index, start_column=8, end_row=row_index, end_column=9)
+        ws.merge_cells(start_row=row_index, start_column=10, end_row=row_index, end_column=12)
+        if item:
+            latest = item["latest"]
+            status = item["status"] if latest_complete else "Preliminary"
+            focus = item["recommended_focus"] if latest_complete else (
+                f"Comparisons paused; missing {missing_text or 'daily reports'}."
             )
-            ws.merge_cells(start_row=row_offset, start_column=start_col + 3, end_row=row_offset, end_column=start_col + 5)
-            evidence = str(item.get("Why It Matters") or "").split(" | ")[0]
-            move = f"{item.get('Signal', '')}: {evidence}. Next: {item.get('Recommended Next Step', '')}".strip()
-            ws.cell(row=row_offset, column=start_col + 3, value=move)
-            for col in range(start_col, start_col + 6):
-                ws.cell(row=row_offset, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-            fill = priority_fill(item.get("Priority"))
+            ws.cell(row=row_index, column=1, value=item["entity"])
+            ws.cell(row=row_index, column=3, value=status)
+            ws.cell(row=row_index, column=5, value=latest["gross_sales"]).number_format = "$#,##0"
+            ws.cell(row=row_index, column=6, value=latest["guest_count"]).number_format = "#,##0"
+            ws.cell(row=row_index, column=7, value=latest["check_average"]).number_format = "$0.00"
+            ws.cell(row=row_index, column=8, value=latest["average_ticket_time_seconds"] / 60).number_format = '0.0 "min"'
+            ws.cell(row=row_index, column=10, value=focus)
+            fill = priority_fill(item["priority"] if latest_complete else "Review")
             if fill:
-                ws.cell(row=row_offset, column=start_col).fill = fill
-            ws.row_dimensions[row_offset].height = 68
+                ws.cell(row=row_index, column=3).fill = fill
+        else:
+            ws.cell(row=row_index, column=1, value="No store data")
+        for col in (1, 3, 5, 6, 7, 8, 10):
+            ws.cell(row=row_index, column=col).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
+        ws.row_dimensions[row_index].height = 36
+
+    ws.merge_cells("A22:L22")
+    ws["A22"] = "RECOGNITION / REPLICATE"
+    ws["A22"].fill = PatternFill("solid", fgColor="E7E6E6")
+    ws["A22"].font = Font(bold=True, color="7A1E1E")
+    ws.merge_cells("A23:L23")
+    recognition = deduplicated_dashboard_actions(
+        action_rows, {"Recognize", "Share"}, limit=1
+    )
+    if not latest_complete:
+        recognition_text = (
+            f"Recognition is paused until the latest week is complete. Missing: {missing_text or 'daily reports'}."
+        )
+        recognition_fill = "FCE8E6"
+    elif recognition:
+        item = recognition[0]
+        person = str(item.get("Person / Area") or item.get("Location") or "Team")
+        location = str(item.get("Location") or "")
+        identity = person if person.casefold() == location.casefold() else " | ".join(
+            part for part in (person, location) if part
+        )
+        recognition_text = f"{identity} — {dashboard_management_move(item)}"
+        recognition_fill = "D9EAD3"
+    else:
+        recognition_text = "No recognition item met the current complete-week thresholds."
+        recognition_fill = "F3F4F6"
+    ws["A23"] = recognition_text
+    ws["A23"].fill = PatternFill("solid", fgColor=recognition_fill)
+    ws["A23"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[23].height = 34
 
     ws.merge_cells("A24:L24")
-    full_by_location, global_full = full_week_ends_by_location(weekly_location_rows)
     ws["A24"] = (
-        f"Data quality: latest week {'complete' if latest_complete else 'incomplete'}; "
-        f"{len(global_full)} full all-store weeks available; partial weeks are excluded from benchmarks."
+        f"Data quality: {len(received_dates)} of {len(expected_dates)} reports received; "
+        f"{len(global_full)} complete all-store weeks available; incomplete weeks are excluded from comparisons."
+        if latest_complete
+        else f"Data quality: {len(received_dates)} of {len(expected_dates)} reports received; missing {missing_text or 'daily reports'}."
     )
-    ws["A24"].fill = PatternFill("solid", fgColor="D9EAF7")
-    ws["A24"].alignment = Alignment(horizontal="center")
+    ws["A24"].fill = PatternFill("solid", fgColor="D9EAF7" if latest_complete else "F4CCCC")
+    ws["A24"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[24].height = 30
 
-    week_labels = " | ".join(
-        week_end.strftime("%m/%d")
-        for week_end in sorted({row["week_end"] for row in weekly_location_rows})[-5:]
-    )
-    for start_col in (1, 7):
-        ws.merge_cells(start_row=25, start_column=start_col, end_row=25, end_column=start_col + 5)
-        label_cell = ws.cell(row=25, column=start_col, value=f"Weeks left to right: {week_labels}")
-        label_cell.font = Font(size=8, color="666666", italic=True)
-        label_cell.alignment = Alignment(horizontal="center")
-
-    location_points, group_points = write_management_chart_data(wb, weekly_location_rows, weekly_group_rows)
-    chart_ws = wb["_Dashboard Chart Data"]
-    if location_points:
-        chart = LineChart()
-        chart.title = "Five-Week Sales Trend by Store"
-        chart.y_axis.title = "Gross Sales"
-        chart.y_axis.numFmt = "$#,##0"
-        chart.x_axis.tickLblPos = "low"
-        chart.height = 7
-        chart.width = 11.5
-        data = Reference(chart_ws, min_col=2, max_col=1 + len({row['location'] for row in weekly_location_rows}), min_row=1, max_row=1 + location_points)
-        cats = Reference(chart_ws, min_col=1, min_row=2, max_row=1 + location_points)
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
-        category_formula = "'_Dashboard Chart Data'!$A$2:$A$" + str(1 + location_points)
-        for series in chart.series:
-            series.cat = AxDataSource(strRef=StrRef(f=category_formula))
-        for series, color in zip(chart.series, ("4472C4", "C0504D")):
-            series.graphicalProperties.line.solidFill = color
-            series.graphicalProperties.line.width = 28575
-        chart.legend.position = "r"
-        ws.add_chart(chart, "A26")
-    if group_points:
-        chart = LineChart()
-        chart.title = "Five-Week All-Stores Guest Trend"
-        chart.y_axis.title = "Guests"
-        chart.y_axis.numFmt = "#,##0"
-        chart.x_axis.tickLblPos = "low"
-        chart.height = 7
-        chart.width = 11.5
-        data = Reference(chart_ws, min_col=7, min_row=1, max_row=1 + group_points)
-        cats = Reference(chart_ws, min_col=6, min_row=2, max_row=1 + group_points)
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
-        category_formula = "'_Dashboard Chart Data'!$F$2:$F$" + str(1 + group_points)
-        for series in chart.series:
-            series.cat = AxDataSource(strRef=StrRef(f=category_formula))
-        if chart.series:
-            chart.series[0].graphicalProperties.line.solidFill = "7A1E1E"
-            chart.series[0].graphicalProperties.line.width = 28575
-        chart.legend = None
-        ws.add_chart(chart, "G26")
-    ws.sheet_view.zoomScale = 85
+    ws.print_area = "A1:L24"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.print_options.horizontalCentered = True
+    ws.sheet_view.zoomScale = 90
 
 
 def write_management_run_notes(
@@ -4407,18 +5057,25 @@ def write_management_run_notes(
     style_management_title(ws, "Red Onion Server Master", 2)
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 96
+    report_audit = config.get("_report_audit", {})
     note_rows = [
         ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Source Folder", str(source_dir)),
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed."),
         ("Raw Reports Read", len({record.source_file for record in records})),
+        ("Unique Business Days Used", report_audit.get("unique_business_days", len({record.report_date for record in records}))),
+        ("Semantic Duplicates Ignored", report_audit.get("duplicate_files_ignored", 0)),
+        ("Canonical History Folder", report_audit.get("canonical_archive", "Not recorded")),
+        ("Report Conflicts", "None; conflicting same-date reports stop the run before output or archiving."),
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
-        ("Management Baseline", f"Up to {config.get('dashboard_baseline_full_weeks', 4)} prior full Tuesday-Sunday weeks; partial weeks excluded."),
-        ("Prominent Server Confidence", f"Latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests."),
+        ("Recent Momentum", f"Latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete weeks. Partial latest weeks and low current samples are Not Scored."),
+        ("Recent Momentum Confidence", f"Latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests."),
+        ("8-Week Direction", f"Compares the most recent {config.get('dashboard_long_term_block_weeks', 4)} complete weeks with the preceding {config.get('dashboard_long_term_block_weeks', 4)}. Full uses eight server weeks with at least {config.get('dashboard_long_term_full_min_recent_guests', 100)} recent / {config.get('dashboard_long_term_full_min_earlier_guests', 100)} earlier guests; Developing requires at least {config.get('dashboard_long_term_developing_min_total_weeks', 6)} usable weeks, {config.get('dashboard_long_term_developing_min_recent_weeks', 3)} recent / {config.get('dashboard_long_term_developing_min_earlier_weeks', 2)} earlier weeks, and {config.get('dashboard_long_term_developing_min_recent_guests', 75)} recent / {config.get('dashboard_long_term_developing_min_earlier_guests', 50)} earlier guests."),
         ("Targets", "Management Setup targets take precedence; blank targets use the rolling baseline. Edits apply on the next run."),
-        ("Momentum", "Four metric families score from -2 to +2 using materiality bands; average rank movement contributes only -1, 0, or +1."),
+        ("Trend Scoring", "Both trend horizons use four metric families scored from -2 to +2 using materiality bands; average rank movement contributes only -1, 0, or +1."),
         ("Performance Level", "Latest metrics are assessed separately as Above Benchmark, On Track, or Below Benchmark."),
+        ("Technical Trend Detail", "Server Week-over-Week Detail shows adjacent-week changes for audit use. Management coaching uses Recent Momentum and 8-Week Direction instead."),
         ("Action Tracking", "Owner, due date, status, and manager notes carry forward between weekly runs. Cleared signals move to Action History."),
         ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
         ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
@@ -4426,7 +5083,7 @@ def write_management_run_notes(
     for row, (label, value) in enumerate(note_rows, start=4):
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 30
+        ws.row_dimensions[row].height = 45 if label == "8-Week Direction" else 30
 
 
 def finalize_management_workbook(wb: Workbook) -> None:
@@ -4500,10 +5157,16 @@ def write_master_workbook(
         write_management_setup_sheet(wb, state["targets"], state["owners"], config)
         write_action_tracking_sheet(wb, "Action Board", current_actions, editable=True)
         write_server_scorecard_sheet(wb, server_rows)
-        write_store_group_scorecards_sheet(wb, [*group_rows, *store_rows], config)
+        write_store_group_scorecards_sheet(
+            wb,
+            [*group_rows, *store_rows],
+            config,
+            weekly_location_rows,
+            weekly_group_rows,
+        )
         write_rising_falling_sheet(wb, server_rows)
         write_action_tracking_sheet(wb, "Action History", action_history, editable=False)
-        write_management_data_quality_sheet(wb, weekly_location_rows)
+        write_management_data_quality_sheet(wb, weekly_location_rows, config)
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
             wb, records, weekly_location_rows, weekly_group_rows, server_rows,
@@ -4539,26 +5202,75 @@ def run(args: argparse.Namespace) -> list[Path]:
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     archive_dir = Path(args.archive_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
+
+    migration_sources = [
+        Path(path).resolve() for path in (getattr(args, "migrate_history_from", None) or [])
+    ]
+    migration_only = bool(getattr(args, "migrate_history_only", False))
+    if migration_only and not migration_sources:
+        raise ValueError("--migrate-history-only requires at least one --migrate-history-from folder.")
+
+    migration_plan = (
+        build_history_migration_plan(migration_sources, archive_dir, config)
+        if migration_sources
+        else None
+    )
+    if migration_only:
+        assert migration_plan is not None
+        return list(apply_history_migration_plan(migration_plan))
+
     active_paths = daily_report_paths(input_dir)
     if not active_paths:
         raise FileNotFoundError(
-            f"No active daily .xls reports found in {input_dir}. "
+            f"No active daily reports ({DAILY_REPORT_FORMAT_LABEL}) found in {input_dir}. "
             "Drop current Toast reports into 01 Daily Reports - Drop Here and rerun."
         )
 
-    active_records_by_path = read_reports_by_path(active_paths, config)
+    raw_active_records_by_path = read_reports_by_path(active_paths, config)
+    active_resolution = resolve_report_duplicates(raw_active_records_by_path)
+    active_records_by_path = active_resolution.records_by_path
     _, active_week_end = active_week_for_paths(active_records_by_path)
     active_records = flatten_report_records(active_records_by_path)
-    active_path_set = set(active_paths)
-    archived_paths = [
-        path for path in archived_daily_report_paths(archive_dir) if path not in active_path_set
-    ]
-    archived_records_by_path = read_reports_by_path(archived_paths, config) if archived_paths else {}
-    records = flatten_report_records(archived_records_by_path) + active_records
+
+    if migration_plan is not None:
+        historical_records_by_path = migration_plan.effective_records_by_path
+        historical_duplicate_paths = migration_plan.duplicate_paths
+    else:
+        archived_paths = archived_daily_report_paths(archive_dir)
+        archived_records_by_path = (
+            read_reports_by_path(archived_paths, config) if archived_paths else {}
+        )
+        historical_resolution = resolve_report_duplicates(archived_records_by_path)
+        historical_records_by_path = historical_resolution.records_by_path
+        historical_duplicate_paths = historical_resolution.duplicate_paths
+
+    combined_records_by_path = dict(historical_records_by_path)
+    combined_records_by_path.update(active_records_by_path)
+    combined_resolution = resolve_report_duplicates(combined_records_by_path)
+    records = flatten_report_records(combined_resolution.records_by_path)
+
+    duplicate_paths = sorted(
+        {
+            *active_resolution.duplicate_paths,
+            *historical_duplicate_paths,
+            *combined_resolution.duplicate_paths,
+        },
+        key=lambda path: str(path).casefold(),
+    )
+    config["_report_audit"] = {
+        "canonical_archive": str(canonical_daily_archive_dir(archive_dir)),
+        "unique_business_days": len(combined_resolution.business_dates),
+        "duplicate_files_ignored": len(duplicate_paths),
+        "duplicate_file_names": [path.name for path in duplicate_paths],
+        "conflicts": 0,
+    }
+
+    if migration_plan is not None:
+        apply_history_migration_plan(migration_plan)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     public_start, public_end = selected_public_dates(active_records, args.week_start, args.week_end)
     selected_records = [
@@ -4600,7 +5312,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-dir",
         default=str(DEFAULT_INPUT_DIR),
-        help="Folder containing active raw daily .xls reports.",
+        help=f"Folder containing active raw daily {DAILY_REPORT_FORMAT_LABEL} reports.",
     )
     parser.add_argument(
         "--output-dir",
@@ -4615,6 +5327,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config JSON.")
     parser.add_argument("--week-start", help="Optional public snapshot start date, YYYY-MM-DD.")
     parser.add_argument("--week-end", help="Optional public snapshot end date, YYYY-MM-DD.")
+    parser.add_argument(
+        "--migrate-history-from",
+        action="append",
+        default=[],
+        metavar="FOLDER",
+        help=(
+            "Copy validated daily reports from a legacy folder into the canonical processed "
+            "archive. Repeat this option for additional source folders."
+        ),
+    )
+    parser.add_argument(
+        "--migrate-history-only",
+        action="store_true",
+        help="Perform the copy-only history migration without generating weekly workbooks.",
+    )
     return parser
 
 
@@ -4624,9 +5351,17 @@ def main() -> None:
         generated = run(args)
     except Exception as exc:
         raise SystemExit(f"ERROR: {exc}") from exc
-    print("Generated:")
-    for path in generated:
-        print(f"  {path}")
+    if args.migrate_history_only:
+        if generated:
+            print("History copied to the canonical archive:")
+            for path in generated:
+                print(f"  {path}")
+        else:
+            print("History migration complete: the canonical archive is already up to date.")
+    else:
+        print("Generated:")
+        for path in generated:
+            print(f"  {path}")
 
 
 if __name__ == "__main__":

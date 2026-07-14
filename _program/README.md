@@ -47,10 +47,14 @@ The master workbook is rebuilt from active daily reports plus archived daily rep
 
 The master workbook separates performance level from momentum:
 
-- Momentum compares the latest full week with up to four prior full weeks across check average, wine percentage, rate of sale, and ticket time.
+- Recent Momentum compares the latest complete week with up to four prior complete weeks across check average, wine percentage, rate of sale, and ticket time.
+- 8-Week Direction compares the most recent four complete weeks with the preceding four. Eight usable server weeks with at least 100 guests in each four-week block are labeled `Full`; six or seven may be labeled `Developing` when both blocks meet the configured week and guest thresholds.
+- Incomplete latest weeks are `Not Scored` and generate no server action. A low current sample also keeps Recent Momentum at `Not Scored`, while qualified longer-term context may still display.
 - Performance level compares the latest values with optional management targets, falling back to the store rolling baseline.
-- Average rank movement is capped at a one-point modifier so it does not double-count the underlying metrics.
+- Average rank movement is capped at a one-point modifier on each horizon so it does not double-count the underlying metrics.
 - Prominent server actions require both the current-week volume thresholds and enough prior full-week history.
+
+The management `Server Scorecard` shows the action, current sample, performance, both trend horizons, and the exact weeks and guests used. The hidden `Server Week-over-Week Detail` tab remains an audit view of adjacent-week changes; it is not the management coaching trend.
 
 `Management Setup` targets, owner names, and manual `Action Board` fields are read from the existing master before regeneration. The new workbook is written to a temporary file and atomically replaces the prior master only after validation succeeds.
 

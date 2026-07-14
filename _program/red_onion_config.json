@@ -14,6 +14,15 @@
   "dashboard_min_prior_full_weeks": 2,
   "dashboard_min_prior_guest_count": 50,
   "dashboard_baseline_full_weeks": 4,
+  "dashboard_long_term_full_weeks": 8,
+  "dashboard_long_term_block_weeks": 4,
+  "dashboard_long_term_full_min_recent_guests": 100,
+  "dashboard_long_term_full_min_earlier_guests": 100,
+  "dashboard_long_term_developing_min_total_weeks": 6,
+  "dashboard_long_term_developing_min_recent_weeks": 3,
+  "dashboard_long_term_developing_min_earlier_weeks": 2,
+  "dashboard_long_term_developing_min_recent_guests": 75,
+  "dashboard_long_term_developing_min_earlier_guests": 50,
   "dashboard_exclude_name_contains": [
     "Banquet",
     "Server"

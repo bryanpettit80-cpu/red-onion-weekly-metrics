@@ -147,7 +147,7 @@ def test_zero_active_files_stop_with_clear_message(tmp_path: Path) -> None:
     args = args_for(tmp_path)
     Path(args.input_dir).mkdir(parents=True)
 
-    with pytest.raises(FileNotFoundError, match="No active daily .xls reports"):
+    with pytest.raises(FileNotFoundError, match=r"No active daily reports \(.xls or .xlsx\)"):
         metrics.run(args)
 
 
@@ -764,11 +764,12 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for value in row
         if isinstance(value, str)
     }
-    assert "Act First" in dashboard_values
-    assert "Recognize / Replicate" in dashboard_values
-    assert "Store Pulse" in dashboard_values
-    assert any("LATEST WEEK COMPLETE" in value for value in dashboard_values)
-    assert len(wb["Dashboard"]._charts) == 2
+    assert "TOP THREE ACTIONS" in dashboard_values
+    assert "RECOGNITION / REPLICATE" in dashboard_values
+    assert "STORE SNAPSHOT" in dashboard_values
+    assert any("READY FOR MANAGEMENT REVIEW" in value for value in dashboard_values)
+    assert len(wb["Dashboard"]._charts) == 0
+    assert len(wb["Store & Group Scorecards"]._charts) == 2
 
     action_values = {
         value
