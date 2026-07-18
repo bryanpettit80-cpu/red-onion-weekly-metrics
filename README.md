@@ -14,7 +14,7 @@ Red Onion Metrics\
   Run Weekly Snapshot.cmd
 ```
 
-- `01 Daily Reports - Drop Here`: drop the current Toast daily `.xls` files here.
+- `01 Daily Reports - Drop Here`: drop the current Toast daily `.xls` or `.xlsx` files here.
 - `02 Finished Reports`: generated weekly workbooks appear here.
 - `03 Archive`: processed reports, prior layouts, and historical workbooks are preserved here.
 - `Red Onion Weekly Metrics Automation`: Git repository, code, config, tests, and technical documentation. Operators should not edit this folder.
@@ -29,10 +29,11 @@ Red Onion Metrics\
 The report files should be named like:
 
 ```text
-Daily Report - TM (Auto-Run) - Marketing Vitals - 06-10-2026.xls
+Daily Report - TM (Auto-Run) - Marketing Vitals - 06-10-2026.xlsx
 ```
 
 The program reads the business date inside the workbook. The filename date is only a fallback.
+Excel temporary files whose names start with `~$` are ignored.
 
 ## What The Run Does
 
@@ -53,7 +54,20 @@ The program reads the business date inside the workbook. The filename date is on
 03 Archive\processed-daily-reports\week-ending-YYYY-MM-DD\
 ```
 
-The master workbook reads archived daily reports plus the active files in the drop folder, so moving processed source files does not remove historical rows from the master workbook.
+The master workbook reads historical daily reports only from the canonical `processed-daily-reports` folder plus active files in the drop folder. Semantically identical same-date reports are counted once even when their file formats or bytes differ. Conflicting same-date reports stop the run before workbooks are created or active files are moved.
+
+## One-Time History Migration
+
+Legacy backup folders can be copied into the canonical history without moving or deleting the originals. The command validates every candidate first, copies one representative per business date into the correct week-ending folder, and is safe to repeat:
+
+```powershell
+python _program\red_onion_weekly_metrics.py `
+  --migrate-history-only `
+  --migrate-history-from "..\03 Archive\pre-codex-restructure-20260706" `
+  --migrate-history-from "..\03 Archive\pre-dropbox-sync-20260706"
+```
+
+If same-date files contain different metric data, migration stops before copying anything and lists the files to reconcile.
 
 ## If Something Fails
 
