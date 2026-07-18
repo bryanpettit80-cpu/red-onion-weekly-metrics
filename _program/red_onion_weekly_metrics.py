@@ -221,6 +221,29 @@ class HistoryMigrationResult:
     business_dates_considered: int
 
 
+@dataclass(frozen=True)
+class LatestWeekReadiness:
+    latest_week_end: date | None
+    latest_location_rows: tuple[dict[str, Any], ...]
+    configured_locations: tuple[str, ...]
+    location_gaps: tuple[str, ...]
+    expected_dates: tuple[date, ...]
+    received_dates: frozenset[date]
+    missing_dates: tuple[date, ...]
+    ready: bool
+
+    @property
+    def missing_parts(self) -> tuple[str, ...]:
+        return (
+            *(f"{report_date:%b} {report_date.day}" for report_date in self.missing_dates),
+            *(f"{location} data" for location in self.location_gaps),
+        )
+
+    @property
+    def missing_text(self) -> str:
+        return ", ".join(self.missing_parts)
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     if path.exists():
@@ -592,20 +615,25 @@ def selected_public_dates(
     return week_period_for(max(operating_dates))
 
 
-def archive_destination_for(source_path: Path, archive_dir: Path) -> tuple[Path, bool]:
+def archive_destination_for(
+    source_path: Path,
+    archive_dir: Path,
+    reserved_destinations: set[Path] | None = None,
+) -> tuple[Path, bool]:
+    reserved_destinations = reserved_destinations or set()
     destination = archive_dir / source_path.name
-    if not destination.exists():
+    if not destination.exists() and destination not in reserved_destinations:
         return destination, False
 
-    if filecmp.cmp(source_path, destination, shallow=False):
+    if destination.exists() and filecmp.cmp(source_path, destination, shallow=False):
         return destination, True
 
     counter = 1
     while True:
         candidate = archive_dir / f"{source_path.stem} ({counter}){source_path.suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and candidate not in reserved_destinations:
             return candidate, False
-        if filecmp.cmp(source_path, candidate, shallow=False):
+        if candidate.exists() and filecmp.cmp(source_path, candidate, shallow=False):
             return candidate, True
         counter += 1
 
@@ -674,6 +702,7 @@ def build_history_migration_plan(
         source_paths_by_date[report_date_for_records(path, records)].append(path)
 
     copy_pairs: list[tuple[Path, Path]] = []
+    reserved_destinations: set[Path] = set()
     for report_date, paths in sorted(source_paths_by_date.items()):
         if report_date in canonical_dates:
             continue
@@ -685,9 +714,12 @@ def build_history_migration_plan(
         destination_dir = canonical_daily_archive_dir(archive_root) / (
             f"week-ending-{week_end.isoformat()}"
         )
-        destination, already_present = archive_destination_for(source_path, destination_dir)
+        destination, already_present = archive_destination_for(
+            source_path, destination_dir, reserved_destinations
+        )
         if not already_present:
             copy_pairs.append((source_path, destination))
+            reserved_destinations.add(destination)
 
     return HistoryMigrationPlan(
         copy_pairs=tuple(copy_pairs),
@@ -698,13 +730,21 @@ def build_history_migration_plan(
 
 
 def apply_history_migration_plan(plan: HistoryMigrationPlan) -> tuple[Path, ...]:
+    destinations = [destination for _, destination in plan.copy_pairs]
+    if len(set(destinations)) != len(destinations):
+        raise RuntimeError(
+            "History migration preflight selected the same destination more than once. "
+            "No files were copied."
+        )
+    conflicts = [destination for destination in destinations if destination.exists()]
+    if conflicts:
+        raise RuntimeError(
+            f"History migration destination appeared after preflight: {conflicts[0]}. "
+            "No files were copied; rerun the migration."
+        )
+
     copied_paths: list[Path] = []
     for source_path, destination in plan.copy_pairs:
-        if destination.exists():
-            raise RuntimeError(
-                f"History migration destination appeared after preflight: {destination}. "
-                "Nothing was overwritten; rerun the migration."
-            )
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, destination)
         copied_paths.append(destination)
@@ -3954,9 +3994,11 @@ def build_management_action_signals(
     store_rows: list[dict[str, Any]],
     group_rows: list[dict[str, Any]],
     weekly_location_rows: list[dict[str, Any]],
+    readiness: LatestWeekReadiness | None = None,
 ) -> list[dict[str, Any]]:
     signals: list[dict[str, Any]] = []
-    for row in server_rows:
+    analytical_ready = readiness is None or readiness.ready
+    for row in server_rows if analytical_ready else []:
         if not row["prominent"] or row["action"] == "Monitor":
             continue
         family = "recognition" if row["action"] == "Recognize & Replicate" else "coaching"
@@ -3982,7 +4024,8 @@ def build_management_action_signals(
                 "Last Seen": row["week_end"],
             }
         )
-    for action_type, rows in (("store", store_rows), ("group", group_rows)):
+    analytical_rows = (("store", store_rows), ("group", group_rows)) if analytical_ready else ()
+    for action_type, rows in analytical_rows:
         for row in rows:
             if row["priority"] == "Monitor":
                 continue
@@ -4011,7 +4054,53 @@ def build_management_action_signals(
                     "Last Seen": latest["week_end"],
                 }
             )
-    if weekly_location_rows:
+    if readiness is not None and readiness.latest_week_end is not None:
+        latest_by_location = {
+            row["location"]: row for row in readiness.latest_location_rows
+        }
+        for location in readiness.location_gaps:
+            row = latest_by_location.get(location)
+            source_days = int(row.get("source_days", 0)) if row else 0
+            detail = (
+                f"{source_days} of {OPERATING_WEEK_DAYS} source days"
+                if row
+                else "No current-week store data"
+            )
+            entity_key = f"data-quality|{location}|latest-week".casefold()
+            signals.append(
+                {
+                    "Entity Key": entity_key,
+                    "Priority": "Review",
+                    "Location": location,
+                    "Person / Area": location,
+                    "Action": "Data Quality",
+                    "Signal": "Incomplete Latest Week",
+                    "Why It Matters": detail,
+                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
+                    "Performance Level": "Preliminary",
+                    "Momentum": "Not Scored",
+                    "Confidence": "Low Sample",
+                    "Last Seen": readiness.latest_week_end,
+                }
+            )
+        if readiness.missing_dates and not readiness.location_gaps:
+            signals.append(
+                {
+                    "Entity Key": "data-quality|all-stores|missing-daily-reports",
+                    "Priority": "Review",
+                    "Location": "All Stores",
+                    "Person / Area": "All Stores",
+                    "Action": "Data Quality",
+                    "Signal": "Incomplete Latest Week",
+                    "Why It Matters": f"Missing {readiness.missing_text}",
+                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
+                    "Performance Level": "Preliminary",
+                    "Momentum": "Not Scored",
+                    "Confidence": "Low Sample",
+                    "Last Seen": readiness.latest_week_end,
+                }
+            )
+    elif weekly_location_rows:
         latest_week_end = max(row["week_end"] for row in weekly_location_rows)
         for row in weekly_location_rows:
             if row["week_end"] != latest_week_end or row.get("source_days", 0) >= OPERATING_WEEK_DAYS:
@@ -4037,7 +4126,9 @@ def build_management_action_signals(
 
 
 def merge_management_actions(
-    signals: list[dict[str, Any]], state: dict[str, Any]
+    signals: list[dict[str, Any]],
+    state: dict[str, Any],
+    readiness: LatestWeekReadiness | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     prior_active = {
         str(row.get("Entity Key", "")).casefold(): row
@@ -4086,6 +4177,38 @@ def merge_management_actions(
     for key, prior in prior_active.items():
         if key in matched_keys:
             continue
+        prior_status = str(prior.get("Status", "")).casefold()
+        is_data_quality = (
+            key.startswith("data-quality|")
+            or str(prior.get("Action") or "").casefold() == "data quality"
+        )
+        if (
+            readiness is not None
+            and not readiness.ready
+            and prior_status not in completed_statuses
+            and not is_data_quality
+        ):
+            paused = dict(prior)
+            prior_signal = str(paused.get("Signal") or "Prior action").strip()
+            if not prior_signal.casefold().startswith("paused / carryover"):
+                paused["Signal"] = f"PAUSED / CARRYOVER - {prior_signal}"
+            missing_text = readiness.missing_text or "latest-week data"
+            paused["Priority"] = "Paused"
+            paused["Action"] = "Paused Carryover"
+            paused["Why It Matters"] = (
+                f"Prior action retained; the latest week is incomplete ({missing_text}) "
+                "and was not used to confirm or clear it."
+            )
+            paused["Recommended Next Step"] = (
+                "Keep the manual assignment on hold until a complete week can confirm, "
+                "update, or clear the prior signal."
+            )
+            paused["Performance Level"] = "Preliminary"
+            paused["Momentum"] = "Not Scored"
+            paused["Confidence"] = "Paused"
+            paused["Signal State"] = "Paused / Carryover"
+            current.append(paused)
+            continue
         cleared = dict(prior)
         cleared["Signal State"] = "Cleared"
         history.append(cleared)
@@ -4096,7 +4219,15 @@ def merge_management_actions(
         action_id = str(row.get("Action ID") or "")
         if action_id and action_id not in current_ids:
             history_by_id[action_id] = row
-    priority_order = {"High": 0, "Medium": 1, "Recognize": 2, "Share": 3, "Review": 4, "Monitor": 5}
+    priority_order = {
+        "High": 0,
+        "Medium": 1,
+        "Recognize": 2,
+        "Share": 3,
+        "Review": 4,
+        "Monitor": 5,
+        "Paused": 6,
+    }
     current.sort(
         key=lambda row: (
             priority_order.get(str(row.get("Priority")), 9),
@@ -4472,17 +4603,48 @@ def write_store_group_scorecards_sheet(
     config: dict[str, Any],
     weekly_location_rows: list[dict[str, Any]],
     weekly_group_rows: list[dict[str, Any]],
+    readiness: LatestWeekReadiness | None = None,
 ) -> None:
     remove_sheet_if_present(wb, "Store & Group Scorecards")
     ws = wb.create_sheet("Store & Group Scorecards")
     style_management_title(ws, "Store & Group Scorecards", 7)
     ws.freeze_panes = "A4"
     current_row = 4
-    for item in rows:
-        entity = item["entity"]
+    display_items: list[tuple[str, dict[str, Any] | None, str]] = []
+    if readiness is None:
+        display_items = [(item["entity"], item, "current") for item in rows]
+    else:
+        by_entity = {item["entity"]: item for item in rows}
+        configured = set(readiness.configured_locations)
+        for item in rows:
+            if item["entity"] not in configured:
+                state = "current" if readiness.ready else "preliminary"
+                display_items.append((item["entity"], item, state))
+        for location in readiness.configured_locations:
+            item = by_entity.get(location)
+            item_week_end = as_date(item.get("latest", {}).get("week_end")) if item else None
+            if item is None or (
+                item_week_end is not None and item_week_end != readiness.latest_week_end
+            ):
+                display_items.append((location, None, "missing"))
+            else:
+                state = "current" if readiness.ready else "preliminary"
+                display_items.append((location, item, state))
+
+    for entity, item, readiness_state in display_items:
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
-        title = ws.cell(row=current_row, column=1, value=f"{entity} | {item['status']} | {item['recommended_focus']}")
-        title.fill = priority_fill(item["priority"]) or PatternFill("solid", fgColor="E7E6E6")
+        if readiness_state == "missing":
+            title_text = f"{entity} | Missing | No current-week data; comparisons are paused."
+            title_priority = "Review"
+        elif readiness_state == "preliminary":
+            missing_text = readiness.missing_text if readiness else "latest-week data"
+            title_text = f"{entity} | Preliminary | Comparisons paused; missing {missing_text or 'latest-week data'}."
+            title_priority = "Review"
+        else:
+            title_text = f"{entity} | {item['status']} | {item['recommended_focus']}"
+            title_priority = item["priority"]
+        title = ws.cell(row=current_row, column=1, value=title_text)
+        title.fill = priority_fill(title_priority) or PatternFill("solid", fgColor="E7E6E6")
         title.font = Font(bold=True)
         title.alignment = Alignment(wrap_text=True)
         for col, header in enumerate(["Metric", "Current", "vs Prior", "vs Benchmark", "Benchmark", "Source", "Status"], start=1):
@@ -4492,13 +4654,25 @@ def write_store_group_scorecards_sheet(
             cell.alignment = Alignment(horizontal="center")
         for offset, (field, label, _) in enumerate(MANAGEMENT_METRICS, start=2):
             row = current_row + offset
+            ws.cell(row=row, column=1, value=label)
+            if readiness_state == "missing":
+                ws.cell(row=row, column=6, value="No current-week data")
+                ws.cell(row=row, column=7, value="Missing")
+                fill = priority_fill("Review")
+                if fill:
+                    ws.cell(row=row, column=7).fill = fill
+                continue
+
             current_value, number_format = format_management_value(field, item["latest"][field])
             prior_change = item["prior_changes"][field]
             benchmark_change = item["benchmark_changes"][field]
             benchmark_value, benchmark_format = format_management_value(field, item["benchmark_values"][field])
-            ws.cell(row=row, column=1, value=label)
             ws.cell(row=row, column=2, value=current_value).number_format = number_format
-            if field in {"gross_sales", "guest_count"}:
+            if readiness_state == "preliminary":
+                ws.cell(row=row, column=5, value=benchmark_value).number_format = benchmark_format
+                ws.cell(row=row, column=6, value=f"Preliminary; {item['benchmark_sources'][field]}")
+                status = "Preliminary"
+            elif field in {"gross_sales", "guest_count"}:
                 prior_value = safe_pct_delta(item["latest"][field], item["prior"][field] if item["prior"] else None)
                 benchmark_delta = safe_pct_delta(item["latest"][field], item["benchmark_values"][field])
                 ws.cell(row=row, column=3, value=prior_value).number_format = "0.0%"
@@ -4509,12 +4683,15 @@ def write_store_group_scorecards_sheet(
             else:
                 ws.cell(row=row, column=3, value=prior_change).number_format = number_format
                 ws.cell(row=row, column=4, value=benchmark_change).number_format = number_format
-            ws.cell(row=row, column=5, value=benchmark_value).number_format = benchmark_format
-            ws.cell(row=row, column=6, value=item["benchmark_sources"][field])
-            status = management_metric_status(field, item, config)
+            if readiness_state == "current":
+                ws.cell(row=row, column=5, value=benchmark_value).number_format = benchmark_format
+                ws.cell(row=row, column=6, value=item["benchmark_sources"][field])
+                status = management_metric_status(field, item, config)
             ws.cell(row=row, column=7, value=status)
             fill = priority_fill(
-                "Medium" if status == "Watch" else "Recognize" if status == "Above" else "Monitor"
+                "Review" if status == "Preliminary" else
+                "Medium" if status == "Watch" else
+                "Recognize" if status == "Above" else "Monitor"
             )
             if fill:
                 ws.cell(row=row, column=7).fill = fill
@@ -4552,14 +4729,21 @@ def write_management_data_quality_sheet(
     wb: Workbook,
     weekly_location_rows: list[dict[str, Any]],
     config: dict[str, Any],
+    readiness: LatestWeekReadiness | None = None,
 ) -> None:
     remove_sheet_if_present(wb, "Data Quality")
     ws = wb.create_sheet("Data Quality")
     style_management_title(ws, "Data Quality", 6)
-    latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
-    latest_rows, configured_locations, _location_gaps, latest_complete = latest_location_completeness(
-        weekly_location_rows, latest_week_end, config
-    )
+    if readiness is None:
+        latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
+        latest_rows, configured_locations, _location_gaps, latest_complete = latest_location_completeness(
+            weekly_location_rows, latest_week_end, config
+        )
+    else:
+        latest_week_end = readiness.latest_week_end
+        latest_rows = list(readiness.latest_location_rows)
+        configured_locations = list(readiness.configured_locations)
+        latest_complete = readiness.ready
     latest_by_location = {row["location"]: row for row in latest_rows}
     ws.merge_cells("A3:F3")
     ws["A3"] = (
@@ -4752,6 +4936,30 @@ def latest_week_report_coverage(
     return expected, received, missing
 
 
+def latest_week_readiness(
+    records: list[MetricRecord],
+    weekly_location_rows: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> LatestWeekReadiness:
+    latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
+    latest_rows, configured_locations, location_gaps, locations_complete = (
+        latest_location_completeness(weekly_location_rows, latest_week_end, config)
+    )
+    expected_dates, received_dates, missing_dates = latest_week_report_coverage(
+        records, latest_week_end
+    )
+    return LatestWeekReadiness(
+        latest_week_end=latest_week_end,
+        latest_location_rows=tuple(latest_rows),
+        configured_locations=tuple(configured_locations),
+        location_gaps=tuple(location_gaps),
+        expected_dates=tuple(expected_dates),
+        received_dates=frozenset(received_dates),
+        missing_dates=tuple(missing_dates),
+        ready=locations_complete and not missing_dates,
+    )
+
+
 def deduplicated_dashboard_actions(
     action_rows: list[dict[str, Any]],
     priorities: set[str],
@@ -4835,6 +5043,7 @@ def write_management_dashboard_sheet(
     group_rows: list[dict[str, Any]],
     action_rows: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
+    readiness: LatestWeekReadiness | None = None,
 ) -> None:
     config = config or DEFAULT_CONFIG
     remove_sheet_if_present(wb, "Dashboard")
@@ -4847,17 +5056,14 @@ def write_management_dashboard_sheet(
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
-    latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
-    latest_location_rows, configured_locations, location_gaps, locations_complete = (
-        latest_location_completeness(weekly_location_rows, latest_week_end, config)
-    )
-    expected_dates, received_dates, missing_dates = latest_week_report_coverage(records, latest_week_end)
-    latest_complete = locations_complete and not missing_dates
-    missing_parts = [
-        *(f"{report_date:%b} {report_date.day}" for report_date in missing_dates),
-        *(f"{location} data" for location in location_gaps),
-    ]
-    missing_text = ", ".join(missing_parts)
+    readiness = readiness or latest_week_readiness(records, weekly_location_rows, config)
+    latest_week_end = readiness.latest_week_end
+    latest_location_rows = list(readiness.latest_location_rows)
+    configured_locations = list(readiness.configured_locations)
+    expected_dates = readiness.expected_dates
+    received_dates = readiness.received_dates
+    latest_complete = readiness.ready
+    missing_text = readiness.missing_text
     current_location_names = {row["location"] for row in latest_location_rows}
     current_store_rows = {
         item["entity"]: item
@@ -5185,6 +5391,7 @@ def write_master_workbook(
         )
         ranked_rows = weekly_server_rank_rows(weekly_server_rows, rank_min_guest_count)
         weekly_group_rows = group_weekly_rows(records)
+        readiness = latest_week_readiness(records, weekly_location_rows, config)
         full_by_location, global_full = full_week_ends_by_location(weekly_location_rows)
         server_rows = management_server_rows(
             weekly_server_rows, weekly_location_rows, ranked_rows, state["targets"], config
@@ -5196,9 +5403,9 @@ def write_master_workbook(
             weekly_group_rows, "group", state["targets"], config, global_full
         )
         signals = build_management_action_signals(
-            server_rows, store_rows, group_rows, weekly_location_rows
+            server_rows, store_rows, group_rows, weekly_location_rows, readiness
         )
-        current_actions, action_history = merge_management_actions(signals, state)
+        current_actions, action_history = merge_management_actions(signals, state, readiness)
 
         if "Data Quality" in wb.sheetnames:
             remove_sheet_if_present(wb, "_Data Quality Detail")
@@ -5217,14 +5424,15 @@ def write_master_workbook(
             config,
             weekly_location_rows,
             weekly_group_rows,
+            readiness,
         )
         write_rising_falling_sheet(wb, server_rows)
         write_action_tracking_sheet(wb, "Action History", action_history, editable=False)
-        write_management_data_quality_sheet(wb, weekly_location_rows, config)
+        write_management_data_quality_sheet(wb, weekly_location_rows, config, readiness)
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
             wb, records, weekly_location_rows, weekly_group_rows, server_rows,
-            store_rows, group_rows, current_actions, config,
+            store_rows, group_rows, current_actions, config, readiness,
         )
         finalize_management_workbook(wb)
         wb.calculation.fullCalcOnLoad = True

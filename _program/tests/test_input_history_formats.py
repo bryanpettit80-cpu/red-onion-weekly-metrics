@@ -158,6 +158,71 @@ def test_migration_conflict_blocks_before_copying(
     assert not metrics.canonical_daily_archive_dir(archive_root).exists()
 
 
+def test_migration_reserves_distinct_destinations_for_same_named_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_source = tmp_path / "legacy-one"
+    second_source = tmp_path / "legacy-two"
+    archive_root = tmp_path / "archive"
+    first_source.mkdir()
+    second_source.mkdir()
+    first = first_source / "Daily Report same-name.xlsx"
+    second = second_source / "Daily Report same-name.xlsx"
+    first.write_text("2026-06-10", encoding="utf-8")
+    second.write_text("2026-06-11", encoding="utf-8")
+
+    def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
+        return [make_record(path, date.fromisoformat(path.read_text(encoding="utf-8")))]
+
+    monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)
+
+    first_result = metrics.migrate_history_files(
+        [first_source, second_source], archive_root, metrics.DEFAULT_CONFIG
+    )
+    second_result = metrics.migrate_history_files(
+        [first_source, second_source], archive_root, metrics.DEFAULT_CONFIG
+    )
+
+    expected_folder = (
+        archive_root
+        / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
+        / "week-ending-2026-06-14"
+    )
+    assert first_result.copied_paths == (
+        expected_folder / first.name,
+        expected_folder / "Daily Report same-name (1).xlsx",
+    )
+    assert first_result.business_dates_considered == 2
+    assert second_result.copied_paths == ()
+    assert len(metrics.archived_daily_report_paths(archive_root)) == 2
+
+
+def test_migration_rechecks_all_destinations_before_copying(tmp_path: Path) -> None:
+    first_source = tmp_path / "Daily Report first.xlsx"
+    second_source = tmp_path / "Daily Report second.xlsx"
+    first_destination = tmp_path / "archive" / first_source.name
+    second_destination = tmp_path / "archive" / second_source.name
+    first_source.write_text("first", encoding="utf-8")
+    second_source.write_text("second", encoding="utf-8")
+    second_destination.parent.mkdir(parents=True)
+    second_destination.write_text("appeared after planning", encoding="utf-8")
+    plan = metrics.HistoryMigrationPlan(
+        copy_pairs=(
+            (first_source, first_destination),
+            (second_source, second_destination),
+        ),
+        effective_records_by_path={},
+        duplicate_paths=(),
+        business_dates=(),
+    )
+
+    with pytest.raises(RuntimeError, match="No files were copied"):
+        metrics.apply_history_migration_plan(plan)
+
+    assert not first_destination.exists()
+    assert second_destination.read_text(encoding="utf-8") == "appeared after planning"
+
+
 def test_history_cli_accepts_repeatable_sources_and_migration_only() -> None:
     args = metrics.build_parser().parse_args(
         [
