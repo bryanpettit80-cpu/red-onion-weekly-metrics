@@ -4526,6 +4526,28 @@ def write_store_group_scorecards_sheet(
     add_management_scorecard_charts(wb, ws, weekly_location_rows, weekly_group_rows)
 
 
+def latest_location_completeness(
+    weekly_location_rows: list[dict[str, Any]],
+    latest_week_end: date | None,
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], list[str], bool]:
+    latest_rows = [
+        row for row in weekly_location_rows if row["week_end"] == latest_week_end
+    ]
+    latest_by_location = {row["location"]: row for row in latest_rows}
+    configured_locations = list(config.get("locations", {}))
+    if not configured_locations:
+        configured_locations = sorted(latest_by_location)
+    location_gaps = [
+        location
+        for location in configured_locations
+        if location not in latest_by_location
+        or latest_by_location[location].get("source_days", 0) < OPERATING_WEEK_DAYS
+    ]
+    complete = bool(configured_locations) and not location_gaps
+    return latest_rows, configured_locations, location_gaps, complete
+
+
 def write_management_data_quality_sheet(
     wb: Workbook,
     weekly_location_rows: list[dict[str, Any]],
@@ -4535,10 +4557,10 @@ def write_management_data_quality_sheet(
     ws = wb.create_sheet("Data Quality")
     style_management_title(ws, "Data Quality", 6)
     latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
-    latest_rows = [row for row in weekly_location_rows if row["week_end"] == latest_week_end]
-    latest_complete = bool(latest_rows) and all(
-        row.get("source_days", 0) >= OPERATING_WEEK_DAYS for row in latest_rows
+    latest_rows, configured_locations, _location_gaps, latest_complete = latest_location_completeness(
+        weekly_location_rows, latest_week_end, config
     )
+    latest_by_location = {row["location"]: row for row in latest_rows}
     ws.merge_cells("A3:F3")
     ws["A3"] = (
         f"Latest week ending {latest_week_end:%m/%d/%Y} is complete and suitable for management trends."
@@ -4560,10 +4582,19 @@ def write_management_data_quality_sheet(
         cell = ws.cell(row=5, column=col, value=header)
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
-    for row_index, row in enumerate(sorted(latest_rows, key=lambda item: item["location"]), start=6):
-        status = "Complete" if row.get("source_days", 0) >= OPERATING_WEEK_DAYS else "Short Week"
+    for row_index, location in enumerate(configured_locations, start=6):
+        row = latest_by_location.get(location)
+        status = (
+            "Missing" if row is None
+            else "Complete" if row.get("source_days", 0) >= OPERATING_WEEK_DAYS
+            else "Short Week"
+        )
         values = [
-            row["week_end"], row["location"], row["active_days"], row["source_days"], status,
+            latest_week_end,
+            location,
+            row.get("active_days", 0) if row else 0,
+            row.get("source_days", 0) if row else 0,
+            status,
             "Use" if status == "Complete" else "Preliminary only",
         ]
         for col, value in enumerate(values, start=1):
@@ -4803,7 +4834,9 @@ def write_management_dashboard_sheet(
     store_rows: list[dict[str, Any]],
     group_rows: list[dict[str, Any]],
     action_rows: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
 ) -> None:
+    config = config or DEFAULT_CONFIG
     remove_sheet_if_present(wb, "Dashboard")
     ws = wb.create_sheet("Dashboard")
     style_management_title(ws, "Red Onion Weekly Brief", 12)
@@ -4815,12 +4848,22 @@ def write_management_dashboard_sheet(
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
     latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
-    latest_location_rows = [row for row in weekly_location_rows if row["week_end"] == latest_week_end]
+    latest_location_rows, configured_locations, location_gaps, locations_complete = (
+        latest_location_completeness(weekly_location_rows, latest_week_end, config)
+    )
     expected_dates, received_dates, missing_dates = latest_week_report_coverage(records, latest_week_end)
-    latest_complete = bool(latest_location_rows) and all(
-        row.get("source_days", 0) >= OPERATING_WEEK_DAYS for row in latest_location_rows
-    ) and not missing_dates
-    missing_text = ", ".join(f"{report_date:%b} {report_date.day}" for report_date in missing_dates)
+    latest_complete = locations_complete and not missing_dates
+    missing_parts = [
+        *(f"{report_date:%b} {report_date.day}" for report_date in missing_dates),
+        *(f"{location} data" for location in location_gaps),
+    ]
+    missing_text = ", ".join(missing_parts)
+    current_location_names = {row["location"] for row in latest_location_rows}
+    current_store_rows = {
+        item["entity"]: item
+        for item in store_rows
+        if item["entity"] in current_location_names
+    }
     _, global_full = full_week_ends_by_location(weekly_location_rows)
 
     ws.merge_cells("A3:L3")
@@ -4965,7 +5008,13 @@ def write_management_dashboard_sheet(
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     for row_index in range(19, 21):
-        item = store_rows[row_index - 19] if row_index - 19 < len(store_rows) else None
+        location_index = row_index - 19
+        location = (
+            configured_locations[location_index]
+            if location_index < len(configured_locations)
+            else None
+        )
+        item = current_store_rows.get(location) if location else None
         ws.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=2)
         ws.merge_cells(start_row=row_index, start_column=3, end_row=row_index, end_column=4)
         ws.merge_cells(start_row=row_index, start_column=8, end_row=row_index, end_column=9)
@@ -4987,7 +5036,12 @@ def write_management_dashboard_sheet(
             if fill:
                 ws.cell(row=row_index, column=3).fill = fill
         else:
-            ws.cell(row=row_index, column=1, value="No store data")
+            ws.cell(row=row_index, column=1, value=location or "No store data")
+            ws.cell(row=row_index, column=3, value="Missing")
+            ws.cell(row=row_index, column=10, value="No current-week data; comparisons are paused.")
+            fill = priority_fill("Review")
+            if fill:
+                ws.cell(row=row_index, column=3).fill = fill
         for col in (1, 3, 5, 6, 7, 8, 10):
             ws.cell(row=row_index, column=col).alignment = Alignment(
                 wrap_text=True, vertical="center"
@@ -5170,7 +5224,7 @@ def write_master_workbook(
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
             wb, records, weekly_location_rows, weekly_group_rows, server_rows,
-            store_rows, group_rows, current_actions,
+            store_rows, group_rows, current_actions, config,
         )
         finalize_management_workbook(wb)
         wb.calculation.fullCalcOnLoad = True

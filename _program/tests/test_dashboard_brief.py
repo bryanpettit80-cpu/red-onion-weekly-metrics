@@ -163,6 +163,49 @@ def test_incomplete_week_pauses_comparisons_actions_and_recognition() -> None:
     assert len(ws._charts) == 0
 
 
+def test_missing_configured_location_pauses_dashboard_without_stale_metrics() -> None:
+    wb = Workbook()
+    records, _weekly_locations, stores, groups, actions = dashboard_inputs()
+    latest_week_end = date(2026, 7, 12)
+    weekly_locations = [
+        weekly_location_row(latest_week_end, "RC Richmond"),
+        weekly_location_row(latest_week_end - timedelta(days=7), "RC Virginia Beach"),
+    ]
+
+    metrics.write_management_dashboard_sheet(
+        wb,
+        records,
+        weekly_locations,
+        [],
+        [],
+        stores,
+        groups,
+        actions,
+        metrics.DEFAULT_CONFIG,
+    )
+
+    dashboard = wb["Dashboard"]
+    assert dashboard["A7"].value == "6 of 6"
+    assert dashboard["E7"].value == "PAUSED"
+    assert dashboard["I7"].value == "PAUSED"
+    assert "PRELIMINARY" in dashboard["A4"].value
+    assert "RC Virginia Beach data" in dashboard["A4"].value
+    assert dashboard["A19"].value == "RC Richmond"
+    assert dashboard["A20"].value == "RC Virginia Beach"
+    assert dashboard["C20"].value == "Missing"
+    assert dashboard["E20"].value is None
+    assert dashboard["F20"].value is None
+    assert dashboard["G20"].value is None
+
+    metrics.write_management_data_quality_sheet(
+        wb, weekly_locations, metrics.DEFAULT_CONFIG
+    )
+    data_quality = wb["Data Quality"]
+    assert "incomplete" in data_quality["A3"].value.lower()
+    assert data_quality["B7"].value == "RC Virginia Beach"
+    assert data_quality["E7"].value == "Missing"
+
+
 def test_scorecard_charts_use_latest_eight_complete_weeks() -> None:
     wb = Workbook()
     first_week_end = date(2026, 5, 10)
