@@ -258,6 +258,45 @@ def test_incomplete_week_carries_manual_active_action_as_paused() -> None:
     assert current[0]["Momentum"] == "Not Scored"
     assert current[0]["Confidence"] == "Paused"
     assert current[0]["Signal State"] == "Paused / Carryover"
+    assert current[0]["Last Seen"] == date(2026, 7, 12)
+    assert current[0]["First Seen"] == date(2026, 6, 28)
+    assert current[0]["Weeks Open"] == 3
+
+    repeated, _ = metrics.merge_management_actions(
+        [], {"active_actions": current, "action_history": history}, readiness
+    )
+    assert repeated[0]["Last Seen"] == date(2026, 7, 12)
+    assert repeated[0]["First Seen"] == date(2026, 6, 28)
+    assert repeated[0]["Weeks Open"] == 3
+
+
+def test_backdated_incomplete_week_does_not_rewind_paused_action_dates() -> None:
+    readiness = metrics.latest_week_readiness(
+        report_records(missing=date(2026, 7, 11)),
+        configured_locations(source_days=metrics.OPERATING_WEEK_DAYS - 1),
+        metrics.DEFAULT_CONFIG,
+    )
+    prior = {
+        "Action ID": "A1B2C3D4E5F6",
+        "Entity Key": "server|rc richmond|alex|coaching",
+        "Priority": "High",
+        "Status": "In Progress",
+        "Location": "RC Richmond",
+        "Person / Area": "Alex",
+        "Action": "Coach Now",
+        "Signal": "Falling / Below Benchmark",
+        "First Seen": date(2026, 7, 19),
+        "Last Seen": date(2026, 7, 26),
+        "Weeks Open": 2,
+    }
+
+    current, _ = metrics.merge_management_actions(
+        [], {"active_actions": [prior], "action_history": []}, readiness
+    )
+
+    assert current[0]["First Seen"] == date(2026, 7, 19)
+    assert current[0]["Last Seen"] == date(2026, 7, 26)
+    assert current[0]["Weeks Open"] == 2
 
 
 def test_complete_week_shared_readiness_preserves_action_signal_behavior() -> None:

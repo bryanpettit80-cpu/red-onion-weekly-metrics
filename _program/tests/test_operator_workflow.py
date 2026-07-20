@@ -784,6 +784,61 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert len(wb["Action Board"].data_validations.dataValidation) == 2
     assert len(wb["Action Board"].conditional_formatting) >= 3
     assert "ManagementTargets" in wb["Management Setup"].tables
+    assert "Alex Rising" in {
+        cell.value for row in wb["Server Scorecard"].iter_rows() for cell in row
+    }
+    assert "Alex Rising" in {
+        cell.value for row in wb["Rising & Falling Stars"].iter_rows() for cell in row
+    }
+
+
+def test_incomplete_latest_week_hides_server_scorecards_and_stars(tmp_path: Path) -> None:
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    records: list[metrics.MetricRecord] = []
+    for week_end in (date(2026, 6, 14), date(2026, 6, 21), date(2026, 6, 28)):
+        for location in ("RC Richmond", "RC Virginia Beach"):
+            records.extend(
+                full_week_records(
+                    week_end,
+                    location=location,
+                    weekly_gross=1200,
+                    weekly_guests=60,
+                    weekly_wine=120,
+                    server="Alex Server",
+                )
+            )
+    records = [
+        record
+        for record in records
+        if not (
+            record.report_date == date(2026, 6, 27)
+            and record.source_file.endswith("2026-06-27.xls")
+        )
+    ]
+    output_path = tmp_path / "Red_Onion_Server_Master.xlsx"
+
+    metrics.write_master_workbook(
+        records,
+        output_path,
+        config,
+        tmp_path / "Daily Reports",
+        date(2026, 6, 23),
+        date(2026, 6, 28),
+    )
+
+    workbook = load_workbook(output_path, data_only=False)
+    assert workbook["Server Scorecard"].max_row == 3
+    assert workbook["Rising & Falling Stars"].max_row == 3
+    dashboard_values = {
+        cell.value for row in workbook["Dashboard"].iter_rows() for cell in row
+    }
+    assert "Alex Server" not in dashboard_values
+    assert any(
+        "paused" in value.casefold()
+        for value in dashboard_values
+        if isinstance(value, str)
+    )
+    workbook.close()
 
 
 def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path: Path) -> None:
