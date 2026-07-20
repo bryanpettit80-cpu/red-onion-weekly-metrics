@@ -169,6 +169,11 @@ DAILY_REPORT_PREFIX = "daily report"
 DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
 DAILY_REPORT_FORMAT_LABEL = ".xls or .xlsx"
 CANONICAL_DAILY_ARCHIVE_FOLDER = "processed-daily-reports"
+EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+UNTRUSTED_WORKBOOK_TEXT_HEADERS = frozenset(
+    {"Raw Server", "Display Name", "Source File", "Server", "Person / Area"}
+)
+MAX_DATA_QUALITY_DATE_ROWS = 10_000
 PROGRAM_DIR = Path(__file__).resolve().parent
 REPOSITORY_ROOT = PROGRAM_DIR.parent
 PROJECT_ROOT = (
@@ -341,6 +346,24 @@ def display_name_for(raw_name: str, config: dict[str, Any]) -> str:
     return aliases.get(raw_name, raw_name)
 
 
+def excel_safe_text(value: Any) -> Any:
+    """Neutralize strings that spreadsheet applications may interpret as formulas."""
+    if isinstance(value, str) and value.startswith(EXCEL_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
+def excel_safe_cell_value(cell) -> Any:
+    """Return a non-executable value, including for openpyxl formula objects."""
+    value = cell.value
+    if cell.data_type != "f":
+        return excel_safe_text(value)
+    formula_text = value if isinstance(value, str) else getattr(value, "text", None)
+    if not isinstance(formula_text, str) or not formula_text:
+        return "[Blocked spreadsheet formula]"
+    return excel_safe_text(formula_text)
+
+
 def is_numbered_server_placeholder(name: Any) -> bool:
     text = "" if is_blank(name) else str(name).strip()
     pattern = r"\d+\s+Server\d*(?:\s+Server\d*)*"
@@ -388,7 +411,9 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
         if location not in location_names:
             continue
 
-        raw_user_name = "" if is_blank(row.get(1)) else str(row.get(1)).strip()
+        source_raw_user_name = "" if is_blank(row.get(1)) else str(row.get(1)).strip()
+        raw_user_name = source_raw_user_name
+        display_name = display_name_for(source_raw_user_name, config)
 
         for start_col in block_starts:
             values = [row.get(start_col + offset) for offset in range(len(METRICS))]
@@ -408,12 +433,12 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
             wine_pct = wine_sales / gross_sales if gross_sales else 0.0
             records.append(
                 MetricRecord(
-                    source_file=path.name,
+                    source_file=excel_safe_text(path.name),
                     report_date=report_date,
                     location=location,
                     raw_user_name=raw_user_name,
-                    display_name=display_name_for(raw_user_name, config),
-                    is_location_total=raw_user_name == "",
+                    display_name=display_name,
+                    is_location_total=source_raw_user_name == "",
                     gross_sales=gross_sales,
                     guest_count=guest_count,
                     check_average=check_average,
@@ -603,16 +628,68 @@ def selected_public_dates(
     if not operating_dates:
         raise ValueError("No Tuesday-Sunday operating report dates were found.")
 
-    if week_start and week_end:
-        return date.fromisoformat(week_start), date.fromisoformat(week_end)
-    if week_start:
-        start = date.fromisoformat(week_start)
-        return start, start + timedelta(days=OPERATING_WEEK_DAYS - 1)
-    if week_end:
-        end = date.fromisoformat(week_end)
-        return end - timedelta(days=OPERATING_WEEK_DAYS - 1), end
+    try:
+        if week_start and week_end:
+            start, end = date.fromisoformat(week_start), date.fromisoformat(week_end)
+        elif week_start:
+            start = date.fromisoformat(week_start)
+            _, end = week_period_for(start)
+        elif week_end:
+            end = date.fromisoformat(week_end)
+            start, _ = week_period_for(end)
+        else:
+            start, end = week_period_for(max(operating_dates))
 
-    return week_period_for(max(operating_dates))
+        invalid_range = (
+            start > end
+            or not is_operating_day(start)
+            or not is_operating_day(end)
+            or week_period_for(start) != week_period_for(end)
+        )
+    except OverflowError as exc:
+        raise ValueError(
+            "Public snapshot dates must be ordered operating days within one "
+            f"{OPERATING_WEEK_LABEL} operating week; received "
+            f"{week_start or 'automatic'} through {week_end or 'automatic'}."
+        ) from exc
+    if invalid_range:
+        raise ValueError(
+            "Public snapshot dates must be ordered operating days within one "
+            f"{OPERATING_WEEK_LABEL} operating week; received "
+            f"{start.isoformat()} through {end.isoformat()}."
+        )
+    return start, end
+
+
+def operating_day_count(start: date, end: date) -> int:
+    if start > end:
+        return 0
+    total_days = (end - start).days + 1
+    full_weeks, remainder = divmod(total_days, 7)
+    return full_weeks * OPERATING_WEEK_DAYS + sum(
+        is_operating_day(start + timedelta(days=offset)) for offset in range(remainder)
+    )
+
+
+def validated_data_quality_coverage(
+    records: Iterable[MetricRecord], public_start: date, public_end: date
+) -> tuple[date, date, int]:
+    report_dates = [record.report_date for record in records]
+    if not report_dates:
+        raise ValueError("No report dates were found for Data Quality coverage.")
+    coverage_start = min(min(report_dates), public_start)
+    coverage_end = max(max(report_dates), public_end)
+    row_count = operating_day_count(coverage_start, coverage_end)
+    if row_count > MAX_DATA_QUALITY_DATE_ROWS:
+        raise ValueError(
+            "Data Quality date coverage from "
+            f"{coverage_start.isoformat()} through {coverage_end.isoformat()} would create "
+            f"{row_count:,} operating-day rows, above the safe limit of "
+            f"{MAX_DATA_QUALITY_DATE_ROWS:,}. Reconcile the outlier report date and rerun. "
+            "No history files were copied, no workbooks were created, and no active "
+            "source files were moved."
+        )
+    return coverage_start, coverage_end, row_count
 
 
 def archive_destination_for(
@@ -1048,7 +1125,7 @@ def write_public_workbook(
 
     for row_index, row in enumerate(rows_to_write, start=3):
         ws.cell(row=row_index, column=1, value=location)
-        ws.cell(row=row_index, column=2, value=row["display_name"])
+        ws.cell(row=row_index, column=2, value=excel_safe_text(row["display_name"]))
         ws.cell(row=row_index, column=3, value=row["gross_sales"])
         ws.cell(row=row_index, column=4, value=row["guest_count"])
         ws.cell(row=row_index, column=5, value=row["check_average"])
@@ -1090,8 +1167,10 @@ def write_table_sheet(
 
     for row_index, row in enumerate(rows, start=4):
         for col_index, value in enumerate(row, start=1):
-            cell = ws.cell(row=row_index, column=col_index, value=value)
             header = headers[col_index - 1]
+            if header in UNTRUSTED_WORKBOOK_TEXT_HEADERS:
+                value = excel_safe_text(value)
+            cell = ws.cell(row=row_index, column=col_index, value=value)
             if "Date" in header or header in {"Week Start", "Week End", "Latest Week End"}:
                 cell.number_format = "m/d/yyyy"
             elif "Composite Score" in header or "Rank Movement" in header:
@@ -2135,7 +2214,7 @@ def write_dashboard_sheet(
         group_rows,
     )
 
-    write_dashboard_table(
+    data_quality_end = write_dashboard_table(
         ws,
         "Data Quality",
         max(snapshot_end, group_end) + 1,
@@ -2146,24 +2225,24 @@ def write_dashboard_sheet(
 
     coach_rows = [
         [
-            row["priority"],
-            row["location"],
-            row["subject"],
-            row["impact"],
-            row["evidence"],
-            row["recommended_follow_up"],
+            excel_safe_text(row["priority"]),
+            excel_safe_text(row["location"]),
+            excel_safe_text(row["subject"]),
+            excel_safe_text(row["impact"]),
+            excel_safe_text(row["evidence"]),
+            excel_safe_text(row["recommended_follow_up"]),
         ]
         for row in action_rows
         if row["action"] == "Coach"
     ][:5]
     recognize_rows = [
         [
-            row["priority"],
-            row["location"],
-            row["subject"],
-            row["impact"],
-            row["evidence"],
-            row["recommended_follow_up"],
+            excel_safe_text(row["priority"]),
+            excel_safe_text(row["location"]),
+            excel_safe_text(row["subject"]),
+            excel_safe_text(row["impact"]),
+            excel_safe_text(row["evidence"]),
+            excel_safe_text(row["recommended_follow_up"]),
         ]
         for row in action_rows
         if row["action"] == "Recognize"
@@ -2172,10 +2251,11 @@ def write_dashboard_sheet(
         coach_rows = [["", "", "No coach-now items", "", "", ""]]
     if not recognize_rows:
         recognize_rows = [["", "", "No recognition items", "", "", ""]]
+    action_tables_row = max(max(snapshot_end, group_end) + 7, data_quality_end)
     coach_end = write_dashboard_table(
         ws,
         "Coach First",
-        max(snapshot_end, group_end) + 7,
+        action_tables_row,
         1,
         ["Priority", "Location", "Server", "Impact", "Evidence", "Recommended Follow-Up"],
         coach_rows,
@@ -2183,7 +2263,7 @@ def write_dashboard_sheet(
     recognize_end = write_dashboard_table(
         ws,
         "Recognize / Replicate",
-        max(snapshot_end, group_end) + 7,
+        action_tables_row,
         8,
         ["Priority", "Location", "Server", "Impact", "Evidence", "Recommended Follow-Up"],
         recognize_rows,
@@ -2295,7 +2375,11 @@ def write_dashboard_sheet(
                     value = selected[value_field]
                 ws.cell(row=write_row, column=1, value=location)
                 ws.cell(row=write_row, column=2, value=visible_rank)
-                ws.cell(row=write_row, column=3, value=selected["display_name"])
+                ws.cell(
+                    row=write_row,
+                    column=3,
+                    value=excel_safe_text(selected["display_name"]),
+                )
                 ws.cell(row=write_row, column=4, value=selected["guest_count"])
                 ws.cell(row=write_row, column=5, value=value)
                 ws.cell(row=write_row, column=6, value=selected["active_days"])
@@ -2367,7 +2451,7 @@ def write_data_quality_sheet(
         locations = sorted({record.location for record in source_records})
         source_rows.append(
             [
-                source_file,
+                excel_safe_text(source_file),
                 min(record.report_date for record in source_records),
                 ", ".join(locations),
                 sum(1 for record in source_records if not record.is_location_total),
@@ -2408,8 +2492,9 @@ def write_data_quality_sheet(
         cell.font = Font(bold=True)
     expected_dates = []
     if all_dates:
-        current = min(min(all_dates), public_start)
-        coverage_end = max(max(all_dates), public_end)
+        current, coverage_end, _ = validated_data_quality_coverage(
+            records, public_start, public_end
+        )
         while current <= coverage_end:
             if is_operating_day(current):
                 expected_dates.append(current)
@@ -2435,7 +2520,9 @@ def write_data_quality_sheet(
         ws.cell(
             row=row_index,
             column=4,
-            value=", ".join(sorted(source_files_by_date.get(report_date, set()))),
+            value=excel_safe_text(
+                ", ".join(sorted(source_files_by_date.get(report_date, set())))
+            ),
         )
         if status == "Missing":
             ws.cell(row=row_index, column=2).fill = PatternFill("solid", fgColor="F4CCCC")
@@ -2607,14 +2694,14 @@ def write_action_board_sheet(wb: Workbook, action_rows: list[dict[str, Any]]) ->
     ]
     data = [
         [
-            row["priority"],
-            row["action"],
-            row["location"],
-            row["subject"],
-            row["signal"],
-            row["impact"],
-            row["evidence"],
-            row["recommended_follow_up"],
+            excel_safe_text(row["priority"]),
+            excel_safe_text(row["action"]),
+            excel_safe_text(row["location"]),
+            excel_safe_text(row["subject"]),
+            excel_safe_text(row["signal"]),
+            excel_safe_text(row["impact"]),
+            excel_safe_text(row["evidence"]),
+            excel_safe_text(row["recommended_follow_up"]),
             row["week_end"],
             row["guest_count"],
             row["active_days"],
@@ -3907,7 +3994,7 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for row in range(header_row + 1, ws.max_row + 1):
         record = {
-            str(header): ws.cell(row=row, column=col).value
+            str(header): excel_safe_cell_value(ws.cell(row=row, column=col))
             for col, header in enumerate(headers, start=1)
             if header
         }
@@ -3956,11 +4043,10 @@ def read_management_state(output_path: Path) -> dict[str, Any]:
                             values[field] = None
                     state["targets"][str(entity)] = values
                     row += 1
-            state["owners"] = [
-                str(ws.cell(row=row, column=10).value).strip()
-                for row in range(6, min(ws.max_row, 25) + 1)
-                if ws.cell(row=row, column=10).value
-            ]
+            for row in range(6, min(ws.max_row, 25) + 1):
+                value = excel_safe_cell_value(ws.cell(row=row, column=10))
+                if not is_blank(value):
+                    state["owners"].append(str(value).strip())
         if "Action Board" in wb.sheetnames:
             state["active_actions"] = records_from_sheet(wb["Action Board"], "Action ID")
         if "Action History" in wb.sheetnames:
@@ -4189,6 +4275,21 @@ def merge_management_actions(
             and not is_data_quality
         ):
             paused = dict(prior)
+            prior_last_seen = as_date(paused.get("Last Seen"))
+            first_seen = (
+                as_date(paused.get("First Seen"))
+                or prior_last_seen
+                or readiness.latest_week_end
+                or date.today()
+            )
+            last_seen = max(
+                candidate
+                for candidate in (readiness.latest_week_end, prior_last_seen, first_seen)
+                if candidate is not None
+            )
+            paused["Last Seen"] = last_seen
+            paused["First Seen"] = first_seen
+            paused["Weeks Open"] = max(1, ((last_seen - first_seen).days // 7) + 1)
             prior_signal = str(paused.get("Signal") or "Prior action").strip()
             if not prior_signal.casefold().startswith("paused / carryover"):
                 paused["Signal"] = f"PAUSED / CARRYOVER - {prior_signal}"
@@ -4327,7 +4428,8 @@ def write_management_setup_sheet(
     ws["J5"].fill = PatternFill("solid", fgColor="D9E1F2")
     ws["J5"].font = Font(bold=True)
     for row in range(6, 26):
-        ws.cell(row=row, column=10, value=owners[row - 6] if row - 6 < len(owners) else None)
+        owner = owners[row - 6] if row - 6 < len(owners) else None
+        ws.cell(row=row, column=10, value=excel_safe_text(owner))
         ws.cell(row=row, column=10).fill = PatternFill("solid", fgColor="D9EAF7")
 
     threshold_headers = ["Metric", "Neutral Band", "Strong Band", "Better Direction", "Use"]
@@ -4369,7 +4471,7 @@ def write_management_setup_sheet(
 
 
 def action_row_values(row: dict[str, Any]) -> list[Any]:
-    return [row.get(header) for header in ACTION_HEADERS]
+    return [excel_safe_text(row.get(header)) for header in ACTION_HEADERS]
 
 
 def write_action_tracking_sheet(
@@ -4480,7 +4582,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
             [
                 row["action"],
                 row["location"],
-                row["display_name"],
+                excel_safe_text(row["display_name"]),
                 f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
                 row["confidence"],
                 row["performance_level"],
@@ -4533,7 +4635,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
             f"{row['momentum']} Star",
             row["action"],
             row["location"],
-            row["display_name"],
+            excel_safe_text(row["display_name"]),
             f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
             row["performance_level"],
             row["momentum"],
@@ -5166,10 +5268,14 @@ def write_management_dashboard_sheet(
                 )
                 owner = str(item.get("Owner") or "Unassigned")
                 due_date = as_date(item.get("Due Date"))
-                ws.cell(row=row_index, column=1, value=priority)
-                ws.cell(row=row_index, column=3, value=person_location)
-                ws.cell(row=row_index, column=6, value=dashboard_management_move(item))
-                ws.cell(row=row_index, column=11, value=owner)
+                ws.cell(row=row_index, column=1, value=excel_safe_text(priority))
+                ws.cell(row=row_index, column=3, value=excel_safe_text(person_location))
+                ws.cell(
+                    row=row_index,
+                    column=6,
+                    value=excel_safe_text(dashboard_management_move(item)),
+                )
+                ws.cell(row=row_index, column=11, value=excel_safe_text(owner))
                 if due_date:
                     ws.cell(row=row_index, column=12, value=due_date).number_format = "m/d/yyyy"
                 else:
@@ -5279,7 +5385,7 @@ def write_management_dashboard_sheet(
     else:
         recognition_text = "No recognition item met the current complete-week thresholds."
         recognition_fill = "F3F4F6"
-    ws["A23"] = recognition_text
+    ws["A23"] = excel_safe_text(recognition_text)
     ws["A23"].fill = PatternFill("solid", fgColor=recognition_fill)
     ws["A23"].alignment = Alignment(wrap_text=True, vertical="center")
     ws.row_dimensions[23].height = 34
@@ -5406,6 +5512,7 @@ def write_master_workbook(
             server_rows, store_rows, group_rows, weekly_location_rows, readiness
         )
         current_actions, action_history = merge_management_actions(signals, state, readiness)
+        visible_server_rows = server_rows if readiness.ready else []
 
         if "Data Quality" in wb.sheetnames:
             remove_sheet_if_present(wb, "_Data Quality Detail")
@@ -5417,7 +5524,7 @@ def write_master_workbook(
             remove_sheet_if_present(wb, name)
         write_management_setup_sheet(wb, state["targets"], state["owners"], config)
         write_action_tracking_sheet(wb, "Action Board", current_actions, editable=True)
-        write_server_scorecard_sheet(wb, server_rows)
+        write_server_scorecard_sheet(wb, visible_server_rows)
         write_store_group_scorecards_sheet(
             wb,
             [*group_rows, *store_rows],
@@ -5426,12 +5533,12 @@ def write_master_workbook(
             weekly_group_rows,
             readiness,
         )
-        write_rising_falling_sheet(wb, server_rows)
+        write_rising_falling_sheet(wb, visible_server_rows)
         write_action_tracking_sheet(wb, "Action History", action_history, editable=False)
         write_management_data_quality_sheet(wb, weekly_location_rows, config, readiness)
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
-            wb, records, weekly_location_rows, weekly_group_rows, server_rows,
+            wb, records, weekly_location_rows, weekly_group_rows, visible_server_rows,
             store_rows, group_rows, current_actions, config, readiness,
         )
         finalize_management_workbook(wb)
@@ -5529,12 +5636,10 @@ def run(args: argparse.Namespace) -> list[Path]:
         "conflicts": 0,
     }
 
-    if migration_plan is not None:
-        apply_history_migration_plan(migration_plan)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    public_start, public_end = selected_public_dates(active_records, args.week_start, args.week_end)
+    public_start, public_end = selected_public_dates(
+        active_records, args.week_start, args.week_end
+    )
+    validated_data_quality_coverage(records, public_start, public_end)
     selected_records = [
         record
         for record in records
@@ -5542,6 +5647,11 @@ def run(args: argparse.Namespace) -> list[Path]:
     ]
     if not selected_records:
         raise ValueError(f"No records found between {public_start} and {public_end}.")
+
+    if migration_plan is not None:
+        apply_history_migration_plan(migration_plan)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     generated: list[Path] = []
     for location in config["locations"]:
