@@ -170,6 +170,9 @@ DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
 DAILY_REPORT_FORMAT_LABEL = ".xls or .xlsx"
 CANONICAL_DAILY_ARCHIVE_FOLDER = "processed-daily-reports"
 EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+UNTRUSTED_WORKBOOK_TEXT_HEADERS = frozenset(
+    {"Raw Server", "Display Name", "Source File", "Server", "Person / Area"}
+)
 MAX_DATA_QUALITY_DATE_ROWS = 10_000
 PROGRAM_DIR = Path(__file__).resolve().parent
 REPOSITORY_ROOT = PROGRAM_DIR.parent
@@ -409,8 +412,8 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
             continue
 
         source_raw_user_name = "" if is_blank(row.get(1)) else str(row.get(1)).strip()
-        raw_user_name = excel_safe_text(source_raw_user_name)
-        display_name = excel_safe_text(display_name_for(source_raw_user_name, config))
+        raw_user_name = source_raw_user_name
+        display_name = display_name_for(source_raw_user_name, config)
 
         for start_col in block_starts:
             values = [row.get(start_col + offset) for offset in range(len(METRICS))]
@@ -1164,8 +1167,10 @@ def write_table_sheet(
 
     for row_index, row in enumerate(rows, start=4):
         for col_index, value in enumerate(row, start=1):
-            cell = ws.cell(row=row_index, column=col_index, value=value)
             header = headers[col_index - 1]
+            if header in UNTRUSTED_WORKBOOK_TEXT_HEADERS:
+                value = excel_safe_text(value)
+            cell = ws.cell(row=row_index, column=col_index, value=value)
             if "Date" in header or header in {"Week Start", "Week End", "Latest Week End"}:
                 cell.number_format = "m/d/yyyy"
             elif "Composite Score" in header or "Rank Movement" in header:
@@ -2446,7 +2451,7 @@ def write_data_quality_sheet(
         locations = sorted({record.location for record in source_records})
         source_rows.append(
             [
-                source_file,
+                excel_safe_text(source_file),
                 min(record.report_date for record in source_records),
                 ", ".join(locations),
                 sum(1 for record in source_records if not record.is_location_total),
@@ -2515,7 +2520,9 @@ def write_data_quality_sheet(
         ws.cell(
             row=row_index,
             column=4,
-            value=", ".join(sorted(source_files_by_date.get(report_date, set()))),
+            value=excel_safe_text(
+                ", ".join(sorted(source_files_by_date.get(report_date, set())))
+            ),
         )
         if status == "Missing":
             ws.cell(row=row_index, column=2).fill = PatternFill("solid", fgColor="F4CCCC")

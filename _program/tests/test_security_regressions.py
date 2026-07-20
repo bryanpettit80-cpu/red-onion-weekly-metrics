@@ -76,20 +76,14 @@ def test_report_names_are_sanitized_before_workbook_generation(tmp_path: Path) -
 
     config = metrics.load_config(tmp_path / "missing-config.json")
     records = metrics.parse_daily_report(source_path, config)
-    assert records[0].raw_user_name == f"'{malicious_name}"
-    assert records[0].display_name == f"'{malicious_name}"
+    assert records[0].raw_user_name == malicious_name
+    assert records[0].display_name == malicious_name
 
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     output_path = metrics.write_public_workbook(
         "RC Richmond",
-        [
-            make_record(
-                date(2026, 7, 18),
-                raw_user_name=malicious_name,
-                display_name=malicious_name,
-            )
-        ],
+        records,
         output_dir,
         config,
         date(2026, 7, 18),
@@ -100,6 +94,95 @@ def test_report_names_are_sanitized_before_workbook_generation(tmp_path: Path) -
     assert name_cell.value == f"'{malicious_name}"
     assert name_cell.data_type == "s"
     generated.close()
+
+
+def test_formula_escaping_does_not_hide_distinct_report_conflicts(tmp_path: Path) -> None:
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    formula_name = "=Alex"
+    literal_name = "'=Alex"
+    first_path = tmp_path / "Daily Report active.xlsx"
+    second_path = tmp_path / "Daily Report archived.xlsx"
+
+    for path, server_name in (
+        (first_path, formula_name),
+        (second_path, literal_name),
+    ):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Report(All)"
+        worksheet.append(["Date(s): 07/18/2026"])
+        worksheet.append(
+            [
+                "Store",
+                "User",
+                "Gross Sales",
+                "Guest Count",
+                "Check Average",
+                "Wine Sales",
+                "Rate of Sale by Guest Count",
+                "Average Ticket Time",
+            ]
+        )
+        worksheet.append(
+            ["RC Richmond", server_name, 100.0, 10.0, 10.0, 20.0, 0.2, time(0, 20)]
+        )
+        worksheet["B3"].data_type = "s"
+        workbook.save(path)
+        workbook.close()
+
+    records_by_path = {
+        first_path: metrics.parse_daily_report(first_path, config),
+        second_path: metrics.parse_daily_report(second_path, config),
+    }
+    assert records_by_path[first_path][0].raw_user_name == formula_name
+    assert records_by_path[second_path][0].raw_user_name == literal_name
+
+    with pytest.raises(ValueError, match="Conflicting daily reports"):
+        metrics.resolve_report_duplicates(records_by_path)
+
+
+def test_generic_workbook_tables_escape_untrusted_identity_columns() -> None:
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    worksheet = metrics.write_table_sheet(
+        workbook,
+        "Identity Detail",
+        ["Raw Server", "Display Name", "Source File", "Trusted Note"],
+        [["=Raw", "+Display", "@source.xlsx", "=trusted formula-like note"]],
+        "IdentityDetail",
+    )
+
+    for coordinate in ("A4", "B4", "C4"):
+        assert worksheet[coordinate].value.startswith("'")
+        assert worksheet[coordinate].data_type == "s"
+    assert worksheet["D4"].value == "=trusted formula-like note"
+    assert worksheet["D4"].data_type == "f"
+    workbook.close()
+
+
+def test_data_quality_sheet_escapes_source_file_names() -> None:
+    workbook = Workbook()
+    report_day = date(2026, 7, 18)
+
+    metrics.write_data_quality_sheet(
+        workbook,
+        [make_record(report_day, source_file="=source.xlsx")],
+        [],
+        report_day,
+        report_day,
+    )
+
+    source_cells = [
+        cell
+        for row in workbook["Data Quality"].iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and "source.xlsx" in cell.value
+    ]
+    assert len(source_cells) == 2
+    assert all(cell.value.startswith("'") for cell in source_cells)
+    assert all(cell.data_type == "s" for cell in source_cells)
+    workbook.close()
 
 
 def test_carried_forward_management_text_is_sanitized(tmp_path: Path) -> None:
