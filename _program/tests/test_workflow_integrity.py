@@ -97,6 +97,35 @@ def install_synthetic_parser(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(metrics, "parse_daily_report", parse)
 
 
+def downgrade_master_to_pre_protection_contract(path: Path) -> str:
+    """Model the protected owner-roster workbook deployed before PR #10."""
+
+    workbook = load_workbook(path, data_only=False)
+    run_notes = workbook["Run Notes"]
+    marker_row = next(
+        (
+            row
+            for row in range(1, run_notes.max_row + 1)
+            if run_notes.cell(row=row, column=1).value == "Protection Contract"
+        ),
+        None,
+    )
+    if marker_row is not None:
+        run_notes.delete_rows(marker_row, 1)
+    for worksheet in workbook.worksheets:
+        worksheet.protection.objects = False
+        worksheet.protection.scenarios = False
+    for sheet_name in ("Management Setup", "Action Board"):
+        for validation in workbook[sheet_name].data_validations.dataValidation:
+            validation.showErrorMessage = False
+            validation.errorStyle = None
+            validation.errorTitle = None
+            validation.error = None
+    workbook.save(path)
+    workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
 def test_explicit_baseline_succeeds_without_active_input_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -233,6 +262,304 @@ def test_existing_verified_chain_requires_explicit_one_time_anchor_adoption(
         existing.resolve(),
         adopted_sha256,
     )
+
+
+def test_adopted_pre_contract_master_is_regenerated_with_strict_protection(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        roster = workbook["Management Setup"]
+        roster["A21"] = "Avery Manager"
+        roster["B21"] = "Yes"
+        workbook.save(master)
+    finally:
+        workbook.close()
+    legacy_digest = downgrade_master_to_pre_protection_contract(master)
+    genesis = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="integrity-baseline",
+        run_id="pre-protection-genesis",
+        previous_manifest=None,
+    )
+    genesis_sha256 = integrity.canonical_json_sha256(
+        integrity.read_json_manifest(genesis)
+    )
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="pre-protection-contract",
+        previous_manifest=genesis,
+        expected_previous_sha256=genesis_sha256,
+    )
+    assert integrity.read_json_manifest(existing)[
+        "master_generated_content_sha256"
+    ] == legacy_digest
+    before_adoption = master.read_bytes()
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="predates the current protection contract",
+    ):
+        metrics.verify_existing_management_workbook_integrity(master)
+
+    adopted, adopted_payload, adopted_sha256 = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+
+    assert adopted == existing
+    assert metrics.verify_integrity_anchor(archive_dir) == (
+        existing.resolve(),
+        adopted_sha256,
+    )
+    assert adopted_payload["_legacy_master_upgrade_pending"] is True
+    assert master.read_bytes() == before_adoption
+    assert len(
+        integrity.verify_manifest_chain(existing, metrics.integrity_manifest_dir(archive_dir))
+    ) == 2
+
+    args.migrate_history_from = [str(tmp_path / "legacy-history")]
+    args.migrate_history_only = True
+    pinned_anchor = integrity.read_json_manifest(
+        metrics.integrity_anchor_path(archive_dir),
+        root=metrics.integrity_anchor_path(archive_dir).parent,
+    )
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="History-only migration is blocked",
+    ):
+        metrics.run(args)
+    assert master.read_bytes() == before_adoption
+    assert manifest_paths(archive_dir) == [genesis, existing]
+    assert integrity.read_json_manifest(
+        metrics.integrity_anchor_path(archive_dir),
+        root=metrics.integrity_anchor_path(archive_dir).parent,
+    ) == pinned_anchor
+    args.migrate_history_from = []
+    args.migrate_history_only = False
+
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    (input_dir / "Daily Report - TM - 07-21-2026.xlsx").write_bytes(
+        b"captured active report"
+    )
+    install_synthetic_parser(monkeypatch)
+
+    generated = metrics.run(args)
+
+    assert master in generated
+    assert metrics.validate_management_workbook(master)
+    latest = metrics.latest_integrity_manifest_path(archive_dir)
+    assert latest is not None and latest not in {genesis, existing}
+    assert len(
+        integrity.verify_manifest_chain(latest, metrics.integrity_manifest_dir(archive_dir))
+    ) == 3
+    assert metrics.verify_integrity_anchor(archive_dir)[0] == latest.resolve()
+    upgraded = load_workbook(master, data_only=False)
+    try:
+        assert all(
+            worksheet.protection.objects is True
+            and worksheet.protection.scenarios is True
+            for worksheet in upgraded.worksheets
+        )
+        assert any(
+            upgraded["Run Notes"].cell(row=row, column=1).value
+            == "Protection Contract"
+            for row in range(1, upgraded["Run Notes"].max_row + 1)
+        )
+        assert metrics.owner_roster_from_sheet(upgraded["Management Setup"])[0] == {
+            "Owner Name": "Avery Manager",
+            "Active": "Yes",
+        }
+    finally:
+        upgraded.close()
+
+
+def test_pre_contract_adoption_rejects_a_manifest_digest_mismatch(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    recorded_digest = downgrade_master_to_pre_protection_contract(master)
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook["Dashboard"]["A1"] = "Unrecorded generated heading"
+        workbook.save(master)
+    finally:
+        workbook.close()
+    state = metrics.build_integrity_state(archive_dir, output_dir)
+    state["master_generated_content_sha256"] = recorded_digest
+    metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="mismatched-pre-contract-master",
+        previous_manifest=None,
+        integrity_state=state,
+    )
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="Master workbook generated-content verification failed",
+    ):
+        metrics.ensure_integrity_preflight(
+            archive_dir,
+            output_dir,
+            config_path,
+            config,
+            allow_initialize=True,
+        )
+
+    assert not metrics.integrity_anchor_exists(archive_dir)
+
+
+@pytest.mark.parametrize(
+    ("tamper_kind", "message"),
+    [
+        ("protection", "pre-approved protection contract"),
+        ("validation_range", "approved legacy shape"),
+    ],
+)
+def test_pre_contract_adoption_rejects_a_self_stamped_near_legacy_shape(
+    tmp_path: Path,
+    valid_master_template: Path,
+    tamper_kind: str,
+    message: str,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    downgrade_master_to_pre_protection_contract(master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        if tamper_kind == "protection":
+            workbook["Dashboard"].protection.objects = True
+        else:
+            validation = next(
+                item
+                for item in workbook[
+                    "Management Setup"
+                ].data_validations.dataValidation
+                if item.formula1 == '"Yes,No"'
+            )
+            validation.sqref = "Z1"
+        workbook.save(master)
+    finally:
+        workbook.close()
+    metrics.stamp_generated_content_digest(master)
+    metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="near-legacy-protection-shape",
+        previous_manifest=None,
+    )
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match=message,
+    ):
+        metrics.ensure_integrity_preflight(
+            archive_dir,
+            output_dir,
+            config_path,
+            config,
+            allow_initialize=True,
+        )
+
+    assert not metrics.integrity_anchor_exists(archive_dir)
+
+
+def test_explicit_adoption_rejects_an_unknown_protection_contract(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        run_notes = workbook["Run Notes"]
+        marker_row = next(
+            row
+            for row in range(1, run_notes.max_row + 1)
+            if run_notes.cell(row=row, column=1).value
+            == metrics.WORKBOOK_PROTECTION_CONTRACT_LABEL
+        )
+        run_notes.cell(
+            row=marker_row,
+            column=2,
+            value="objects-scenarios-stop-validation-v999",
+        )
+        workbook.save(master)
+    finally:
+        workbook.close()
+    metrics.stamp_generated_content_digest(master)
+    metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="unknown-protection-contract",
+        previous_manifest=None,
+    )
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="unsupported protection contract",
+    ):
+        metrics.ensure_integrity_preflight(
+            archive_dir,
+            output_dir,
+            config_path,
+            config,
+            allow_initialize=True,
+        )
+
+    assert not metrics.integrity_anchor_exists(archive_dir)
 
 
 def test_anchor_advance_failure_preserves_prior_trusted_head(
