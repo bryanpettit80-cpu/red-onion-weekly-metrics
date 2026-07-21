@@ -59,6 +59,11 @@ def build_controlled_workbook(path: Path) -> None:
         [action_row()],
         editable=True,
     )
+    run_notes = workbook.create_sheet("Run Notes")
+    run_notes["A10"] = metrics.WORKBOOK_PROTECTION_CONTRACT_LABEL
+    run_notes["B10"] = metrics.WORKBOOK_PROTECTION_CONTRACT
+    run_notes["A11"] = metrics.RUN_NOTES_DIGEST_LABEL
+    run_notes["B11"] = "Pending test digest"
     technical = workbook.create_sheet("_Technical")
     technical["A1"] = "Generated detail"
     technical["A2"] = 1
@@ -389,6 +394,62 @@ def test_all_sheets_and_workbook_structure_are_password_protected(
     workbook.close()
 
 
+def test_strict_validation_rejects_a_restamped_validation_range_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "moved-validation-range.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    try:
+        validation = next(
+            item
+            for item in workbook["Management Setup"].data_validations.dataValidation
+            if item.formula1 == '"Yes,No"'
+        )
+        validation.sqref = "Z1"
+        workbook.save(path)
+    finally:
+        workbook.close()
+    tampered_digest = metrics.stamp_generated_content_digest(path)
+    monkeypatch.setattr(
+        metrics,
+        "VISIBLE_MANAGEMENT_SHEETS",
+        ["Management Setup", "Action Board", "Run Notes"],
+    )
+
+    with pytest.raises(
+        metrics.IntegrityError,
+        match="must block invalid pasted or typed values",
+    ):
+        metrics.validate_management_workbook(path, tampered_digest)
+
+
+def test_strict_validation_rejects_a_duplicate_contract_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "duplicate-contract-marker.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    try:
+        workbook["Run Notes"].append(
+            [metrics.WORKBOOK_PROTECTION_CONTRACT_LABEL, "attacker-contract"]
+        )
+        workbook.save(path)
+    finally:
+        workbook.close()
+    tampered_digest = metrics.stamp_generated_content_digest(path)
+    monkeypatch.setattr(
+        metrics,
+        "VISIBLE_MANAGEMENT_SHEETS",
+        ["Management Setup", "Action Board", "Run Notes"],
+    )
+
+    with pytest.raises(metrics.IntegrityError, match="duplicated protection contract"):
+        metrics.validate_management_workbook(path, tampered_digest)
+
+
 def test_image_overlay_is_rejected_before_semantic_digest(tmp_path: Path) -> None:
     path = tmp_path / "image-overlay.xlsx"
     build_controlled_workbook(path)
@@ -449,7 +510,7 @@ def test_pasted_invalid_list_values_stop_before_workbook_generation(
     monkeypatch.setattr(
         metrics,
         "verify_existing_management_workbook_integrity",
-        lambda _path: None,
+        lambda _path, **_kwargs: None,
     )
 
     def unexpected_generation(*_args: object, **_kwargs: object) -> None:

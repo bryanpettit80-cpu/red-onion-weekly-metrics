@@ -213,6 +213,8 @@ OWNER_ROSTER_SPARE_ROWS = 10
 OWNER_ROSTER_MAX_ROWS = 200
 WORKBOOK_DIGEST_SCHEME = "red-onion-generated-content-v2"
 RUN_NOTES_DIGEST_LABEL = "Generated Content SHA-256"
+WORKBOOK_PROTECTION_CONTRACT_LABEL = "Protection Contract"
+WORKBOOK_PROTECTION_CONTRACT = "objects-scenarios-stop-validation-v1"
 EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 UNTRUSTED_WORKBOOK_TEXT_HEADERS = frozenset(
     {"Raw Server", "Display Name", "Source File", "Server", "Person / Area"}
@@ -5021,7 +5023,12 @@ def owner_roster_capacity_from_sheet(ws) -> int:
     return capacity
 
 
-def read_management_state(output_path: Path) -> dict[str, Any]:
+def read_management_state(
+    output_path: Path,
+    *,
+    allow_legacy_protection_upgrade: bool = False,
+    expected_digest: str | None = None,
+) -> dict[str, Any]:
     state: dict[str, Any] = {
         "targets": {},
         "owners": [],
@@ -5040,7 +5047,11 @@ def read_management_state(output_path: Path) -> dict[str, Any]:
             "Close the workbook in Excel and rerun; no source files were moved."
         ) from exc
     try:
-        verify_existing_management_workbook_integrity(output_path)
+        verify_existing_management_workbook_integrity(
+            output_path,
+            expected_digest=expected_digest,
+            allow_legacy_protection_upgrade=allow_legacy_protection_upgrade,
+        )
     except Exception:
         wb.close()
         raise
@@ -5663,11 +5674,34 @@ def stamped_workbook_digest(wb: Workbook) -> str | None:
     if "Run Notes" not in wb.sheetnames:
         return None
     ws = wb["Run Notes"]
-    for row in range(1, ws.max_row + 1):
-        if ws.cell(row=row, column=1).value == RUN_NOTES_DIGEST_LABEL:
-            value = ws.cell(row=row, column=2).value
-            return str(value).strip().lower() if value else None
-    return None
+    rows = [
+        row
+        for row in range(1, ws.max_row + 1)
+        if ws.cell(row=row, column=1).value == RUN_NOTES_DIGEST_LABEL
+    ]
+    if len(rows) > 1:
+        raise IntegrityError("Run Notes contains a duplicated generated-content digest field.")
+    if not rows:
+        return None
+    value = ws.cell(row=rows[0], column=2).value
+    return str(value).strip().lower() if value else None
+
+
+def stamped_workbook_protection_contract(wb: Workbook) -> str | None:
+    if "Run Notes" not in wb.sheetnames:
+        return None
+    ws = wb["Run Notes"]
+    rows = [
+        row
+        for row in range(1, ws.max_row + 1)
+        if ws.cell(row=row, column=1).value == WORKBOOK_PROTECTION_CONTRACT_LABEL
+    ]
+    if len(rows) > 1:
+        raise IntegrityError("Run Notes contains a duplicated protection contract marker.")
+    if not rows:
+        return None
+    value = ws.cell(row=rows[0], column=2).value
+    return str(value).strip() if value is not None else ""
 
 
 def stamp_generated_content_digest(path: Path) -> str:
@@ -5677,17 +5711,16 @@ def stamp_generated_content_digest(path: Path) -> str:
         if "Run Notes" not in wb.sheetnames:
             raise IntegrityError("Generated master workbook is missing Run Notes.")
         ws = wb["Run Notes"]
-        digest_row = next(
-            (
-                row
-                for row in range(1, ws.max_row + 1)
-                if ws.cell(row=row, column=1).value == RUN_NOTES_DIGEST_LABEL
-            ),
-            None,
-        )
-        if digest_row is None:
+        digest_rows = [
+            row
+            for row in range(1, ws.max_row + 1)
+            if ws.cell(row=row, column=1).value == RUN_NOTES_DIGEST_LABEL
+        ]
+        if not digest_rows:
             raise IntegrityError("Run Notes is missing the generated-content digest field.")
-        ws.cell(row=digest_row, column=2, value=digest)
+        if len(digest_rows) > 1:
+            raise IntegrityError("Run Notes contains a duplicated generated-content digest field.")
+        ws.cell(row=digest_rows[0], column=2, value=digest)
         wb.save(path)
     finally:
         wb.close()
@@ -5702,6 +5735,7 @@ def require_stop_style_list_validation(
     formula1: str,
     label: str,
     allow_blank: bool,
+    sqref: str,
 ) -> None:
     matches = [
         validation
@@ -5715,6 +5749,7 @@ def require_stop_style_list_validation(
         validation.showErrorMessage is not True
         or validation.errorStyle != "stop"
         or bool(validation.allowBlank) is not allow_blank
+        or str(validation.sqref) != sqref
         or not validation.errorTitle
         or not validation.error
     ):
@@ -5723,88 +5758,209 @@ def require_stop_style_list_validation(
         )
 
 
+def expected_management_list_validations(
+    wb: Workbook,
+) -> list[tuple[str, str, bool, str, str]]:
+    def column_range(column: str, first_row: int, last_row: int) -> str:
+        first = f"{column}{first_row}"
+        return first if first_row == last_row else f"{first}:{column}{last_row}"
+
+    setup = wb["Management Setup"]
+    min_col, min_row, max_col, max_row = range_boundaries(
+        setup.tables[OWNER_ROSTER_TABLE_NAME].ref
+    )
+    if (min_col, max_col) != (1, 2):
+        raise IntegrityError("The Owner Roster table has an unexpected shape.")
+    expected = [
+        (
+            "Management Setup",
+            '"Yes,No"',
+            True,
+            f"B{min_row + 1}:B{max_row}",
+            "Owner Roster Active",
+        )
+    ]
+    action_board = wb["Action Board"]
+    if "ActionBoardTable" in action_board.tables:
+        action_min_col, action_min_row, action_max_col, action_max_row = range_boundaries(
+            action_board.tables["ActionBoardTable"].ref
+        )
+        if (action_min_col, action_max_col) != (1, len(ACTION_HEADERS)):
+            raise IntegrityError("The Action Board table has an unexpected shape.")
+        expected.extend(
+            [
+                (
+                    "Action Board",
+                    f'"{",".join(ACTION_STATUS_CHOICES)}"',
+                    False,
+                    column_range("D", action_min_row + 1, action_max_row),
+                    "Action Board status",
+                ),
+                (
+                    "Action Board",
+                    f"={OWNER_ROSTER_DEFINED_NAME}",
+                    True,
+                    column_range("E", action_min_row + 1, action_max_row),
+                    "Action Board owner",
+                ),
+            ]
+        )
+    elif records_from_sheet(action_board, "Action ID"):
+        raise IntegrityError("The Action Board table is missing.")
+    return expected
+
+
+def require_exact_validation_count(
+    wb: Workbook,
+    expected: list[tuple[str, str, bool, str, str]],
+    *,
+    contract_label: str,
+) -> None:
+    actual_count = sum(
+        len(ws.data_validations.dataValidation) for ws in wb.worksheets
+    )
+    if actual_count != len(expected):
+        raise IntegrityError(
+            f"The {contract_label} workbook contains an unexpected number of data validations."
+        )
+
+
+def validate_management_workbook_controls(
+    wb: Workbook,
+    *,
+    protect_objects_and_scenarios: bool,
+) -> tuple[Any, Any]:
+    """Validate controls shared by strict and manifest-bound pre-contract workbooks."""
+
+    missing = [name for name in VISIBLE_MANAGEMENT_SHEETS if name not in wb.sheetnames]
+    if missing:
+        raise IntegrityError(
+            f"Generated master workbook is missing required sheets: {', '.join(missing)}"
+        )
+    if wb.security is None or not wb.security.lockStructure:
+        raise IntegrityError("Generated master workbook structure protection is missing.")
+    if not wb.security.workbookPassword:
+        raise IntegrityError("Generated master workbook structure password is missing.")
+    if (
+        wb.calculation.calcMode != "auto"
+        or wb.calculation.fullCalcOnLoad is not True
+        or wb.calculation.forceFullCalc is not True
+    ):
+        raise IntegrityError(
+            "Generated master workbook automatic/full recalculation controls are missing."
+        )
+    approved = approved_management_input_cells(wb)
+    actual_unlocked = {
+        (ws.title, cell.coordinate)
+        for ws in wb.worksheets
+        for cell in ws._cells.values()
+        if cell.protection.locked is False
+    }
+    if actual_unlocked != approved:
+        unexpected = sorted(actual_unlocked - approved)
+        missing_unlocked = sorted(approved - actual_unlocked)
+        detail = unexpected[:1] or missing_unlocked[:1]
+        raise IntegrityError(
+            "Generated master workbook editable-cell protection does not match the "
+            f"approved allowlist ({detail[0] if detail else 'unknown mismatch'})."
+        )
+    for ws in wb.worksheets:
+        expected_state = "visible" if ws.title in VISIBLE_MANAGEMENT_SHEETS else "veryHidden"
+        if ws.sheet_state != expected_state:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} has state {ws.sheet_state!r}; "
+                f"expected {expected_state!r}."
+            )
+        if not ws.protection.sheet or not ws.protection.password:
+            raise IntegrityError(f"Worksheet {ws.title!r} is not password-protected.")
+        if (
+            ws.protection.objects is not protect_objects_and_scenarios
+            or ws.protection.scenarios is not protect_objects_and_scenarios
+        ):
+            expected = "protect" if protect_objects_and_scenarios else "leave unprotected"
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not match the pre-approved protection "
+                f"contract: it must {expected} drawing objects and scenarios."
+            )
+    setup = wb["Management Setup"]
+    if "ManagementTargets" not in setup.tables or OWNER_ROSTER_TABLE_NAME not in setup.tables:
+        raise IntegrityError("Management Setup is missing a required protected input table.")
+    if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
+        raise IntegrityError("The active-owner workbook name is missing.")
+    owner_roster_from_sheet(setup)
+    action_board = wb["Action Board"]
+    validate_action_board_records(records_from_sheet(action_board, "Action ID"))
+    return setup, action_board
+
+
+def require_pre_contract_list_validations(wb: Workbook) -> None:
+    """Require the exact validation shape emitted immediately before PR #10."""
+
+    expected = expected_management_list_validations(wb)
+    actual = [
+        (ws.title, validation)
+        for ws in wb.worksheets
+        for validation in ws.data_validations.dataValidation
+    ]
+    require_exact_validation_count(wb, expected, contract_label="pre-contract")
+    for sheet_name, formula1, allow_blank, sqref, label in expected:
+        matches = [
+            validation
+            for actual_sheet, validation in actual
+            if actual_sheet == sheet_name
+            and validation.type == "list"
+            and validation.formula1 == formula1
+        ]
+        if len(matches) != 1:
+            raise IntegrityError(f"The pre-contract {label} validation is missing or duplicated.")
+        validation = matches[0]
+        if (
+            str(validation.sqref) != sqref
+            or bool(validation.allowBlank) is not allow_blank
+            or validation.showErrorMessage is not False
+            or validation.errorStyle is not None
+            or validation.errorTitle is not None
+            or validation.error is not None
+        ):
+            raise IntegrityError(
+                f"The pre-contract {label} validation does not match the approved legacy shape."
+            )
+
+
 def validate_management_workbook(path: Path, expected_digest: str | None = None) -> str:
     """Validate protection, visibility, editable cells, tables, and digest."""
     reject_unapproved_workbook_drawings(path)
     wb = load_workbook(path, data_only=False)
     try:
-        missing = [name for name in VISIBLE_MANAGEMENT_SHEETS if name not in wb.sheetnames]
-        if missing:
+        protection_contract = stamped_workbook_protection_contract(wb)
+        if protection_contract != WORKBOOK_PROTECTION_CONTRACT:
             raise IntegrityError(
-                f"Generated master workbook is missing required sheets: {', '.join(missing)}"
+                "Generated master workbook has no supported protection contract marker."
             )
-        if wb.security is None or not wb.security.lockStructure:
-            raise IntegrityError("Generated master workbook structure protection is missing.")
-        if not wb.security.workbookPassword:
-            raise IntegrityError("Generated master workbook structure password is missing.")
-        if (
-            wb.calculation.calcMode != "auto"
-            or wb.calculation.fullCalcOnLoad is not True
-            or wb.calculation.forceFullCalc is not True
-        ):
-            raise IntegrityError(
-                "Generated master workbook automatic/full recalculation controls are missing."
-            )
-        approved = approved_management_input_cells(wb)
-        actual_unlocked = {
-            (ws.title, cell.coordinate)
-            for ws in wb.worksheets
-            for cell in ws._cells.values()
-            if cell.protection.locked is False
-        }
-        if actual_unlocked != approved:
-            unexpected = sorted(actual_unlocked - approved)
-            missing_unlocked = sorted(approved - actual_unlocked)
-            detail = unexpected[:1] or missing_unlocked[:1]
-            raise IntegrityError(
-                "Generated master workbook editable-cell protection does not match the "
-                f"approved allowlist ({detail[0] if detail else 'unknown mismatch'})."
-            )
-        for ws in wb.worksheets:
-            expected_state = "visible" if ws.title in VISIBLE_MANAGEMENT_SHEETS else "veryHidden"
-            if ws.sheet_state != expected_state:
-                raise IntegrityError(
-                    f"Worksheet {ws.title!r} has state {ws.sheet_state!r}; "
-                    f"expected {expected_state!r}."
-                )
-            if not ws.protection.sheet or not ws.protection.password:
-                raise IntegrityError(f"Worksheet {ws.title!r} is not password-protected.")
-            if ws.protection.objects is not True or ws.protection.scenarios is not True:
-                raise IntegrityError(
-                    f"Worksheet {ws.title!r} does not protect drawing objects and scenarios."
-                )
-        setup = wb["Management Setup"]
-        if "ManagementTargets" not in setup.tables or OWNER_ROSTER_TABLE_NAME not in setup.tables:
-            raise IntegrityError("Management Setup is missing a required protected input table.")
-        if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
-            raise IntegrityError("The active-owner workbook name is missing.")
-        owner_roster_from_sheet(setup)
-        require_stop_style_list_validation(
-            setup,
-            formula1='"Yes,No"',
-            label="Owner Roster Active",
-            allow_blank=True,
+        setup, action_board = validate_management_workbook_controls(
+            wb, protect_objects_and_scenarios=True
         )
-        action_board = wb["Action Board"]
-        validate_action_board_records(records_from_sheet(action_board, "Action ID"))
-        if action_board.max_row > 4:
+        expected_validations = expected_management_list_validations(wb)
+        require_exact_validation_count(
+            wb, expected_validations, contract_label="strict protection-contract"
+        )
+        for sheet_name, formula1, allow_blank, sqref, label in expected_validations:
             require_stop_style_list_validation(
-                action_board,
-                formula1=f'"{",".join(ACTION_STATUS_CHOICES)}"',
-                label="Action Board status",
-                allow_blank=False,
-            )
-            require_stop_style_list_validation(
-                action_board,
-                formula1=f"={OWNER_ROSTER_DEFINED_NAME}",
-                label="Action Board owner",
-                allow_blank=True,
+                wb[sheet_name],
+                formula1=formula1,
+                label=label,
+                allow_blank=allow_blank,
+                sqref=sqref,
             )
         stamped = stamped_workbook_digest(wb)
     finally:
         wb.close()
     actual_digest = workbook_generated_content_sha256(path)
-    required_digest = expected_digest or stamped
+    required_digest = expected_digest.lower() if expected_digest else stamped
+    if expected_digest and stamped != required_digest:
+        raise IntegrityError(
+            "Master workbook stamped digest does not match the manifest-recorded digest."
+        )
     if not required_digest or actual_digest != required_digest.lower():
         raise IntegrityError(
             "Master workbook generated-content verification failed: "
@@ -5814,7 +5970,54 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
     return actual_digest
 
 
-def verify_existing_management_workbook_integrity(path: Path) -> str | None:
+def validate_pre_contract_management_workbook(path: Path, expected_digest: str) -> str:
+    """Validate only the exact PR #9 workbook state pinned by an integrity manifest."""
+
+    required_digest = str(expected_digest).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
+        raise IntegrityError("The pre-contract workbook requires a valid manifest digest.")
+    reject_unapproved_workbook_drawings(path)
+    wb = load_workbook(path, data_only=False)
+    try:
+        if stamped_workbook_protection_contract(wb) is not None:
+            raise IntegrityError(
+                "The compatibility verifier only accepts a markerless pre-contract workbook."
+            )
+        validate_management_workbook_controls(
+            wb, protect_objects_and_scenarios=False
+        )
+        require_pre_contract_list_validations(wb)
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    actual_digest = workbook_generated_content_sha256(path)
+    if stamped != required_digest or actual_digest != required_digest:
+        raise IntegrityError(
+            "Pre-contract master workbook verification failed: the manifest digest, "
+            "stamped digest, and actual generated-content digest must match exactly."
+        )
+    return actual_digest
+
+
+def pre_contract_management_workbook(path: Path) -> bool:
+    wb = load_workbook(path, data_only=False)
+    try:
+        return (
+            "Management Setup" in wb.sheetnames
+            and OWNER_ROSTER_TABLE_NAME in wb["Management Setup"].tables
+            and stamped_workbook_digest(wb) is not None
+            and stamped_workbook_protection_contract(wb) is None
+        )
+    finally:
+        wb.close()
+
+
+def verify_existing_management_workbook_integrity(
+    path: Path,
+    *,
+    expected_digest: str | None = None,
+    allow_legacy_protection_upgrade: bool = False,
+) -> str | None:
     """Verify new-schema workbooks while allowing one-way migration from legacy files."""
     if not path.exists():
         return None
@@ -5826,8 +6029,16 @@ def verify_existing_management_workbook_integrity(path: Path) -> str | None:
             and OWNER_ROSTER_TABLE_NAME in wb["Management Setup"].tables
         )
         stamped = stamped_workbook_digest(wb)
+        protection_contract = stamped_workbook_protection_contract(wb)
     finally:
         wb.close()
+    if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
+        return validate_management_workbook(path, expected_digest or stamped)
+    if protection_contract is not None:
+        raise IntegrityError(
+            "The existing master workbook declares an unsupported protection contract. "
+            "Restore a verified generated-workbook version before rerunning."
+        )
     if not is_new_schema and stamped is None:
         return None
     if stamped is None:
@@ -5836,7 +6047,13 @@ def verify_existing_management_workbook_integrity(path: Path) -> str | None:
             "generated-content digest is missing. Restore an earlier Dropbox version or "
             "approved archive copy; no outputs were created and no source files were moved."
         )
-    return validate_management_workbook(path, stamped)
+    if not allow_legacy_protection_upgrade or expected_digest is None:
+        raise IntegrityError(
+            "The existing master workbook predates the current protection contract. "
+            "It may be adopted only when its exact digest is pinned by the verified "
+            "integrity manifest; the next ordinary weekly run will upgrade it."
+        )
+    return validate_pre_contract_management_workbook(path, expected_digest)
 
 
 def action_episode_id(entity_key: str, first_seen: date) -> str:
@@ -7446,6 +7663,7 @@ def write_management_run_notes(
         ("Requirements SHA-256", requirements_provenance.get("sha256", "Not available")),
         ("Previous Manifest SHA-256", integrity.get("previous_manifest_sha256", "Integrity baseline or standalone generation")),
         ("Digest Scheme", WORKBOOK_DIGEST_SCHEME),
+        (WORKBOOK_PROTECTION_CONTRACT_LABEL, WORKBOOK_PROTECTION_CONTRACT),
         (RUN_NOTES_DIGEST_LABEL, "Pending save/reload validation"),
         ("Source Folder", str(source_dir)),
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed."),
@@ -7523,7 +7741,16 @@ def write_master_workbook(
     public_start: date,
     public_end: date,
 ) -> Path:
-    state = read_management_state(output_path)
+    integrity_context = config.get("_integrity", {})
+    state = read_management_state(
+        output_path,
+        allow_legacy_protection_upgrade=bool(
+            integrity_context.get("allow_legacy_master_upgrade", False)
+        ),
+        expected_digest=integrity_context.get(
+            "expected_master_generated_content_sha256"
+        ),
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(f".{output_path.stem}.{os.getpid()}.tmp.xlsx")
     if temp_path.exists():
@@ -8245,6 +8472,8 @@ def verify_integrity_state(
     archive_dir: Path,
     output_dir: Path,
     latest_manifest: Path,
+    *,
+    allow_legacy_master_upgrade: bool = False,
 ) -> tuple[dict[str, Any], str]:
     root = integrity_manifest_dir(archive_dir)
     chain = verify_manifest_chain(latest_manifest, root)
@@ -8298,8 +8527,17 @@ def verify_integrity_state(
                 f"expected {expected_master}; actual {actual_master}. Restore the recorded "
                 "Dropbox or generated-workbook archive version before rerunning."
             )
-        # New-schema workbooks receive the stricter protection-contract validation as well.
-        verify_existing_management_workbook_integrity(master_path)
+        # Compatibility is permitted only when the manifest-recorded digest is
+        # independently trusted by explicit adoption or an existing local anchor.
+        verify_existing_management_workbook_integrity(
+            master_path,
+            expected_digest=expected_master,
+            allow_legacy_protection_upgrade=allow_legacy_master_upgrade,
+        )
+        payload["_legacy_master_upgrade_pending"] = (
+            allow_legacy_master_upgrade
+            and pre_contract_management_workbook(master_path)
+        )
     elif os.path.lexists(master_path):
         raise IntegrityError(
             "An unrecorded master workbook appeared after the integrity baseline. "
@@ -8362,7 +8600,10 @@ def ensure_integrity_preflight(
         created_baseline = True
     try:
         payload, manifest_hash = verify_integrity_state(
-            archive_dir, output_dir, latest
+            archive_dir,
+            output_dir,
+            latest,
+            allow_legacy_master_upgrade=allow_initialize or anchor_exists,
         )
         if anchor_exists:
             if not secrets.compare_digest(manifest_hash, anchored_sha256):
@@ -8815,6 +9056,15 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         config,
         anchor_dir=anchor_dir,
     )
+    legacy_master_upgrade_pending = bool(
+        previous_payload.get("_legacy_master_upgrade_pending", False)
+    )
+    if migration_only and legacy_master_upgrade_pending:
+        raise IntegrityError(
+            "History-only migration is blocked while the manifest-pinned master workbook "
+            "awaits its one-way protection-contract upgrade. Run the next ordinary weekly "
+            "snapshot first; no files were changed."
+        )
 
     migration_plan = (
         build_history_migration_plan(
@@ -8979,6 +9229,10 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         "previous_manifest_sha256": previous_manifest_hash,
         "effective_config_sha256": provenance["effective_config_sha256"],
         "provenance": provenance,
+        "allow_legacy_master_upgrade": legacy_master_upgrade_pending,
+        "expected_master_generated_content_sha256": previous_payload.get(
+            "master_generated_content_sha256"
+        ),
     }
 
     migration_copied: list[Path] = []
@@ -9047,7 +9301,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 previous_manifest_hash,
                 anchor_dir,
             )
-            verify_integrity_state(archive_dir, output_dir, previous_manifest)
+            verify_integrity_state(
+                archive_dir,
+                output_dir,
+                previous_manifest,
+                allow_legacy_master_upgrade=legacy_master_upgrade_pending,
+            )
             if migration_plan is not None:
                 verify_captured_migration_inputs(migration_plan.captured_sources)
                 migration_copied = list(apply_history_migration_plan(migration_plan))
