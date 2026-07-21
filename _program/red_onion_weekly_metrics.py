@@ -7296,16 +7296,19 @@ def latest_integrity_manifest_path(archive_dir: Path) -> Path | None:
 def managed_published_output_paths(output_dir: Path) -> list[Path]:
     if not output_dir.exists():
         return []
-    return sorted(
-        (
-            path
-            for path in output_dir.glob("*.xlsx")
-            if path.is_file()
-            and path.name != "Red_Onion_Server_Master.xlsx"
-            and not path.name.startswith((".", "~$"))
-        ),
-        key=lambda path: path.name.casefold(),
-    )
+    paths: list[Path] = []
+    for path in output_dir.glob("*.xlsx"):
+        if path.name == "Red_Onion_Server_Master.xlsx" or path.name.startswith((".", "~$")):
+            continue
+        paths.append(
+            managed_direct_child(
+                output_dir,
+                path,
+                purpose="published workbook",
+                require_file=True,
+            )
+        )
+    return sorted(paths, key=lambda path: path.name.casefold())
 
 
 def effective_config_sha256(config: dict[str, Any]) -> str:
@@ -7349,8 +7352,14 @@ def timestamped_manifest_path(root: Path, run_id: str, kind: str) -> Path:
 
 def current_master_digest(output_dir: Path) -> str | None:
     master_path = output_dir / "Red_Onion_Server_Master.xlsx"
-    if not master_path.exists():
+    if not os.path.lexists(master_path):
         return None
+    master_path = managed_direct_child(
+        output_dir,
+        master_path,
+        purpose="master workbook",
+        require_file=True,
+    )
     return workbook_generated_content_sha256(master_path)
 
 
@@ -7560,10 +7569,16 @@ def verify_integrity_state(
     if expected_master is not None:
         if not isinstance(expected_master, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_master):
             raise IntegrityError("Integrity manifest contains an invalid master workbook digest.")
-        if not master_path.is_file():
+        if not os.path.lexists(master_path):
             raise IntegrityError(
                 "Master workbook verification failed: the recorded master workbook is missing."
             )
+        master_path = managed_direct_child(
+            output_dir,
+            master_path,
+            purpose="master workbook",
+            require_file=True,
+        )
         actual_master = workbook_generated_content_sha256(master_path)
         if actual_master != expected_master:
             raise IntegrityError(
@@ -7573,7 +7588,7 @@ def verify_integrity_state(
             )
         # New-schema workbooks receive the stricter protection-contract validation as well.
         verify_existing_management_workbook_integrity(master_path)
-    elif master_path.exists():
+    elif os.path.lexists(master_path):
         raise IntegrityError(
             "An unrecorded master workbook appeared after the integrity baseline. "
             "Reconcile it before running the automation."
