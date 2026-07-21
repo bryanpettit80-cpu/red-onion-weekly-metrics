@@ -22,6 +22,36 @@ function Stop-ReleasePreflight {
     )
 }
 
+function Assert-NoSourceBytecode {
+    # Git intentionally ignores Python bytecode, so a clean status alone cannot
+    # prove that the source directory contains only the reviewed Python files.
+    $BytecodeArtifacts = @(
+        Get-ChildItem -LiteralPath $ProgramDir -Recurse -Force -File |
+            Where-Object { $_.Extension -in @(".pyc", ".pyo") }
+    )
+    if ($BytecodeArtifacts.Count -eq 0) {
+        return
+    }
+
+    $ArtifactPaths = @(
+        $BytecodeArtifacts | ForEach-Object {
+            $_.FullName.Substring($RepositoryRoot.Length).TrimStart("\", "/")
+        }
+    )
+    $Reason = (
+        "The automation source contains Python bytecode that cannot be verified by Git: " +
+        ($ArtifactPaths -join ", ") + "."
+    )
+    if ($IsDeployedCheckout) {
+        Stop-ReleasePreflight $Reason
+    }
+
+    throw (
+        "Launcher safety check failed: $Reason " +
+        "Remove the bytecode artifacts and rerun the launcher."
+    )
+}
+
 function Invoke-LocalGit {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -92,9 +122,20 @@ function Assert-DeployedRelease {
     Write-Host "Verified deployed release: main at $($Head.Substring(0, 12))."
 }
 
+Assert-NoSourceBytecode
+
 if ($IsDeployedCheckout) {
     Assert-DeployedRelease
 }
+
+# -B/PYTHONDONTWRITEBYTECODE prevents this run from creating source-tree
+# bytecode. A fresh, deliberately nonexistent cache prefix also prevents Python
+# from reading a local __pycache__ artifact if one appears after the preflight;
+# -B by itself does not disable bytecode reads.
+$env:PYTHONDONTWRITEBYTECODE = "1"
+$env:PYTHONPYCACHEPREFIX = Join-Path (
+    [System.IO.Path]::GetTempPath()
+) ("RedOnionMetrics-PythonCache-" + [guid]::NewGuid().ToString("N"))
 
 if (-not $OperationsRoot) {
     if ($IsDeployedCheckout) {
@@ -109,19 +150,20 @@ $DefaultOutputDir = Join-Path $OperationsRoot "02 Finished Reports"
 $DefaultArchiveDir = Join-Path $OperationsRoot "03 Archive"
 $VenvDir = Join-Path $env:LOCALAPPDATA "RedOnionMetrics\.venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+$IntegrityAnchorDir = Join-Path $env:LOCALAPPDATA "RedOnionMetrics\integrity-anchors"
 
 function Get-PythonLauncher {
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" *> $null
+        & py -3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" *> $null
         if ($LASTEXITCODE -eq 0) {
-            return @("py", "-3")
+            return @("py", "-3", "-B")
         }
     }
 
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        & python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" *> $null
+        & python -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" *> $null
         if ($LASTEXITCODE -eq 0) {
-            return @("python")
+            return @("python", "-B")
         }
     }
 
@@ -154,7 +196,7 @@ if (-not (Test-Path $VenvPython)) {
     }
 }
 
-& $VenvPython -m pip install --disable-pip-version-check --quiet -r (Join-Path $ProgramDir "requirements.txt")
+& $VenvPython -B -m pip install --disable-pip-version-check --quiet -r (Join-Path $ProgramDir "requirements.txt")
 if ($LASTEXITCODE -ne 0) {
     throw "Could not install the Red Onion program requirements (exit code $LASTEXITCODE)."
 }
@@ -164,13 +206,14 @@ $ProgramArguments = @(
     "--input-dir", $InputDir,
     "--output-dir", $OutputDir,
     "--archive-dir", $ArchiveDir,
-    "--config", (Join-Path $ProgramDir "red_onion_config.json")
+    "--config", (Join-Path $ProgramDir "red_onion_config.json"),
+    "--integrity-anchor-dir", $IntegrityAnchorDir
 )
 if ($InitializeIntegrityBaseline) {
     $ProgramArguments += "--initialize-integrity-baseline"
 }
 
-& $VenvPython @ProgramArguments
+& $VenvPython -B @ProgramArguments
 $ReportExitCode = $LASTEXITCODE
 if ($ReportExitCode -ne 0) {
     exit $ReportExitCode

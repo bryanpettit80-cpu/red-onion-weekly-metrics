@@ -208,6 +208,7 @@ def test_carried_forward_management_text_is_sanitized(tmp_path: Path) -> None:
         actions.cell(row=4, column=column, value=header)
     actions["A5"] = "A1B2C3D4E5F6"
     actions["B5"] = "server|rc richmond|server one|coaching"
+    actions["D5"] = "Open"
     actions["E5"] = malicious
     actions["H5"] = malicious
     actions["N5"] = ArrayFormula("N5", malicious)
