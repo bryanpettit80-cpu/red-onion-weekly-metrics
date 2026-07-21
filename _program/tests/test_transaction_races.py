@@ -394,6 +394,61 @@ def test_output_symlink_is_rejected_without_reading_or_replacing_external_master
     assert manifest_paths(Path(args.archive_dir)) == []
 
 
+def test_broken_output_symlink_is_rejected_before_baseline_creation(
+    tmp_path: Path,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    missing_target = (
+        tmp_path / "outside-output" / "Red_Onion_Server_Master.xlsx"
+    )
+    output_link = Path(args.output_dir) / missing_target.name
+    output_link.parent.mkdir(parents=True)
+    try:
+        output_link.symlink_to(missing_target)
+    except OSError:
+        pytest.skip("File symlinks are unavailable on this host")
+
+    with pytest.raises(integrity.IntegrityError, match="link|reparse"):
+        metrics.run(args)
+
+    assert output_link.is_symlink()
+    assert not missing_target.exists()
+    assert manifest_paths(Path(args.archive_dir)) == []
+
+
+def test_recorded_master_replaced_by_symlink_is_rejected_before_read(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    live_master = Path(args.output_dir) / valid_master_template.name
+    live_master.parent.mkdir(parents=True)
+    shutil.copy2(valid_master_template, live_master)
+    metrics.run(args)
+    baseline_manifests = manifest_paths(Path(args.archive_dir))
+    assert len(baseline_manifests) == 1
+
+    outside = tmp_path / "outside-output" / valid_master_template.name
+    outside.parent.mkdir(parents=True)
+    shutil.copy2(valid_master_template, outside)
+    before = outside.read_bytes()
+    live_master.unlink()
+    try:
+        live_master.symlink_to(outside)
+    except OSError:
+        if os.path.lexists(live_master):
+            live_master.unlink()
+        shutil.copy2(valid_master_template, live_master)
+        pytest.skip("File symlinks are unavailable on this host")
+
+    with pytest.raises(integrity.IntegrityError, match="link|reparse"):
+        metrics.run(args)
+
+    assert live_master.is_symlink()
+    assert outside.read_bytes() == before
+    assert manifest_paths(Path(args.archive_dir)) == baseline_manifests
+
+
 def test_manager_edit_after_staging_is_preserved_when_publication_aborts(
     tmp_path: Path,
     valid_master_template: Path,
@@ -464,8 +519,9 @@ def test_migration_source_replaced_after_plan_construction_aborts_without_commit
         source_dirs: list[Path],
         supplied_archive_dir: Path,
         config: dict,
+        **kwargs,
     ) -> metrics.HistoryMigrationPlan:
-        plan = original_build(source_dirs, supplied_archive_dir, config)
+        plan = original_build(source_dirs, supplied_archive_dir, config, **kwargs)
         source.write_bytes(b"migration-source-B")  # Same size, different SHA-256.
         return plan
 
@@ -578,6 +634,211 @@ def test_raw_archive_replacement_before_forced_rollback_is_preserved(
     assert archived.read_bytes() == replacement
     assert source.read_bytes() == b"source-version-A"
     assert manifest_paths(archive_dir) == [baseline]
+
+
+def test_archived_history_is_parsed_only_from_manifest_pinned_bytes(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    raw = (
+        metrics.canonical_daily_archive_dir(archive_dir)
+        / "week-ending-2026-07-19"
+        / "Daily Report historical.xlsx"
+    )
+    raw.parent.mkdir(parents=True)
+    original = b"manifest-recorded-history"
+    injected = b"temporarily-manipulated!!"
+    assert len(original) == len(injected)
+    raw.write_bytes(original)
+    metrics.run(workflow_args(tmp_path, initialize_baseline=True))
+    active_source(args)
+    observed_history_bytes: list[bytes] = []
+
+    def parse_with_restore_attack(
+        path: Path, config: dict
+    ) -> list[metrics.MetricRecord]:
+        if path.name == raw.name:
+            if path.absolute() == raw.absolute():
+                raw.write_bytes(injected)
+                observed_history_bytes.append(path.read_bytes())
+                raw.write_bytes(original)
+            else:
+                observed_history_bytes.append(path.read_bytes())
+            return minimal_records(date(2026, 7, 14), path.name)
+        return minimal_records(ACTIVE_DAY, path.name)
+
+    install_lightweight_workflow(
+        monkeypatch, valid_master_template, parser=parse_with_restore_attack
+    )
+
+    metrics.run(args)
+
+    assert observed_history_bytes == [original]
+    assert raw.read_bytes() == original
+
+
+def test_rollback_created_file_does_not_delete_replacement_after_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_root = tmp_path / "raw"
+    candidate = raw_root / "week-ending-2026-07-26" / "Daily Report current.xlsx"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"run-owned-version")
+    expected_hash = metrics.sha256_file(candidate)
+    replacement = b"Dropbox replacement after comparison"
+    original_sha256 = metrics.sha256_file
+    injected = False
+
+    def inject_after_comparison(path: Path) -> str:
+        nonlocal injected
+        digest = original_sha256(path)
+        supplied = Path(path)
+        if not injected and supplied.parent == candidate.parent:
+            candidate.write_bytes(replacement)
+            injected = True
+        return digest
+
+    monkeypatch.setattr(metrics, "sha256_file", inject_after_comparison)
+
+    conflicts = metrics.rollback_created_files(
+        [candidate], raw_root, expected_hashes={candidate: expected_hash}
+    )
+
+    assert injected is True
+    assert conflicts == []
+    assert candidate.read_bytes() == replacement
+
+
+def test_output_rollback_does_not_overwrite_replacement_after_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "02 Finished Reports"
+    snapshot_dir = tmp_path / "snapshot"
+    output_dir.mkdir()
+    snapshot_dir.mkdir()
+    final = output_dir / "Red_Onion_Server_Master.xlsx"
+    backup = snapshot_dir / final.name
+    final.write_bytes(b"run-staged-output")
+    backup.write_bytes(b"pre-run-manager-output")
+    staged_hash = metrics.sha256_file(final)
+    original_hash = metrics.sha256_file(backup)
+    replacement = b"manager edit after rollback comparison"
+    original_sha256 = metrics.sha256_file
+    injected = False
+
+    def inject_after_comparison(path: Path) -> str:
+        nonlocal injected
+        digest = original_sha256(path)
+        supplied = Path(path)
+        if not injected and supplied.parent == output_dir:
+            final.write_bytes(replacement)
+            injected = True
+        return digest
+
+    monkeypatch.setattr(metrics, "sha256_file", inject_after_comparison)
+
+    conflicts = metrics.rollback_published_outputs(
+        {
+            final: metrics.OutputRollback(
+                backup=backup,
+                original_sha256=original_hash,
+                backup_sha256=original_hash,
+            )
+        },
+        {final: staged_hash},
+    )
+
+    assert injected is True
+    assert conflicts == [final]
+    assert final.read_bytes() == replacement
+
+
+def test_legacy_archive_helper_rejects_symlink_without_deleting_target(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "input"
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    outside = tmp_path / "outside" / "Daily Report external.xlsx"
+    source_dir.mkdir()
+    outside.parent.mkdir()
+    outside.write_bytes(b"external raw report")
+    link = source_dir / "Daily Report submitted.xlsx"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("File symlinks are unavailable on this host")
+
+    with pytest.raises(integrity.IntegrityError, match="link|reparse"):
+        metrics.archive_processed_files([link], archive_dir, ACTIVE_WEEK_END)
+
+    assert link.is_symlink()
+    assert outside.read_bytes() == b"external raw report"
+    assert not archive_dir.exists() or not any(
+        path.is_file() for path in archive_dir.rglob("*")
+    )
+
+
+def test_legacy_archive_helper_rejects_linked_source_directory(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-source"
+    outside.mkdir()
+    target = outside / "Daily Report external.xlsx"
+    target.write_bytes(b"external raw report")
+    linked_dir = tmp_path / "linked-input"
+    try:
+        linked_dir.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            pytest.skip("Directory links are unavailable on this host")
+        junction = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(linked_dir), str(outside)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if junction.returncode != 0:
+            pytest.skip("Directory symlinks or junctions are unavailable on this host")
+
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    submitted = linked_dir / target.name
+    with pytest.raises(integrity.IntegrityError, match="link|reparse"):
+        metrics.archive_processed_files([submitted], archive_dir, ACTIVE_WEEK_END)
+
+    assert target.read_bytes() == b"external raw report"
+    assert not archive_dir.exists() or not any(
+        path.is_file() for path in archive_dir.rglob("*")
+    )
+
+
+def test_legacy_migration_helper_refuses_manifest_managed_archive(
+    tmp_path: Path,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    archive_dir = Path(args.archive_dir)
+    metrics.run(args)
+    source_dir = tmp_path / "legacy-history"
+    source_dir.mkdir()
+    source = source_dir / "Daily Report historical.xlsx"
+    source.write_bytes(b"legacy report bytes")
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="outside the locked integrity transaction",
+    ):
+        metrics.migrate_history_files(
+            [source_dir], archive_dir, metrics.DEFAULT_CONFIG
+        )
+
+    assert source.read_bytes() == b"legacy report bytes"
+    assert metrics.archived_daily_report_paths(archive_dir) == []
 
 
 def test_raw_archive_directory_link_rejects_external_writes_where_supported(

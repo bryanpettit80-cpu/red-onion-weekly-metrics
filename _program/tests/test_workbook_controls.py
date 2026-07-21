@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from base64 import b64decode
 from datetime import date
 from pathlib import Path
+from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, Reference
@@ -89,6 +92,107 @@ def unlocked_cells(worksheet) -> set[str]:
         for cell in row
         if not cell.protection.locked
     }
+
+
+def add_image_overlay(path: Path) -> None:
+    """Add a valid OOXML picture anchor without requiring Pillow in the test runtime."""
+    xdr_ns = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+    drawing_rel_ns = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    )
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    content_type_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    with ZipFile(path) as source:
+        source_parts = {item.filename: source.read(item) for item in source.infolist()}
+        drawing_part = next(
+            name
+            for name in source_parts
+            if name.startswith("xl/drawings/drawing") and name.endswith(".xml")
+        )
+        relationship_part = (
+            "xl/drawings/_rels/"
+            f"{drawing_part.rsplit('/', 1)[-1]}.rels"
+        )
+
+    drawing = ElementTree.fromstring(source_parts[drawing_part])
+    overlay = ElementTree.fromstring(
+        f"""
+        <xdr:oneCellAnchor
+            xmlns:xdr="{xdr_ns}"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:r="{drawing_rel_ns}">
+          <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+          <xdr:ext cx="7600000" cy="1500000" />
+          <xdr:pic>
+            <xdr:nvPicPr><xdr:cNvPr id="999" name="Dashboard Overlay" /><xdr:cNvPicPr /></xdr:nvPicPr>
+            <xdr:blipFill><a:blip r:embed="rId999" /><a:stretch><a:fillRect /></a:stretch></xdr:blipFill>
+            <xdr:spPr><a:prstGeom prst="rect"><a:avLst /></a:prstGeom></xdr:spPr>
+          </xdr:pic>
+          <xdr:clientData />
+        </xdr:oneCellAnchor>
+        """
+    )
+    drawing.append(overlay)
+    source_parts[drawing_part] = ElementTree.tostring(
+        drawing,
+        encoding="utf-8",
+        xml_declaration=False,
+    )
+
+    relationships = ElementTree.fromstring(source_parts[relationship_part])
+    ElementTree.SubElement(
+        relationships,
+        f"{{{package_rel_ns}}}Relationship",
+        {
+            "Id": "rId999",
+            "Type": f"{drawing_rel_ns}/image",
+            "Target": "../media/dashboard-overlay.png",
+        },
+    )
+    source_parts[relationship_part] = ElementTree.tostring(
+        relationships,
+        encoding="utf-8",
+        xml_declaration=False,
+    )
+
+    content_types = ElementTree.fromstring(source_parts["[Content_Types].xml"])
+    if not any(
+        node.attrib.get("Extension", "").casefold() == "png"
+        for node in content_types
+    ):
+        ElementTree.SubElement(
+            content_types,
+            f"{{{content_type_ns}}}Default",
+            {"Extension": "png", "ContentType": "image/png"},
+        )
+    source_parts["[Content_Types].xml"] = ElementTree.tostring(
+        content_types,
+        encoding="utf-8",
+        xml_declaration=False,
+    )
+    source_parts["xl/media/dashboard-overlay.png"] = b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFgAI/"
+        "sQ2eAAAAAElFTkSuQmCC"
+    )
+
+    replacement = path.with_name(f".{path.name}.overlay.tmp")
+    with ZipFile(replacement, "w", compression=ZIP_DEFLATED) as target:
+        for name, content in source_parts.items():
+            target.writestr(name, content)
+    replacement.replace(path)
+
+
+def add_legacy_vml_drawing_part(path: Path) -> None:
+    with ZipFile(path) as source:
+        source_parts = {item.filename: source.read(item) for item in source.infolist()}
+    source_parts["xl/drawings/vmlDrawing999.vml"] = (
+        b'<xml xmlns:v="urn:schemas-microsoft-com:vml"><v:shape id="overlay" /></xml>'
+    )
+    replacement = path.with_name(f".{path.name}.vml.tmp")
+    with ZipFile(replacement, "w", compression=ZIP_DEFLATED) as target:
+        for name, content in source_parts.items():
+            target.writestr(name, content)
+    replacement.replace(path)
 
 
 def test_owner_roster_supports_more_than_twenty_people_and_never_shrinks(
@@ -214,6 +318,11 @@ def test_active_owner_defined_name_and_action_validation_are_live() -> None:
     assert defined_name.attr_text == "'_Validation Lists'!$A$2:$A$51"
 
     action_validations = workbook["Action Board"].data_validations.dataValidation
+    status_validation = next(
+        item
+        for item in action_validations
+        if item.formula1 == f'"{",".join(metrics.ACTION_STATUS_CHOICES)}"'
+    )
     owner_validation = next(
         item
         for item in action_validations
@@ -223,6 +332,14 @@ def test_active_owner_defined_name_and_action_validation_are_live() -> None:
     active_validation = workbook["Management Setup"].data_validations.dataValidation[0]
     assert active_validation.formula1 == '"Yes,No"'
     assert str(active_validation.sqref) == "B21:B70"
+    for validation in (active_validation, status_validation, owner_validation):
+        assert validation.showErrorMessage is True
+        assert validation.errorStyle == "stop"
+        assert validation.errorTitle
+        assert validation.error
+    assert active_validation.allowBlank is True
+    assert status_validation.allowBlank is False
+    assert owner_validation.allowBlank is True
     workbook.close()
 
 
@@ -265,9 +382,89 @@ def test_all_sheets_and_workbook_structure_are_password_protected(
     assert workbook["_Technical"].sheet_state == "veryHidden"
     for worksheet in workbook.worksheets:
         assert worksheet.protection.sheet is True
+        assert worksheet.protection.objects is True
+        assert worksheet.protection.scenarios is True
         assert worksheet.protection.password
         assert len(worksheet.protection.password) <= 4
     workbook.close()
+
+
+def test_image_overlay_is_rejected_before_semantic_digest(tmp_path: Path) -> None:
+    path = tmp_path / "image-overlay.xlsx"
+    build_controlled_workbook(path)
+
+    assert metrics.workbook_generated_content_sha256(path)
+    add_image_overlay(path)
+
+    with pytest.raises(
+        metrics.IntegrityError,
+        match="Images and embedded objects are not allowed",
+    ):
+        metrics.workbook_generated_content_sha256(path)
+
+
+def test_legacy_vml_drawing_is_rejected_before_semantic_digest(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-vml-overlay.xlsx"
+    build_controlled_workbook(path)
+    add_legacy_vml_drawing_part(path)
+
+    with pytest.raises(metrics.IntegrityError, match="Legacy VML"):
+        metrics.workbook_generated_content_sha256(path)
+
+
+@pytest.mark.parametrize(
+    ("sheet_name", "coordinate", "invalid_value", "message"),
+    [
+        (
+            "Management Setup",
+            "B21",
+            "Maybe",
+            "Owner Roster Active values must be Yes or No",
+        ),
+        (
+            "Action Board",
+            "D5",
+            "Maybe",
+            "Action Board Status values must be one of",
+        ),
+    ],
+)
+def test_pasted_invalid_list_values_stop_before_workbook_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sheet_name: str,
+    coordinate: str,
+    invalid_value: str,
+    message: str,
+) -> None:
+    path = tmp_path / "invalid-pasted-value.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook[sheet_name][coordinate] = invalid_value
+    workbook.save(path)
+    workbook.close()
+
+    monkeypatch.setattr(
+        metrics,
+        "verify_existing_management_workbook_integrity",
+        lambda _path: None,
+    )
+
+    def unexpected_generation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Workbook generation started before pasted values were validated")
+
+    monkeypatch.setattr(metrics, "_write_master_workbook_base", unexpected_generation)
+    with pytest.raises(ValueError, match=message):
+        metrics.write_master_workbook(
+            [],
+            path,
+            metrics.DEFAULT_CONFIG,
+            tmp_path,
+            date(2026, 7, 14),
+            date(2026, 7, 19),
+        )
 
 
 def test_generated_content_digest_ignores_only_approved_management_edits(
@@ -295,7 +492,7 @@ def test_generated_content_digest_ignores_only_approved_management_edits(
 
 @pytest.mark.parametrize(
     "tamper_kind",
-    ["style", "comment", "internal_hyperlink"],
+    ["style", "internal_hyperlink"],
 )
 def test_editable_cells_exclude_scalar_value_but_cover_metadata(
     tmp_path: Path,
@@ -309,8 +506,6 @@ def test_editable_cells_exclude_scalar_value_but_cover_metadata(
     cell = workbook["Management Setup"]["A21"]
     if tamper_kind == "style":
         cell.font = Font(name="Arial", bold=True, color="FFFF0000")
-    elif tamper_kind == "comment":
-        cell.comment = Comment("Unapproved metadata", "Test")
     else:
         cell.hyperlink = "#'Action Board'!A5"
     workbook.save(path)
@@ -354,7 +549,6 @@ def test_external_hyperlink_is_rejected(tmp_path: Path) -> None:
         "chart",
         "conditional_formatting",
         "merged_cells",
-        "comment",
         "filter",
         "protection_password",
     ],
@@ -383,8 +577,6 @@ def test_generated_content_digest_covers_layout_and_object_state(
         conditional_format.rules[0].formula = ["2"]
     elif tamper_kind == "merged_cells":
         technical.unmerge_cells("D1:E1")
-    elif tamper_kind == "comment":
-        actions["G5"].comment = Comment("Changed generated metadata", "Test")
     elif tamper_kind == "filter":
         actions.auto_filter.ref = "A4:N5"
     else:
@@ -393,6 +585,20 @@ def test_generated_content_digest_covers_layout_and_object_state(
     workbook.close()
 
     assert metrics.workbook_generated_content_sha256(path) != original_digest
+
+
+def test_cell_comment_vml_drawing_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "comment-vml.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["Action Board"]["G5"].comment = Comment(
+        "Changed generated metadata", "Test"
+    )
+    workbook.save(path)
+    workbook.close()
+
+    with pytest.raises(metrics.IntegrityError, match="Legacy VML"):
+        metrics.workbook_generated_content_sha256(path)
 
 
 @pytest.mark.parametrize(

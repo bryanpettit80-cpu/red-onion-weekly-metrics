@@ -239,7 +239,7 @@ def test_successful_run_archives_active_files_and_keeps_master_history(
     real_master_writer = metrics.write_master_workbook
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        if path == archived_source:
+        if path.name == archived_source.name:
             return [make_record(date(2026, 6, 7), "RC Virginia Beach")]
         return [make_record(date(2026, 6, 14), "RC Richmond")]
 

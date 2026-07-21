@@ -119,12 +119,165 @@ def test_explicit_baseline_succeeds_without_active_input_and_is_idempotent(
     assert [entry.path for entry in integrity.verify_manifest_chain(baseline, baseline.parent)] == [
         baseline.resolve()
     ]
+    anchor = metrics.integrity_anchor_path(archive_dir)
+    assert anchor.is_file()
+    anchor_payload = integrity.read_json_manifest(anchor, root=anchor.parent)
+    assert anchor_payload["manifest_path"] == baseline.name
+    assert anchor_payload["manifest_sha256"] == integrity.canonical_json_sha256(payload)
     assert not Path(args.input_dir).exists()
 
     second = metrics.run(args)
 
     assert second == [baseline]
     assert manifest_paths(archive_dir) == [baseline]
+    assert integrity.read_json_manifest(anchor, root=anchor.parent) == anchor_payload
+
+
+def test_rewritten_manifest_head_and_raw_data_cannot_replace_trusted_history(
+    tmp_path: Path,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    raw_root = metrics.canonical_daily_archive_dir(archive_dir)
+    raw = raw_root / "week-ending-2026-07-19" / "Daily Report evidence.xlsx"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"original raw evidence")
+    [baseline] = metrics.run(args)
+    anchor = metrics.integrity_anchor_path(archive_dir)
+    pinned = integrity.read_json_manifest(anchor, root=anchor.parent)
+
+    raw.write_bytes(b"rewritten raw evidence")
+    rewritten = integrity.read_json_manifest(baseline)
+    rewritten["raw_inventory"] = [integrity.fingerprint_file(raw_root, raw).to_dict()]
+    integrity.write_json_manifest_atomic(
+        baseline,
+        rewritten,
+        root=metrics.integrity_manifest_dir(archive_dir),
+    )
+
+    for allow_initialize in (False, True):
+        with pytest.raises(
+            integrity.IntegrityError,
+            match="does not match the machine-local trusted anchor",
+        ):
+            metrics.ensure_integrity_preflight(
+                archive_dir,
+                output_dir,
+                Path(args.config),
+                metrics.load_config(Path(args.config)),
+                allow_initialize=allow_initialize,
+            )
+
+    assert raw.read_bytes() == b"rewritten raw evidence"
+    assert manifest_paths(archive_dir) == [baseline]
+    assert integrity.read_json_manifest(anchor, root=anchor.parent) == pinned
+
+
+def test_deleted_established_chain_cannot_be_explicitly_reinitialized(
+    tmp_path: Path,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    archive_dir = Path(args.archive_dir)
+    [baseline] = metrics.run(args)
+    anchor = metrics.integrity_anchor_path(archive_dir)
+    pinned = integrity.read_json_manifest(anchor, root=anchor.parent)
+    baseline.unlink()
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="pinned by the machine-local integrity anchor is missing",
+    ):
+        metrics.run(args)
+
+    assert manifest_paths(archive_dir) == []
+    assert integrity.read_json_manifest(anchor, root=anchor.parent) == pinned
+
+
+def test_existing_verified_chain_requires_explicit_one_time_anchor_adoption(
+    tmp_path: Path,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="integrity-baseline",
+        run_id="pre-anchor-deployment",
+        previous_manifest=None,
+    )
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="no machine-local trusted-head anchor",
+    ):
+        metrics.ensure_integrity_preflight(
+            archive_dir, output_dir, config_path, config
+        )
+
+    adopted, _, adopted_sha256 = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+
+    assert adopted == existing
+    assert metrics.verify_integrity_anchor(archive_dir) == (
+        existing.resolve(),
+        adopted_sha256,
+    )
+
+
+def test_anchor_advance_failure_preserves_prior_trusted_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    [baseline] = metrics.run(args)
+    _, baseline_sha256 = metrics.verify_integrity_anchor(archive_dir)
+    anchor = metrics.integrity_anchor_path(archive_dir)
+    pinned = integrity.read_json_manifest(anchor, root=anchor.parent)
+    successor = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="failed-anchor-advance",
+        previous_manifest=baseline,
+        expected_previous_sha256=baseline_sha256,
+    )
+    _, successor_sha256 = metrics.verify_integrity_state(
+        archive_dir, output_dir, successor
+    )
+
+    def fail_before_atomic_replace(*args, **kwargs):
+        raise OSError("simulated local anchor write failure")
+
+    monkeypatch.setattr(
+        metrics, "write_json_manifest_atomic", fail_before_atomic_replace
+    )
+    with pytest.raises(OSError, match="simulated local anchor write failure"):
+        metrics.advance_integrity_anchor(
+            archive_dir,
+            baseline,
+            baseline_sha256,
+            successor,
+            successor_sha256,
+        )
+
+    assert integrity.read_json_manifest(anchor, root=anchor.parent) == pinned
 
 
 def test_successful_staged_run_chains_manifest_snapshots_outputs_and_deletes_source_last(
@@ -220,6 +373,9 @@ def test_successful_staged_run_chains_manifest_snapshots_outputs_and_deletes_sou
     weekly = manifest_by_kind(archive_dir, "weekly-run")
     chain = integrity.verify_manifest_chain(weekly, weekly.parent)
     assert [entry.path for entry in chain] == [weekly.resolve(), baseline.resolve()]
+    trusted_manifest, trusted_sha256 = metrics.verify_integrity_anchor(archive_dir)
+    assert trusted_manifest == weekly.resolve()
+    assert trusted_sha256 == chain[0].sha256
     weekly_payload = dict(chain[0].payload)
     assert weekly_payload["raw_inventory"] == [expected_raw]
     assert weekly_payload["details"]["archived_destinations"] == [

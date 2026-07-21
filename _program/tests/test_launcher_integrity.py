@@ -24,8 +24,11 @@ def test_release_preflight_runs_before_any_runtime_mutation() -> None:
     assert '"status", "--porcelain=v1", "--untracked-files=all"' in compact_launcher
     assert '"symbolic-ref", "--quiet", "--short", "HEAD"' in compact_launcher
     assert 'refs/remotes/origin/main^{commit}' in launcher
+    assert "Assert-NoSourceBytecode" in launcher
+    assert 'PYTHONDONTWRITEBYTECODE = "1"' in launcher
+    assert "PYTHONPYCACHEPREFIX" in launcher
     preflight_call = launcher.index(
-        "if ($IsDeployedCheckout) {\n    Assert-DeployedRelease"
+        "Assert-NoSourceBytecode\n\nif ($IsDeployedCheckout)"
     )
     assert preflight_call < launcher.index(
         "New-Item -ItemType Directory"
@@ -54,7 +57,18 @@ def _write_minimal_runner(repository_root: Path) -> Path:
     shutil.copy2(LAUNCHER, program_dir / LAUNCHER.name)
     (program_dir / "requirements.txt").write_text("", encoding="utf-8")
     (program_dir / "red_onion_weekly_metrics.py").write_text(
-        "raise SystemExit(0)\n", encoding="utf-8"
+        """from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+capture_path = os.environ.get("RED_ONION_TEST_ARGUMENTS_PATH")
+if capture_path:
+    Path(capture_path).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+raise SystemExit(0)
+""",
+        encoding="utf-8",
     )
     return program_dir / LAUNCHER.name
 
@@ -80,7 +94,11 @@ def _initialize_release_checkout(repository_root: Path) -> None:
     _git(repository_root, "update-ref", "refs/remotes/origin/main", "HEAD")
 
 
-def _run_launcher(launcher: Path, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_launcher(
+    launcher: Path,
+    environment: dict[str, str],
+    *launcher_arguments: str,
+) -> subprocess.CompletedProcess[str]:
     assert POWERSHELL is not None
     return subprocess.run(
         [
@@ -90,6 +108,7 @@ def _run_launcher(launcher: Path, environment: dict[str, str]) -> subprocess.Com
             "Bypass",
             "-File",
             str(launcher),
+            *launcher_arguments,
         ],
         cwd=launcher.parent.parent,
         env=environment,
@@ -148,6 +167,67 @@ def test_clean_main_deployment_at_local_origin_main_runs(
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Verified deployed release: main at" in result.stdout
     assert (tmp_path / "01 Daily Reports - Drop Here").is_dir()
+
+
+@pytest.mark.skipif(
+    not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
+    reason="Windows PowerShell and Git required",
+)
+def test_deployed_checkout_rejects_ignored_python_bytecode_before_python(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
+    launcher = _write_minimal_runner(repository_root)
+    (repository_root / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n", encoding="utf-8"
+    )
+    _initialize_release_checkout(repository_root)
+
+    bytecode = launcher.parent / "__pycache__" / "red_onion_integrity.cpython-312.pyc"
+    bytecode.parent.mkdir()
+    bytecode.write_bytes(b"crafted ignored bytecode")
+    assert _git(repository_root, "status", "--porcelain=v1").stdout == ""
+
+    capture_path = tmp_path / "invoked-arguments.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    result = _run_launcher(launcher, environment)
+    normalized_output = " ".join((result.stdout + result.stderr).split())
+
+    assert result.returncode != 0
+    assert "Release preflight failed" in normalized_output
+    assert "Python bytecode that cannot be verified by Git" in normalized_output
+    assert "red_onion_integrity.cpython-312.pyc" in normalized_output
+    assert not capture_path.exists()
+    assert not (tmp_path / "01 Daily Reports - Drop Here").exists()
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+def test_initialize_integrity_baseline_argument_is_forwarded(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    repository_root = tmp_path / "standalone-baseline"
+    launcher = _write_minimal_runner(repository_root)
+    capture_path = tmp_path / "baseline-arguments.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+
+    result = _run_launcher(
+        launcher,
+        environment,
+        "-InitializeIntegrityBaseline",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    forwarded_arguments = capture_path.read_text(encoding="utf-8").splitlines()
+    assert "--initialize-integrity-baseline" in forwarded_arguments
+    anchor_flag_index = forwarded_arguments.index("--integrity-anchor-dir")
+    assert forwarded_arguments[anchor_flag_index + 1] == str(
+        Path(environment["LOCALAPPDATA"])
+        / "RedOnionMetrics"
+        / "integrity-anchors"
+    )
+    assert not list(launcher.parent.rglob("*.pyc"))
 
 
 @pytest.mark.skipif(

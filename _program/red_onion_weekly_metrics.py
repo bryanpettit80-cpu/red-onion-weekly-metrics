@@ -44,6 +44,7 @@ from red_onion_integrity import (
     verify_manifest_chain,
     verify_raw_inventory,
     write_chained_manifest_atomic,
+    write_json_manifest_atomic,
 )
 
 
@@ -170,6 +171,14 @@ ACTION_HEADERS = [
     "Signal State",
 ]
 
+ACTION_STATUS_CHOICES: tuple[str, ...] = (
+    "Open",
+    "In Progress",
+    "Blocked",
+    "Complete",
+    "Dismissed",
+)
+
 VISIBLE_MANAGEMENT_SHEETS = [
     "Dashboard",
     "Action Board",
@@ -192,6 +201,8 @@ DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
 DAILY_REPORT_FORMAT_LABEL = ".xls or .xlsx"
 CANONICAL_DAILY_ARCHIVE_FOLDER = "processed-daily-reports"
 INTEGRITY_MANIFEST_FOLDER = "run-manifests"
+INTEGRITY_ANCHOR_ENVIRONMENT_VARIABLE = "RED_ONION_INTEGRITY_ANCHOR_DIR"
+INTEGRITY_ANCHOR_SCHEMA_VERSION = 1
 GENERATED_WORKBOOK_ARCHIVE_FOLDER = "generated-workbooks"
 OWNER_ROSTER_TABLE_NAME = "OwnerRoster"
 OWNER_ROSTER_DEFINED_NAME = "ActiveOwnerChoices"
@@ -514,13 +525,17 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
     return records
 
 
-def is_daily_report_path(path: Path) -> bool:
+def is_daily_report_name(name: str) -> bool:
+    path = Path(name)
     return (
-        path.is_file()
-        and not path.name.startswith("~$")
+        not path.name.startswith("~$")
         and path.name.casefold().startswith(DAILY_REPORT_PREFIX)
         and path.suffix.lower() in DAILY_REPORT_EXTENSIONS
     )
+
+
+def is_daily_report_path(path: Path) -> bool:
+    return path.is_file() and is_daily_report_name(path.name)
 
 
 def find_daily_report_paths(root: Path, *, recursive: bool) -> list[Path]:
@@ -622,6 +637,17 @@ def managed_direct_child(
     return candidate
 
 
+def managed_master_workbook_path(output_dir: Path) -> Path:
+    """Return the master leaf only when it is a normal managed output entry."""
+
+    return managed_direct_child(
+        output_dir,
+        output_dir / "Red_Onion_Server_Master.xlsx",
+        purpose="master workbook",
+        require_file=False,
+    )
+
+
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int | None, int | None]:
     return (
         metadata.st_size,
@@ -682,6 +708,22 @@ def managed_recursive_file(roots: Iterable[Path], supplied: Path, *, purpose: st
         raise IntegrityError(f"Refusing {purpose} outside its declared source folder: {supplied}")
     cursor = matching_root
     for part in relative.parts:
+        cursor = cursor / part
+        if os.path.lexists(cursor) and path_is_link_or_reparse(cursor):
+            raise IntegrityError(
+                f"Refusing {purpose} link or Windows reparse point: {cursor}"
+            )
+    if not candidate.is_file():
+        raise IntegrityError(f"Managed {purpose} file is missing: {candidate}")
+    return candidate
+
+
+def regular_file_without_reparse_ancestors(supplied: Path, *, purpose: str) -> Path:
+    """Validate an arbitrary lexical path without following a linked ancestor."""
+
+    candidate = Path(supplied).absolute()
+    cursor = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
         cursor = cursor / part
         if os.path.lexists(cursor) and path_is_link_or_reparse(cursor):
             raise IntegrityError(
@@ -776,6 +818,77 @@ def canonical_daily_archive_dir(archive_dir: Path) -> Path:
 
 def archived_daily_report_paths(archive_dir: Path) -> list[Path]:
     return find_daily_report_paths(canonical_daily_archive_dir(archive_dir), recursive=True)
+
+
+def capture_archived_report_inputs(
+    archive_dir: Path,
+    *,
+    expected_inventory: Iterable[FileFingerprint] | None = None,
+) -> list[CapturedActiveInput]:
+    """Pin canonical history bytes before parsing and bind them to the manifest."""
+
+    raw_root = canonical_daily_archive_dir(archive_dir)
+    captures: list[CapturedActiveInput] = []
+    if expected_inventory is None:
+        for supplied in archived_daily_report_paths(archive_dir):
+            source = managed_recursive_file(
+                [raw_root], supplied, purpose="canonical archived daily report"
+            )
+            relative = source.absolute().relative_to(raw_root.resolve()).as_posix()
+            captures.append(capture_regular_file(source, fingerprint_path=relative))
+        return captures
+
+    expected_reports = sorted(
+        (
+            fingerprint
+            for fingerprint in expected_inventory
+            if is_daily_report_name(Path(fingerprint.path).name)
+        ),
+        key=lambda fingerprint: fingerprint.path.casefold(),
+    )
+    for expected in expected_reports:
+        supplied = raw_root.joinpath(*expected.path.split("/"))
+        source = managed_recursive_file(
+            [raw_root], supplied, purpose="manifest-recorded archived daily report"
+        )
+        capture = capture_regular_file(source, fingerprint_path=expected.path)
+        if capture.fingerprint != expected:
+            raise IntegrityError(
+                f"Archived daily report changed before it could be pinned: {source.name}. "
+                "No outputs or archive files were changed."
+            )
+        captures.append(capture)
+    return captures
+
+
+def read_captured_reports_by_path(
+    captures: Iterable[CapturedActiveInput], config: dict[str, Any]
+) -> dict[Path, list[MetricRecord]]:
+    """Parse only staged copies of already captured report bytes."""
+
+    captures = list(captures)
+    records_by_path: dict[Path, list[MetricRecord]] = {}
+    with tempfile.TemporaryDirectory(prefix=".archived-report-read-") as stage_name:
+        stage_root = Path(stage_name)
+        for index, capture in enumerate(captures):
+            staged_dir = stage_root / f"{index:06d}"
+            staged_dir.mkdir()
+            staged_path = staged_dir / capture.source.name
+            written_hash = verified_write_bytes(capture.content, staged_path)
+            if written_hash != capture.fingerprint.sha256:
+                raise IntegrityError(
+                    f"Archived report staging verification failed for {capture.source.name}."
+                )
+            try:
+                records = parse_daily_report(staged_path, config)
+            except Exception as exc:
+                raise ValueError(
+                    f"Could not process {capture.source.name}: {exc}"
+                ) from exc
+            if not records:
+                raise ValueError(f"No metric rows were found in {capture.source}")
+            records_by_path[capture.source] = records
+    return records_by_path
 
 
 def read_reports_by_path(paths: Iterable[Path], config: dict[str, Any]) -> dict[Path, list[MetricRecord]]:
@@ -1061,9 +1174,26 @@ def verified_copy_file(source: Path, destination: Path, *, replace: bool = False
 
 
 def copy_processed_files_verified(
-    source_paths: Iterable[Path], archive_root: Path, week_end: date
+    source_paths: Iterable[Path],
+    archive_root: Path,
+    week_end: date,
+    *,
+    anchor_dir: Path | None = None,
 ) -> list[VerifiedArchiveCopy]:
-    """Create and verify archive copies without deleting active source files."""
+    """Pin and archive normal source entries without deleting them."""
+
+    reject_legacy_raw_mutation_if_protected(
+        archive_root, "legacy processed-file archiving", anchor_dir=anchor_dir
+    )
+    captures = [
+        capture_regular_file(
+            regular_file_without_reparse_ancestors(
+                source_path, purpose="legacy archive source"
+            ),
+            fingerprint_path=Path(source_path).name,
+        )
+        for source_path in source_paths
+    ]
     raw_root = managed_subdirectory(
         archive_root,
         CANONICAL_DAILY_ARCHIVE_FOLDER,
@@ -1077,32 +1207,38 @@ def copy_processed_files_verified(
         create=True,
     )
     reserved: set[Path] = set()
-    plans: list[tuple[Path, Path, bool]] = []
-    for source_path in source_paths:
-        destination, already_archived = archive_destination_for(
-            source_path, archive_dir, reserved
+    plans: list[tuple[CapturedActiveInput, Path, bool]] = []
+    for capture in captures:
+        destination, already_archived = archive_destination_for_capture(
+            capture, archive_dir, reserved
         )
-        plans.append((source_path.resolve(), destination.resolve(), already_archived))
+        plans.append((capture, destination.absolute(), already_archived))
         reserved.add(destination)
 
     completed: list[VerifiedArchiveCopy] = []
     try:
-        for source, destination, already_archived in plans:
-            source_hash = sha256_file(source)
+        for capture, destination, already_archived in plans:
             if already_archived:
-                if sha256_file(destination) != source_hash:
+                if sha256_file(destination) != capture.fingerprint.sha256:
                     raise IntegrityError(
-                        f"Existing archive copy no longer matches {source.name}; "
+                        f"Existing archive copy no longer matches {capture.source.name}; "
                         "no active source files were deleted."
                     )
                 created = False
             else:
-                copied_hash = verified_copy_file(source, destination)
-                if copied_hash != source_hash:
-                    raise IntegrityError(f"Archive verification failed for {source.name}.")
+                copied_hash = verified_write_bytes(capture.content, destination)
+                if copied_hash != capture.fingerprint.sha256:
+                    raise IntegrityError(
+                        f"Archive verification failed for {capture.source.name}."
+                    )
                 created = True
             completed.append(
-                VerifiedArchiveCopy(source, destination, created, source_hash)
+                VerifiedArchiveCopy(
+                    capture.source,
+                    destination,
+                    created,
+                    capture.fingerprint.sha256,
+                )
             )
     except Exception:
         created = [copy for copy in completed if copy.created]
@@ -1308,34 +1444,69 @@ def quarantine_and_delete_captured_inputs(
 
 
 def delete_verified_active_sources(copies: Iterable[VerifiedArchiveCopy]) -> None:
-    """Delete active inputs only after their hashes and archive copies still match."""
+    """Quarantine exact source entries before deletion; never unlink a resolved target."""
+
     copies = list(copies)
     for copy in copies:
-        if sha256_file(copy.source) != copy.sha256:
+        source = regular_file_without_reparse_ancestors(
+            copy.source, purpose="legacy active source"
+        )
+        if sha256_file(source) != copy.sha256:
             raise IntegrityError(
-                f"Active source changed before cleanup: {copy.source.name}. "
+                f"Active source changed before cleanup: {source.name}. "
                 "The verified outputs and archive remain, but the source was not deleted."
             )
-        if sha256_file(copy.destination) != copy.sha256:
+        destination = regular_file_without_reparse_ancestors(
+            copy.destination, purpose="legacy archive destination"
+        )
+        if sha256_file(destination) != copy.sha256:
             raise IntegrityError(
-                f"Archive copy changed before cleanup: {copy.destination.name}. "
+                f"Archive copy changed before cleanup: {destination.name}. "
                 "The active source was not deleted."
             )
     for copy in copies:
+        source = regular_file_without_reparse_ancestors(
+            copy.source, purpose="legacy active source"
+        )
+        quarantine = source.parent / (
+            f".{source.name}.{uuid.uuid4().hex}.processed"
+        )
+        if os.path.lexists(quarantine):
+            raise IntegrityError(
+                f"Unexpected active-source quarantine collision: {quarantine.name}"
+            )
         try:
-            copy.source.unlink()
+            os.replace(source, quarantine)
+            if (
+                path_is_link_or_reparse(quarantine)
+                or not quarantine.is_file()
+                or sha256_file(quarantine) != copy.sha256
+            ):
+                if not os.path.lexists(source):
+                    os.replace(quarantine, source)
+                raise IntegrityError(
+                    f"Active source changed at cleanup time: {source.name}. "
+                    "The replacement was not deleted."
+                )
+            quarantine.unlink()
         except OSError as exc:
             raise IntegrityError(
                 f"The run was committed, but active source cleanup failed for "
-                f"{copy.source.name}: {exc}. The archive and generated outputs are intact; "
+                f"{source.name}: {exc}. The archive and generated outputs are intact; "
                 "remove the duplicate active file after confirming it is closed."
             ) from exc
 
 
 def archive_processed_files(
-    source_paths: Iterable[Path], archive_root: Path, week_end: date
+    source_paths: Iterable[Path],
+    archive_root: Path,
+    week_end: date,
+    *,
+    anchor_dir: Path | None = None,
 ) -> list[Path]:
-    copies = copy_processed_files_verified(source_paths, archive_root, week_end)
+    copies = copy_processed_files_verified(
+        source_paths, archive_root, week_end, anchor_dir=anchor_dir
+    )
     delete_verified_active_sources(copies)
     return [copy.destination for copy in copies]
 
@@ -1364,31 +1535,21 @@ def build_history_migration_plan(
     source_dirs: Iterable[Path],
     archive_root: Path,
     config: dict[str, Any],
+    *,
+    expected_raw_inventory: Iterable[FileFingerprint] | None = None,
 ) -> HistoryMigrationPlan:
     source_dirs = [Path(path).resolve() for path in source_dirs]
     source_paths = migration_daily_report_paths(source_dirs)
     captured_sources = capture_migration_inputs(source_paths, source_dirs)
-    source_records_by_path: dict[Path, list[MetricRecord]] = {}
-    with tempfile.TemporaryDirectory(prefix=".history-migration-read-") as stage_name:
-        stage_root = Path(stage_name)
-        for index, capture in enumerate(captured_sources):
-            staged_path = stage_root / str(index) / capture.source.name
-            verified_write_bytes(capture.content, staged_path)
-            try:
-                records = parse_daily_report(staged_path, config)
-            except Exception as exc:
-                raise ValueError(
-                    f"Could not process {capture.source.name}: {exc}"
-                ) from exc
-            if not records:
-                raise ValueError(f"No metric rows were found in {capture.source}")
-            source_records_by_path[capture.source] = records
+    source_records_by_path = read_captured_reports_by_path(captured_sources, config)
     captures_by_path = {
         capture.source.absolute(): capture for capture in captured_sources
     }
-    canonical_paths = archived_daily_report_paths(archive_root)
-    canonical_records_by_path = (
-        read_reports_by_path(canonical_paths, config) if canonical_paths else {}
+    canonical_captures = capture_archived_report_inputs(
+        archive_root, expected_inventory=expected_raw_inventory
+    )
+    canonical_records_by_path = read_captured_reports_by_path(
+        canonical_captures, config
     )
 
     combined_records_by_path = dict(canonical_records_by_path)
@@ -1524,7 +1685,12 @@ def migrate_history_files(
     source_dirs: Iterable[Path],
     archive_root: Path,
     config: dict[str, Any],
+    *,
+    anchor_dir: Path | None = None,
 ) -> HistoryMigrationResult:
+    reject_legacy_raw_mutation_if_protected(
+        archive_root, "legacy history migration", anchor_dir=anchor_dir
+    )
     archive_root = archive_root.resolve()
     archive_root.mkdir(parents=True, exist_ok=True)
     plan = build_history_migration_plan(source_dirs, archive_root, config)
@@ -4697,6 +4863,30 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
     return records
 
 
+def validate_action_board_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reject pasted status values that Excel list validation can be made to bypass."""
+    canonical_statuses = {
+        status.casefold(): status
+        for status in ACTION_STATUS_CHOICES
+    }
+    allowed_text = ", ".join(ACTION_STATUS_CHOICES)
+    for row_number, record in enumerate(records, start=5):
+        raw_status = record.get("Status")
+        status_text = "" if is_blank(raw_status) else str(raw_status).strip()
+        canonical_status = canonical_statuses.get(status_text.casefold())
+        if canonical_status is None:
+            action_id = str(record.get("Action ID") or f"row {row_number}")
+            raise ValueError(
+                f"Action Board Status values must be one of {allowed_text}; "
+                f"received {raw_status!r} for action {action_id!r}. "
+                "No workbooks were created and no source files were moved."
+            )
+        record["Status"] = canonical_status
+    return records
+
+
 def owner_active_value(value: Any) -> bool:
     """Normalize the user-facing owner status without silently accepting typos."""
     if is_blank(value):
@@ -4843,15 +5033,17 @@ def read_management_state(output_path: Path) -> dict[str, Any]:
     if not output_path.exists():
         return state
     try:
-        verify_existing_management_workbook_integrity(output_path)
         wb = load_workbook(output_path, data_only=False)
-    except IntegrityError:
-        raise
     except Exception as exc:
         raise RuntimeError(
             f"Could not read the existing master workbook at {output_path}. "
             "Close the workbook in Excel and rerun; no source files were moved."
         ) from exc
+    try:
+        verify_existing_management_workbook_integrity(output_path)
+    except Exception:
+        wb.close()
+        raise
     try:
         if "Management Setup" in wb.sheetnames:
             ws = wb["Management Setup"]
@@ -4880,7 +5072,9 @@ def read_management_state(output_path: Path) -> dict[str, Any]:
             state["owners"] = active_owner_names(state["owner_roster"])
             state["owner_roster_capacity"] = owner_roster_capacity_from_sheet(ws)
         if "Action Board" in wb.sheetnames:
-            state["active_actions"] = records_from_sheet(wb["Action Board"], "Action ID")
+            state["active_actions"] = validate_action_board_records(
+                records_from_sheet(wb["Action Board"], "Action ID")
+            )
         if "Action History" in wb.sheetnames:
             state["action_history"] = records_from_sheet(wb["Action History"], "Action ID")
     finally:
@@ -5084,6 +5278,167 @@ def workbook_digest_chart_payload(chart: Any) -> dict[str, Any]:
     }
 
 
+def reject_unapproved_workbook_drawings(path: Path) -> None:
+    """Allow generated charts while rejecting image, shape, and embedded-object overlays."""
+    from xml.etree import ElementTree
+    from zipfile import BadZipFile, ZipFile
+
+    spreadsheet_drawing_ns = (
+        "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+    )
+    chart_ns = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+    office_relationship_ns = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    )
+    package_relationship_ns = (
+        "http://schemas.openxmlformats.org/package/2006/relationships"
+    )
+    anchor_tags = {"oneCellAnchor", "twoCellAnchor", "absoluteAnchor"}
+    chart_anchor_children = {
+        "from", "to", "pos", "ext", "graphicFrame", "clientData",
+    }
+
+    def local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    try:
+        with ZipFile(path) as archive:
+            part_names = set(archive.namelist())
+            prohibited_binary_parts = sorted(
+                name
+                for name in part_names
+                if name.lower().startswith(
+                    ("xl/media/", "xl/embeddings/", "xl/activex/", "xl/ctrlprops/")
+                )
+            )
+            if prohibited_binary_parts:
+                raise IntegrityError(
+                    "Images and embedded objects are not allowed in the protected master "
+                    f"workbook ({prohibited_binary_parts[0]})."
+                )
+
+            unsupported_drawing_parts = sorted(
+                name
+                for name in part_names
+                if name.lower().startswith("xl/drawings/")
+                and "/_rels/" not in name.lower()
+                and not name.lower().endswith(".xml")
+            )
+            if unsupported_drawing_parts:
+                raise IntegrityError(
+                    "Legacy VML and other non-chart drawings are not allowed in the "
+                    f"protected master workbook ({unsupported_drawing_parts[0]})."
+                )
+
+            drawing_parts = sorted(
+                name
+                for name in part_names
+                if name.lower().startswith("xl/drawings/")
+                and "/_rels/" not in name.lower()
+                and name.lower().endswith(".xml")
+            )
+            for drawing_part in drawing_parts:
+                root = ElementTree.fromstring(archive.read(drawing_part))
+                if root.tag != f"{{{spreadsheet_drawing_ns}}}wsDr":
+                    raise IntegrityError(
+                        "An unsupported drawing part was found in the protected master "
+                        f"workbook ({drawing_part})."
+                    )
+
+                relationship_part = (
+                    "xl/drawings/_rels/"
+                    f"{drawing_part.rsplit('/', 1)[-1]}.rels"
+                )
+                if relationship_part not in part_names:
+                    raise IntegrityError(
+                        "A drawing relationship file is missing from the protected master "
+                        f"workbook ({drawing_part})."
+                    )
+                relationships_root = ElementTree.fromstring(
+                    archive.read(relationship_part)
+                )
+                relationships: dict[str, Any] = {}
+                for relationship in list(relationships_root):
+                    if relationship.tag != (
+                        f"{{{package_relationship_ns}}}Relationship"
+                    ):
+                        raise IntegrityError(
+                            "An unsupported drawing relationship was found in the protected "
+                            f"master workbook ({relationship_part})."
+                        )
+                    relationship_id = relationship.attrib.get("Id")
+                    if not relationship_id:
+                        raise IntegrityError(
+                            "A drawing relationship has no identifier in the protected master "
+                            f"workbook ({relationship_part})."
+                        )
+                    relationships[relationship_id] = relationship.attrib
+
+                used_relationships: set[str] = set()
+                for anchor in list(root):
+                    if local_name(anchor.tag) not in anchor_tags:
+                        raise IntegrityError(
+                            "Only generated chart drawings are allowed in the protected "
+                            f"master workbook ({drawing_part})."
+                        )
+                    anchor_children = list(anchor)
+                    if any(
+                        local_name(child.tag) not in chart_anchor_children
+                        for child in anchor_children
+                    ):
+                        raise IntegrityError(
+                            "Images and non-chart drawings are not allowed in the protected "
+                            f"master workbook ({drawing_part})."
+                        )
+                    frames = [
+                        child
+                        for child in anchor_children
+                        if local_name(child.tag) == "graphicFrame"
+                    ]
+                    if len(frames) != 1:
+                        raise IntegrityError(
+                            "Images and non-chart drawings are not allowed in the protected "
+                            f"master workbook ({drawing_part})."
+                        )
+                    chart_references = [
+                        node
+                        for node in frames[0].iter()
+                        if node.tag == f"{{{chart_ns}}}chart"
+                    ]
+                    if len(chart_references) != 1:
+                        raise IntegrityError(
+                            "Only generated chart drawings are allowed in the protected "
+                            f"master workbook ({drawing_part})."
+                        )
+                    relationship_id = chart_references[0].attrib.get(
+                        f"{{{office_relationship_ns}}}id"
+                    )
+                    relationship = relationships.get(str(relationship_id))
+                    if (
+                        not relationship_id
+                        or relationship is None
+                        or not relationship.get("Type", "").endswith("/chart")
+                        or relationship.get("TargetMode") == "External"
+                    ):
+                        raise IntegrityError(
+                            "A chart drawing has an unsafe relationship in the protected "
+                            f"master workbook ({drawing_part})."
+                        )
+                    used_relationships.add(str(relationship_id))
+
+                if used_relationships != set(relationships):
+                    raise IntegrityError(
+                        "A non-chart drawing relationship was found in the protected master "
+                        f"workbook ({relationship_part})."
+                    )
+    except IntegrityError:
+        raise
+    except (BadZipFile, ElementTree.ParseError, KeyError, OSError) as exc:
+        raise IntegrityError(
+            f"Could not inspect workbook drawing integrity at {path}: {exc}"
+        ) from exc
+
+
 def workbook_digest_excluded_cells(wb: Workbook) -> set[tuple[str, str]]:
     """Exclude only the self-referential digest value, never a user input."""
     excluded: set[tuple[str, str]] = set()
@@ -5143,6 +5498,7 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
 
 def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
     """Build a stable semantic view that excludes only approved scalar values."""
+    reject_unapproved_workbook_drawings(path)
     try:
         wb = load_workbook(path, data_only=False, read_only=False)
     except Exception as exc:
@@ -5152,6 +5508,11 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
         digest_cells = workbook_digest_excluded_cells(wb)
         sheets: list[dict[str, Any]] = []
         for ws in wb.worksheets:
+            if ws._images:
+                raise IntegrityError(
+                    "Images and non-chart drawings are not allowed in the protected master "
+                    f"workbook ({ws.title!r})."
+                )
             cells: list[dict[str, Any]] = []
             for cell in sorted(ws._cells.values(), key=lambda item: (item.row, item.column)):
                 key = (ws.title, cell.coordinate)
@@ -5335,8 +5696,36 @@ def stamp_generated_content_digest(path: Path) -> str:
     return digest
 
 
+def require_stop_style_list_validation(
+    ws: Any,
+    *,
+    formula1: str,
+    label: str,
+    allow_blank: bool,
+) -> None:
+    matches = [
+        validation
+        for validation in ws.data_validations.dataValidation
+        if validation.type == "list" and validation.formula1 == formula1
+    ]
+    if len(matches) != 1:
+        raise IntegrityError(f"The {label} list validation is missing or duplicated.")
+    validation = matches[0]
+    if (
+        validation.showErrorMessage is not True
+        or validation.errorStyle != "stop"
+        or bool(validation.allowBlank) is not allow_blank
+        or not validation.errorTitle
+        or not validation.error
+    ):
+        raise IntegrityError(
+            f"The {label} list validation must block invalid pasted or typed values."
+        )
+
+
 def validate_management_workbook(path: Path, expected_digest: str | None = None) -> str:
     """Validate protection, visibility, editable cells, tables, and digest."""
+    reject_unapproved_workbook_drawings(path)
     wb = load_workbook(path, data_only=False)
     try:
         missing = [name for name in VISIBLE_MANAGEMENT_SHEETS if name not in wb.sheetnames]
@@ -5380,18 +5769,37 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
                 )
             if not ws.protection.sheet or not ws.protection.password:
                 raise IntegrityError(f"Worksheet {ws.title!r} is not password-protected.")
+            if ws.protection.objects is not True or ws.protection.scenarios is not True:
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} does not protect drawing objects and scenarios."
+                )
         setup = wb["Management Setup"]
         if "ManagementTargets" not in setup.tables or OWNER_ROSTER_TABLE_NAME not in setup.tables:
             raise IntegrityError("Management Setup is missing a required protected input table.")
         if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
             raise IntegrityError("The active-owner workbook name is missing.")
-        owner_validations = {
-            validation.formula1
-            for validation in wb["Action Board"].data_validations.dataValidation
-            if validation.type == "list"
-        }
-        if wb["Action Board"].max_row > 4 and f"={OWNER_ROSTER_DEFINED_NAME}" not in owner_validations:
-            raise IntegrityError("The Action Board owner validation is missing.")
+        owner_roster_from_sheet(setup)
+        require_stop_style_list_validation(
+            setup,
+            formula1='"Yes,No"',
+            label="Owner Roster Active",
+            allow_blank=True,
+        )
+        action_board = wb["Action Board"]
+        validate_action_board_records(records_from_sheet(action_board, "Action ID"))
+        if action_board.max_row > 4:
+            require_stop_style_list_validation(
+                action_board,
+                formula1=f'"{",".join(ACTION_STATUS_CHOICES)}"',
+                label="Action Board status",
+                allow_blank=False,
+            )
+            require_stop_style_list_validation(
+                action_board,
+                formula1=f"={OWNER_ROSTER_DEFINED_NAME}",
+                label="Action Board owner",
+                allow_blank=True,
+            )
         stamped = stamped_workbook_digest(wb)
     finally:
         wb.close()
@@ -5410,6 +5818,7 @@ def verify_existing_management_workbook_integrity(path: Path) -> str | None:
     """Verify new-schema workbooks while allowing one-way migration from legacy files."""
     if not path.exists():
         return None
+    reject_unapproved_workbook_drawings(path)
     wb = load_workbook(path, data_only=False)
     try:
         is_new_schema = (
@@ -5948,7 +6357,15 @@ def write_management_setup_sheet(
         showColumnStripes=False,
     )
     ws.add_table(roster_table)
-    active_validation = DataValidation(type="list", formula1='"Yes,No"', allow_blank=True)
+    active_validation = DataValidation(
+        type="list",
+        formula1='"Yes,No"',
+        allow_blank=True,
+        showErrorMessage=True,
+        errorStyle="stop",
+        errorTitle="Choose Yes or No",
+        error="Select Yes or No from the Owner Roster Active list.",
+    )
     ws.add_data_validation(active_validation)
     active_validation.add(f"B{roster_header_row + 1}:B{roster_last_row}")
 
@@ -6077,10 +6494,22 @@ def write_action_tracking_sheet(
                     cell.fill = blue_fill
                     cell.protection = Protection(locked=False)
             status_validation = DataValidation(
-                type="list", formula1='"Open,In Progress,Blocked,Complete,Dismissed"', allow_blank=False
+                type="list",
+                formula1=f'"{",".join(ACTION_STATUS_CHOICES)}"',
+                allow_blank=False,
+                showErrorMessage=True,
+                errorStyle="stop",
+                errorTitle="Choose a valid status",
+                error="Select a status from the Action Board list.",
             )
             owner_validation = DataValidation(
-                type="list", formula1=f"={OWNER_ROSTER_DEFINED_NAME}", allow_blank=True
+                type="list",
+                formula1=f"={OWNER_ROSTER_DEFINED_NAME}",
+                allow_blank=True,
+                showErrorMessage=True,
+                errorStyle="stop",
+                errorTitle="Choose an active owner",
+                error="Select an active owner from the Owner Roster or leave the cell blank.",
             )
             ws.add_data_validation(status_validation)
             ws.add_data_validation(owner_validation)
@@ -7048,6 +7477,8 @@ def protect_worksheet(ws, password: str) -> None:
     """Enable an accidental-edit boundary while keeping review controls usable."""
     ws.protection.set_password(password)
     ws.protection.sheet = True
+    ws.protection.objects = True
+    ws.protection.scenarios = True
     ws.protection.autoFilter = False
     ws.protection.sort = False
     ws.protection.selectLockedCells = False
@@ -7188,6 +7619,292 @@ def write_master_workbook(
         if temp_path.exists():
             temp_path.unlink()
     return output_path
+
+
+def default_integrity_anchor_dir() -> Path:
+    """Return machine-local trusted state kept outside the Dropbox operator tree."""
+
+    configured = os.environ.get(INTEGRITY_ANCHOR_ENVIRONMENT_VARIABLE, "").strip()
+    if configured:
+        return Path(configured).expanduser().absolute()
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        base = (
+            Path(local_app_data)
+            if local_app_data
+            else Path.home() / "AppData" / "Local"
+        )
+        return (base / "RedOnionMetrics" / "integrity-anchors").absolute()
+    xdg_state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(xdg_state_home) if xdg_state_home else Path.home() / ".local" / "state"
+    return (base / "red-onion-weekly-metrics" / "integrity-anchors").absolute()
+
+
+def integrity_archive_identity(archive_dir: Path) -> str:
+    """Return a stable local identity without disclosing the archive path in state."""
+
+    resolved = os.path.normpath(str(archive_dir.resolve()))
+    if os.name == "nt":
+        resolved = os.path.normcase(resolved)
+    return canonical_json_sha256({"archive_directory": resolved})
+
+
+def integrity_anchor_path(
+    archive_dir: Path,
+    anchor_dir: Path | None = None,
+) -> Path:
+    """Resolve the per-archive trusted-head file outside the operator workspace."""
+
+    archive_dir = archive_dir.resolve()
+    operations_root = archive_dir.parent
+    supplied_root = Path(anchor_dir or default_integrity_anchor_dir()).expanduser().absolute()
+    if os.path.lexists(supplied_root) and path_is_link_or_reparse(supplied_root):
+        raise IntegrityError(
+            "The trusted integrity-anchor folder is a link or reparse point. Restore "
+            "the protected machine-local folder before rerunning."
+        )
+    root = supplied_root.resolve()
+    try:
+        root.relative_to(operations_root)
+    except ValueError:
+        pass
+    else:
+        raise IntegrityError(
+            "The trusted integrity-anchor folder must be outside the Dropbox/operator "
+            f"workspace: {operations_root}."
+        )
+    if os.path.lexists(root) and not root.is_dir():
+        raise IntegrityError(
+            f"The trusted integrity-anchor location is not a folder: {root}."
+        )
+    anchor = root / f"{integrity_archive_identity(archive_dir)}.json"
+    if os.path.lexists(anchor) and path_is_link_or_reparse(anchor):
+        raise IntegrityError(
+            "The trusted integrity-anchor file is a link or reparse point. Restore the "
+            "protected machine-local anchor before rerunning."
+        )
+    return anchor
+
+
+def integrity_anchor_exists(
+    archive_dir: Path,
+    anchor_dir: Path | None = None,
+) -> bool:
+    """Return whether this archive has ever been pinned on the selected machine."""
+
+    return os.path.lexists(integrity_anchor_path(archive_dir, anchor_dir))
+
+
+def reject_legacy_raw_mutation_if_protected(
+    archive_dir: Path,
+    operation: str,
+    *,
+    anchor_dir: Path | None = None,
+) -> None:
+    """Keep legacy helpers from mutating an archive governed by manifests."""
+
+    if (
+        latest_integrity_manifest_path(archive_dir) is not None
+        or integrity_anchor_exists(archive_dir, anchor_dir)
+    ):
+        raise IntegrityError(
+            f"Refusing {operation} outside the locked integrity transaction. "
+            "Use the supported --migrate-history-only or weekly-run CLI workflow so "
+            "the raw archive and trusted manifest head advance together."
+        )
+
+
+def _read_integrity_anchor(
+    archive_dir: Path,
+    anchor_dir: Path | None = None,
+) -> tuple[Path, str]:
+    anchor = integrity_anchor_path(archive_dir, anchor_dir)
+    if not os.path.lexists(anchor):
+        raise IntegrityError(
+            "The machine-local trusted integrity anchor is missing. Do not create a new "
+            "baseline until a technical maintainer has established whether the prior "
+            "anchor or manifest history must be restored."
+        )
+    if not anchor.is_file():
+        raise IntegrityError(f"The trusted integrity anchor is not a file: {anchor}.")
+    try:
+        payload = read_json_manifest(anchor, root=anchor.parent)
+    except IntegrityError as exc:
+        raise IntegrityError(f"The trusted integrity anchor is invalid: {exc}") from exc
+    if payload.get("schema_version") != INTEGRITY_ANCHOR_SCHEMA_VERSION:
+        raise IntegrityError(
+            "The trusted integrity anchor has an unsupported schema version."
+        )
+    expected_identity = integrity_archive_identity(archive_dir)
+    if not secrets.compare_digest(
+        str(payload.get("archive_identity_sha256", "")), expected_identity
+    ):
+        raise IntegrityError(
+            "The trusted integrity anchor belongs to a different archive directory."
+        )
+    manifest_name = payload.get("manifest_path")
+    if (
+        not isinstance(manifest_name, str)
+        or not manifest_name
+        or Path(manifest_name).name != manifest_name
+        or "/" in manifest_name
+        or "\\" in manifest_name
+    ):
+        raise IntegrityError(
+            "The trusted integrity anchor contains an invalid manifest path."
+        )
+    manifest_sha256 = payload.get("manifest_sha256")
+    if not isinstance(manifest_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", manifest_sha256
+    ):
+        raise IntegrityError(
+            "The trusted integrity anchor contains an invalid manifest SHA-256."
+        )
+    manifest = integrity_manifest_dir(archive_dir) / manifest_name
+    if not os.path.lexists(manifest):
+        raise IntegrityError(
+            "The manifest pinned by the machine-local integrity anchor is missing. "
+            "Restore the recorded manifest history before rerunning."
+        )
+    if path_is_link_or_reparse(manifest) or not manifest.is_file():
+        raise IntegrityError(
+            "The manifest pinned by the machine-local integrity anchor is not a regular file."
+        )
+    actual_payload = read_json_manifest(manifest, root=integrity_manifest_dir(archive_dir))
+    actual_sha256 = canonical_json_sha256(actual_payload)
+    if not secrets.compare_digest(actual_sha256, manifest_sha256):
+        raise IntegrityError(
+            "The Dropbox integrity manifest head does not match the machine-local trusted "
+            "anchor. Restore the recorded raw data and manifest history before rerunning."
+        )
+    return manifest.resolve(), manifest_sha256
+
+
+def verify_integrity_anchor(
+    archive_dir: Path,
+    anchor_dir: Path | None = None,
+    *,
+    expected_manifest: Path | None = None,
+    expected_sha256: str | None = None,
+) -> tuple[Path, str]:
+    """Require the current Dropbox head to match independently stored trusted state."""
+
+    manifest, manifest_sha256 = _read_integrity_anchor(archive_dir, anchor_dir)
+    latest = latest_integrity_manifest_path(archive_dir)
+    if latest is None or latest.resolve() != manifest:
+        raise IntegrityError(
+            "The Dropbox integrity manifest head differs from the machine-local trusted "
+            "anchor. Remove no files; ask the technical maintainer to reconcile the history."
+        )
+    if expected_manifest is not None and manifest != expected_manifest.resolve():
+        raise IntegrityError(
+            "The trusted integrity manifest head changed during this run."
+        )
+    if expected_sha256 is not None and not secrets.compare_digest(
+        manifest_sha256, expected_sha256
+    ):
+        raise IntegrityError(
+            "The trusted integrity manifest hash changed during this run."
+        )
+    return manifest, manifest_sha256
+
+
+def _write_integrity_anchor(
+    archive_dir: Path,
+    manifest: Path,
+    manifest_sha256: str,
+    anchor_dir: Path | None = None,
+) -> Path:
+    anchor = integrity_anchor_path(archive_dir, anchor_dir)
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    # Recheck after directory creation so a substituted leaf never becomes trusted.
+    if path_is_link_or_reparse(anchor.parent):
+        raise IntegrityError(
+            "The trusted integrity-anchor folder became a link or reparse point."
+        )
+    manifest_root = integrity_manifest_dir(archive_dir).resolve()
+    try:
+        manifest_name = manifest.resolve().relative_to(manifest_root).as_posix()
+    except ValueError as exc:
+        raise IntegrityError(
+            "Cannot pin an integrity manifest outside the managed manifest folder."
+        ) from exc
+    if "/" in manifest_name:
+        raise IntegrityError("Trusted integrity manifests must be direct files in the manifest folder.")
+    payload = {
+        "schema_version": INTEGRITY_ANCHOR_SCHEMA_VERSION,
+        "archive_identity_sha256": integrity_archive_identity(archive_dir),
+        "manifest_path": manifest_name,
+        "manifest_sha256": manifest_sha256,
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if os.name != "nt":
+        os.chmod(anchor.parent, 0o700)
+    # This atomic replace is deliberately the final operation. If it raises, the
+    # prior anchor remains; once it succeeds, callers must treat the new manifest
+    # as committed and must never roll it back beneath the advanced anchor.
+    return write_json_manifest_atomic(anchor, payload, root=anchor.parent)
+
+
+def initialize_integrity_anchor(
+    archive_dir: Path,
+    manifest: Path,
+    manifest_sha256: str,
+    anchor_dir: Path | None = None,
+) -> Path:
+    """Pin a virgin or explicitly adopted verified chain without any reset path."""
+
+    if integrity_anchor_exists(archive_dir, anchor_dir):
+        raise IntegrityError(
+            "A trusted integrity anchor already exists; refusing to replace it."
+        )
+    latest = latest_integrity_manifest_path(archive_dir)
+    if latest is None or latest.resolve() != manifest.resolve():
+        raise IntegrityError("Only the current integrity manifest head can be trusted.")
+    chain = verify_manifest_chain(manifest, integrity_manifest_dir(archive_dir))
+    if not chain or not secrets.compare_digest(chain[0].sha256, manifest_sha256):
+        raise IntegrityError("The integrity manifest changed before it could be trusted.")
+    written = _write_integrity_anchor(
+        archive_dir, manifest, manifest_sha256, anchor_dir
+    )
+    return written
+
+
+def advance_integrity_anchor(
+    archive_dir: Path,
+    previous_manifest: Path,
+    previous_sha256: str,
+    new_manifest: Path,
+    new_sha256: str,
+    anchor_dir: Path | None = None,
+) -> Path:
+    """Compare-and-swap the trusted head after a verified linear advancement."""
+
+    anchored_manifest, anchored_sha256 = _read_integrity_anchor(archive_dir, anchor_dir)
+    if anchored_manifest != previous_manifest.resolve() or not secrets.compare_digest(
+        anchored_sha256, previous_sha256
+    ):
+        raise IntegrityError(
+            "The trusted integrity head changed before the new manifest could be committed."
+        )
+    latest = latest_integrity_manifest_path(archive_dir)
+    if latest is None or latest.resolve() != new_manifest.resolve():
+        raise IntegrityError("The new manifest is not the sole current integrity head.")
+    chain = verify_manifest_chain(new_manifest, integrity_manifest_dir(archive_dir))
+    if (
+        len(chain) < 2
+        or chain[0].path != new_manifest.resolve()
+        or not secrets.compare_digest(chain[0].sha256, new_sha256)
+        or chain[1].path != previous_manifest.resolve()
+        or not secrets.compare_digest(chain[1].sha256, previous_sha256)
+    ):
+        raise IntegrityError(
+            "The new manifest is not a verified direct successor of the trusted head."
+        )
+    written = _write_integrity_anchor(
+        archive_dir, new_manifest, new_sha256, anchor_dir
+    )
+    return written
 
 
 def integrity_manifest_dir(archive_dir: Path) -> Path:
@@ -7351,15 +8068,9 @@ def timestamped_manifest_path(root: Path, run_id: str, kind: str) -> Path:
 
 
 def current_master_digest(output_dir: Path) -> str | None:
-    master_path = output_dir / "Red_Onion_Server_Master.xlsx"
+    master_path = managed_master_workbook_path(output_dir)
     if not os.path.lexists(master_path):
         return None
-    master_path = managed_direct_child(
-        output_dir,
-        master_path,
-        purpose="master workbook",
-        require_file=True,
-    )
     return workbook_generated_content_sha256(master_path)
 
 
@@ -7469,9 +8180,16 @@ def assert_manifest_head(
     archive_dir: Path,
     expected_manifest: Path,
     expected_sha256: str,
+    anchor_dir: Path | None = None,
 ) -> None:
     """Compare-and-swap guard for a single linear manifest history."""
 
+    verify_integrity_anchor(
+        archive_dir,
+        anchor_dir,
+        expected_manifest=expected_manifest,
+        expected_sha256=expected_sha256,
+    )
     latest = latest_integrity_manifest_path(archive_dir)
     if latest is None or latest.resolve() != expected_manifest.resolve():
         raise IntegrityError(
@@ -7565,7 +8283,7 @@ def verify_integrity_state(
         raise IntegrityError(f"Published workbook verification failed. {exc}") from exc
 
     expected_master = payload.get("master_generated_content_sha256")
-    master_path = output_dir / "Red_Onion_Server_Master.xlsx"
+    master_path = managed_master_workbook_path(output_dir)
     if expected_master is not None:
         if not isinstance(expected_master, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_master):
             raise IntegrityError("Integrity manifest contains an invalid master workbook digest.")
@@ -7573,12 +8291,6 @@ def verify_integrity_state(
             raise IntegrityError(
                 "Master workbook verification failed: the recorded master workbook is missing."
             )
-        master_path = managed_direct_child(
-            output_dir,
-            master_path,
-            purpose="master workbook",
-            require_file=True,
-        )
         actual_master = workbook_generated_content_sha256(master_path)
         if actual_master != expected_master:
             raise IntegrityError(
@@ -7603,9 +8315,28 @@ def ensure_integrity_preflight(
     config: dict[str, Any],
     *,
     allow_initialize: bool = False,
+    anchor_dir: Path | None = None,
 ) -> tuple[Path, dict[str, Any], str]:
     latest = latest_integrity_manifest_path(archive_dir)
+    anchor_exists = integrity_anchor_exists(archive_dir, anchor_dir)
     created_baseline = False
+    if anchor_exists:
+        anchored_manifest, anchored_sha256 = verify_integrity_anchor(
+            archive_dir, anchor_dir
+        )
+        if latest is None or latest.resolve() != anchored_manifest:
+            raise IntegrityError(
+                "The established manifest history is missing or no longer matches the "
+                "machine-local trusted anchor. Explicit baseline initialization cannot "
+                "replace established integrity history."
+            )
+        latest = anchored_manifest
+    elif latest is not None and not allow_initialize:
+        raise IntegrityError(
+            "Integrity manifests exist, but this runner has no machine-local trusted-head "
+            "anchor. A technical maintainer must explicitly inspect and adopt the existing "
+            "chain with --initialize-integrity-baseline before ordinary runs can continue."
+        )
     if latest is None:
         if not allow_initialize:
             raise IntegrityError(
@@ -7633,8 +8364,24 @@ def ensure_integrity_preflight(
         payload, manifest_hash = verify_integrity_state(
             archive_dir, output_dir, latest
         )
+        if anchor_exists:
+            if not secrets.compare_digest(manifest_hash, anchored_sha256):
+                raise IntegrityError(
+                    "The verified manifest hash differs from the machine-local trusted anchor."
+                )
+        else:
+            initialize_integrity_anchor(
+                archive_dir,
+                latest,
+                manifest_hash,
+                anchor_dir,
+            )
     except Exception:
-        if created_baseline and latest.exists():
+        if (
+            created_baseline
+            and latest.exists()
+            and not integrity_anchor_exists(archive_dir, anchor_dir)
+        ):
             latest.unlink()
         raise
     return latest, payload, manifest_hash
@@ -7646,7 +8393,7 @@ def rollback_created_files(
     *,
     expected_hashes: dict[Path, str],
 ) -> list[Path]:
-    """Delete only this run's exact files and preserve every conflicting replacement."""
+    """Quarantine first, then delete only this run's exact file version."""
 
     root = managed_root.resolve()
     normalized_hashes = {
@@ -7661,17 +8408,40 @@ def rollback_created_files(
             conflicts.append(candidate)
             continue
         expected_hash = normalized_hashes.get(candidate)
-        if (
-            expected_hash is None
-            or path_is_link_or_reparse(candidate)
-            or not candidate.is_file()
-            or sha256_file(candidate) != expected_hash
-        ):
-            if os.path.lexists(candidate):
-                conflicts.append(candidate)
+        if not os.path.lexists(candidate):
             continue
-        if candidate.is_file():
-            candidate.unlink()
+        if expected_hash is None:
+            conflicts.append(candidate)
+            continue
+        try:
+            managed_recursive_file([root], candidate, purpose="rollback target")
+        except IntegrityError:
+            conflicts.append(candidate)
+            continue
+
+        quarantine = candidate.parent / (
+            f".{candidate.name}.{uuid.uuid4().hex}.rollback"
+        )
+        if os.path.lexists(quarantine):
+            conflicts.append(candidate)
+            continue
+        os.replace(candidate, quarantine)
+        quarantine_matches = (
+            not path_is_link_or_reparse(quarantine)
+            and quarantine.is_file()
+            and sha256_file(quarantine) == expected_hash
+        )
+        if quarantine_matches:
+            quarantine.unlink()
+            continue
+
+        if not os.path.lexists(candidate):
+            os.replace(quarantine, candidate)
+            conflicts.append(candidate)
+        else:
+            # A new entry appeared after quarantine. Preserve both versions and
+            # report the hidden recovery path rather than overwriting either one.
+            conflicts.append(quarantine)
     return conflicts
 
 
@@ -7887,16 +8657,13 @@ def rollback_published_outputs(
 
     conflicts: list[Path] = []
     for final, rollback in reversed(list(rollback_backups.items())):
-        current_exists = os.path.lexists(final)
-        current_hash = (
-            sha256_file(final)
-            if current_exists and final.is_file() and not path_is_link_or_reparse(final)
-            else None
-        )
         staged_hash = staged_hashes.get(final)
+        recovery_source: Path | None = None
+        displaced_valid = False
         if rollback.backup is not None:
             if (
                 not rollback.backup.is_file()
+                or path_is_link_or_reparse(rollback.backup)
                 or sha256_file(rollback.backup) != rollback.backup_sha256
             ):
                 conflicts.append(final)
@@ -7907,23 +8674,84 @@ def rollback_published_outputs(
                 and not path_is_link_or_reparse(rollback.displaced)
                 and sha256_file(rollback.displaced) == rollback.original_sha256
             )
-            if not current_exists or current_hash == staged_hash:
-                if displaced_valid:
-                    if current_exists:
-                        final.unlink()
-                    os.replace(rollback.displaced, final)
-                else:
-                    verified_copy_file(rollback.backup, final, replace=current_exists)
-            elif current_hash == rollback.original_sha256:
-                if displaced_valid:
-                    rollback.displaced.unlink()
-            else:
+            recovery_source = rollback.displaced if displaced_valid else rollback.backup
+
+        if os.path.lexists(final) and (
+            path_is_link_or_reparse(final) or not final.is_file()
+        ):
+            conflicts.append(final)
+            continue
+
+        quarantine: Path | None = None
+        current_hash: str | None = None
+        if os.path.lexists(final):
+            quarantine = final.parent / (
+                f".{final.name}.{uuid.uuid4().hex}.rollback"
+            )
+            if os.path.lexists(quarantine):
                 conflicts.append(final)
                 continue
-        elif current_hash == staged_hash:
-            final.unlink()
-        elif current_exists:
-            conflicts.append(final)
+            os.replace(final, quarantine)
+            if path_is_link_or_reparse(quarantine) or not quarantine.is_file():
+                if not os.path.lexists(final):
+                    os.replace(quarantine, final)
+                conflicts.append(final)
+                continue
+            current_hash = sha256_file(quarantine)
+
+        def publish_without_overwrite(source: Path, expected_hash: str | None) -> bool:
+            if expected_hash is None or os.path.lexists(final):
+                return False
+            try:
+                return verified_copy_file(source, final, replace=False) == expected_hash
+            except (FileExistsError, IntegrityError, OSError):
+                return False
+
+        if rollback.backup is None:
+            if quarantine is None:
+                continue
+            if current_hash == staged_hash:
+                quarantine.unlink()
+            else:
+                restored = publish_without_overwrite(quarantine, current_hash)
+                if restored:
+                    quarantine.unlink()
+                    conflicts.append(final)
+                else:
+                    conflicts.append(quarantine)
+            continue
+
+        assert rollback.original_sha256 is not None
+        assert recovery_source is not None
+        if quarantine is None or current_hash == staged_hash:
+            restored = publish_without_overwrite(
+                recovery_source, rollback.original_sha256
+            )
+            if quarantine is not None and current_hash == staged_hash:
+                quarantine.unlink()
+            if not restored:
+                conflicts.append(final)
+                continue
+        elif current_hash == rollback.original_sha256:
+            restored = publish_without_overwrite(
+                quarantine, rollback.original_sha256
+            )
+            if restored:
+                quarantine.unlink()
+            else:
+                conflicts.append(quarantine)
+                continue
+        else:
+            restored = publish_without_overwrite(quarantine, current_hash)
+            if restored:
+                quarantine.unlink()
+                conflicts.append(final)
+            else:
+                conflicts.append(quarantine)
+            continue
+
+        if displaced_valid and rollback.displaced is not None and rollback.displaced.exists():
+            rollback.displaced.unlink()
     return conflicts
 
 
@@ -7939,6 +8767,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     archive_dir = Path(args.archive_dir).resolve()
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
+    configured_anchor_dir = getattr(args, "integrity_anchor_dir", None)
+    anchor_dir = (
+        Path(configured_anchor_dir).expanduser().absolute()
+        if configured_anchor_dir
+        else default_integrity_anchor_dir()
+    )
 
     migration_sources = [
         Path(path).resolve() for path in (getattr(args, "migrate_history_from", None) or [])
@@ -7961,6 +8795,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             config_path,
             config,
             allow_initialize=True,
+            anchor_dir=anchor_dir,
         )
         return [latest]
 
@@ -7974,11 +8809,22 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             )
 
     previous_manifest, previous_payload, previous_manifest_hash = ensure_integrity_preflight(
-        archive_dir, output_dir, config_path, config
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        anchor_dir=anchor_dir,
     )
 
     migration_plan = (
-        build_history_migration_plan(migration_sources, archive_dir, config)
+        build_history_migration_plan(
+            migration_sources,
+            archive_dir,
+            config,
+            expected_raw_inventory=manifest_inventory(
+                previous_payload, "raw_inventory"
+            ),
+        )
         if migration_sources
         else None
     )
@@ -7988,7 +8834,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         copied_hashes: dict[Path, str] = {}
         migration_manifest: Path | None = None
         try:
-            assert_manifest_head(archive_dir, previous_manifest, previous_manifest_hash)
+            assert_manifest_head(
+                archive_dir,
+                previous_manifest,
+                previous_manifest_hash,
+                anchor_dir,
+            )
             verify_integrity_state(archive_dir, output_dir, previous_manifest)
             verify_captured_migration_inputs(migration_plan.captured_sources)
             copied_paths = list(apply_history_migration_plan(migration_plan))
@@ -8003,7 +8854,10 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 )
                 verify_expected_integrity_state(archive_dir, output_dir, expected_state)
                 assert_manifest_head(
-                    archive_dir, previous_manifest, previous_manifest_hash
+                    archive_dir,
+                    previous_manifest,
+                    previous_manifest_hash,
+                    anchor_dir,
                 )
                 migration_manifest = write_integrity_manifest(
                     archive_dir=archive_dir,
@@ -8020,7 +8874,17 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                         "source_manifest_sha256": previous_manifest_hash,
                     },
                 )
-                verify_integrity_state(archive_dir, output_dir, migration_manifest)
+                _, migration_manifest_hash = verify_integrity_state(
+                    archive_dir, output_dir, migration_manifest
+                )
+                advance_integrity_anchor(
+                    archive_dir,
+                    previous_manifest,
+                    previous_manifest_hash,
+                    migration_manifest,
+                    migration_manifest_hash,
+                    anchor_dir,
+                )
         except Exception:
             if migration_manifest is not None and migration_manifest.exists():
                 migration_manifest.unlink()
@@ -8061,9 +8925,14 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         historical_records_by_path = migration_plan.effective_records_by_path
         historical_duplicate_paths = migration_plan.duplicate_paths
     else:
-        archived_paths = archived_daily_report_paths(archive_dir)
-        archived_records_by_path = (
-            read_reports_by_path(archived_paths, config) if archived_paths else {}
+        archived_captures = capture_archived_report_inputs(
+            archive_dir,
+            expected_inventory=manifest_inventory(
+                previous_payload, "raw_inventory"
+            ),
+        )
+        archived_records_by_path = read_captured_reports_by_path(
+            archived_captures, config
         )
         historical_resolution = resolve_report_duplicates(archived_records_by_path)
         historical_records_by_path = historical_resolution.records_by_path
@@ -8145,20 +9014,14 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 )
 
             staged_master = stage_dir / "Red_Onion_Server_Master.xlsx"
-            current_master = output_dir / staged_master.name
+            current_master = managed_master_workbook_path(output_dir)
             expected_existing_hashes = {
                 Path(item.path).name.casefold(): item.sha256
                 for item in manifest_inventory(
                     previous_payload, "published_output_inventory"
                 )
             }
-            if current_master.exists():
-                managed_direct_child(
-                    output_dir,
-                    current_master,
-                    purpose="master workbook",
-                    require_file=True,
-                )
+            if os.path.lexists(current_master):
                 expected_existing_hashes[current_master.name.casefold()] = (
                     verified_copy_file(current_master, staged_master)
                 )
@@ -8178,7 +9041,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             staged_master_digest = workbook_generated_content_sha256(staged_master)
 
             verify_captured_active_inputs(active_captures, input_dir)
-            assert_manifest_head(archive_dir, previous_manifest, previous_manifest_hash)
+            assert_manifest_head(
+                archive_dir,
+                previous_manifest,
+                previous_manifest_hash,
+                anchor_dir,
+            )
             verify_integrity_state(archive_dir, output_dir, previous_manifest)
             if migration_plan is not None:
                 verify_captured_migration_inputs(migration_plan.captured_sources)
@@ -8235,7 +9103,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 master_generated_content_sha256=staged_master_digest,
             )
             verify_expected_integrity_state(archive_dir, output_dir, expected_state)
-            assert_manifest_head(archive_dir, previous_manifest, previous_manifest_hash)
+            assert_manifest_head(
+                archive_dir,
+                previous_manifest,
+                previous_manifest_hash,
+                anchor_dir,
+            )
             new_manifest_path = write_integrity_manifest(
                 archive_dir=archive_dir,
                 output_dir=output_dir,
@@ -8257,7 +9130,17 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                     "published_workbooks": [path.name for path in final_paths],
                 },
             )
-            verify_integrity_state(archive_dir, output_dir, new_manifest_path)
+            _, new_manifest_hash = verify_integrity_state(
+                archive_dir, output_dir, new_manifest_path
+            )
+            advance_integrity_anchor(
+                archive_dir,
+                previous_manifest,
+                previous_manifest_hash,
+                new_manifest_path,
+                new_manifest_hash,
+                anchor_dir,
+            )
             manifest_committed = True
             quarantine_and_delete_captured_inputs(
                 active_captures, active_copies, input_dir, run_id
@@ -8321,6 +9204,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--archive-dir",
         default=str(DEFAULT_ARCHIVE_DIR),
         help="Folder for archived source files.",
+    )
+    parser.add_argument(
+        "--integrity-anchor-dir",
+        default=str(default_integrity_anchor_dir()),
+        help=(
+            "Machine-local trusted-head folder outside the Dropbox/operator workspace. "
+            "Keep it restricted to the automation runner account."
+        ),
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config JSON.")
     parser.add_argument("--week-start", help="Optional public snapshot start date, YYYY-MM-DD.")

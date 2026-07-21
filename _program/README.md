@@ -60,16 +60,20 @@ Hash verification detects a later change. It cannot prevent an editor from chang
 
 A maintainer must explicitly initialize or verify the starting state before the first protected run, using `.\Run-WeeklySnapshot.ps1 -InitializeIntegrityBaseline` (or `python red_onion_weekly_metrics.py --initialize-integrity-baseline`). Ordinary runs fail closed when the baseline or manifest history is missing and never silently replace it. Subsequent runs fail before workbook generation if the chain, archived raw inputs, archived generated workbooks, published public reports, or protected generated portions of the master no longer match. The weekly publish is staged and run-locked; exact captured source bytes are used for calculation and archiving, and active source files are quarantined and deleted only after verified archive copies, final outputs, the generated-workbook snapshot, and the new manifest are committed.
 
+The launcher stores the trusted manifest-head anchor outside Dropbox under `%LOCALAPPDATA%\RedOnionMetrics\integrity-anchors`. Keep access to that machine-local location restricted to the Windows account that runs the automation, and include it in the maintainer's independent recovery backup. The anchor pins the exact latest manifest path and hash and advances only after a verified manifest commit. Once present, neither an ordinary run nor `--initialize-integrity-baseline` will accept a deleted chain or a rewritten raw-data/manifest pair. There is intentionally no automated reset option; reconcile and restore trusted history before adopting an existing chain on a replacement runner.
+
 ## Deployed Release Preflight
 
 When the repository folder is named exactly `Red Onion Weekly Metrics Automation`, `Run-WeeklySnapshot.ps1` fails closed unless all of these local checks pass before any runtime mutation:
 
 - Git is available and the folder is a work tree.
 - `git status --porcelain=v1 --untracked-files=all` is empty.
+- The program source contains no `.pyc` or `.pyo` bytecode artifacts, including
+  ignored `__pycache__` files that do not appear in normal Git status output.
 - The checkout is attached to branch `main`.
 - `HEAD` equals the existing local `refs/remotes/origin/main` commit.
 
-The launcher does not fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root.
+The launcher disables bytecode writes and redirects bytecode lookup to a fresh unused cache path for every run. It does not fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root, but the same source-bytecode safety check applies.
 
 ## Master Workbook Management Layer
 
