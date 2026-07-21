@@ -144,7 +144,7 @@ def test_migration_conflict_blocks_before_copying(
     second.write_text("second", encoding="utf-8")
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        gross_sales = 100.0 if path == first else 125.0
+        gross_sales = 100.0 if path.name == first.name else 125.0
         return [make_record(path, date(2026, 6, 11), gross_sales=gross_sales)]
 
     monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)

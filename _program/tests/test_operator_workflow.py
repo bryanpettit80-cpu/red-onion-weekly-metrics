@@ -143,6 +143,11 @@ def args_for(tmp_path: Path) -> Namespace:
     )
 
 
+def initialize_integrity(args: Namespace) -> None:
+    baseline_args = Namespace(**vars(args), initialize_integrity_baseline=True)
+    metrics.run(baseline_args)
+
+
 def test_zero_active_files_stop_with_clear_message(tmp_path: Path) -> None:
     args = args_for(tmp_path)
     Path(args.input_dir).mkdir(parents=True)
@@ -170,6 +175,7 @@ def test_no_data_export_stops_with_file_specific_message(
             return False
 
     monkeypatch.setattr(metrics.pd, "ExcelFile", lambda *args, **kwargs: NoDataWorkbook())
+    initialize_integrity(args)
 
     with pytest.raises(ValueError) as exc_info:
         metrics.run(args)
@@ -193,11 +199,12 @@ def test_mixed_active_weeks_stop_with_exact_file_names(
     second.write_text("second", encoding="utf-8")
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        if path == first:
+        if path.name == first.name:
             return [make_record(date(2026, 6, 7))]
         return [make_record(date(2026, 6, 14))]
 
     monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)
+    initialize_integrity(args)
 
     with pytest.raises(ValueError) as exc_info:
         metrics.run(args)
@@ -229,6 +236,7 @@ def test_successful_run_archives_active_files_and_keeps_master_history(
     archived_source.write_text("archived", encoding="utf-8")
     active_source.write_text("active", encoding="utf-8")
     master_records: list[metrics.MetricRecord] = []
+    real_master_writer = metrics.write_master_workbook
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
         if path == archived_source:
@@ -243,13 +251,14 @@ def test_successful_run_archives_active_files_and_keeps_master_history(
 
     def fake_master(records, output_path, config, input_path, start, end):
         master_records.extend(records)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("master", encoding="utf-8")
-        return output_path
+        return real_master_writer(
+            records, output_path, config, input_path, start, end
+        )
 
     monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)
     monkeypatch.setattr(metrics, "write_public_workbook", fake_public)
     monkeypatch.setattr(metrics, "write_master_workbook", fake_master)
+    initialize_integrity(args)
 
     generated = metrics.run(args)
 
@@ -291,6 +300,7 @@ def test_failed_run_leaves_active_files_in_place(
     monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)
     monkeypatch.setattr(metrics, "write_public_workbook", fake_public)
     monkeypatch.setattr(metrics, "write_master_workbook", failing_master)
+    initialize_integrity(args)
 
     with pytest.raises(RuntimeError, match="workbook failed"):
         metrics.run(args)
@@ -752,9 +762,9 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
 
     wb = load_workbook(output_path)
     assert wb.sheetnames[:9] == metrics.VISIBLE_MANAGEMENT_SHEETS
-    assert wb["_Dashboard Chart Data"].sheet_state == "hidden"
-    assert wb["Weekly Server Metrics"].sheet_state == "hidden"
-    assert wb["Store Week Trends"].sheet_state == "hidden"
+    assert wb["_Dashboard Chart Data"].sheet_state == "veryHidden"
+    assert wb["Weekly Server Metrics"].sheet_state == "veryHidden"
+    assert wb["Store Week Trends"].sheet_state == "veryHidden"
     assert wb["Dashboard"].sheet_state == "visible"
     assert wb["Action Board"].sheet_state == "visible"
 
@@ -870,7 +880,8 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
     wb = load_workbook(output_path)
     setup = wb["Management Setup"]
     setup["D7"] = 28.0
-    setup["J6"] = "Pat Manager"
+    setup["A21"] = "Pat Manager"
+    setup["B21"] = "Yes"
     actions = wb["Action Board"]
     assert actions.max_row >= 5
     actions["D5"] = "In Progress"
@@ -888,7 +899,10 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
 
     regenerated = load_workbook(output_path, data_only=False)
     assert regenerated["Management Setup"]["D7"].value == 28.0
-    assert regenerated["Management Setup"]["J6"].value == "Pat Manager"
+    roster = regenerated["Management Setup"].tables[metrics.OWNER_ROSTER_TABLE_NAME]
+    assert roster.ref == "A20:B70"
+    assert regenerated["Management Setup"]["A21"].value == "Pat Manager"
+    assert regenerated["Management Setup"]["B21"].value == "Yes"
     action_rows = metrics.records_from_sheet(regenerated["Action Board"], "Action ID")
     carried = next(row for row in action_rows if row["Action ID"] == action_id)
     assert carried["Status"] == "In Progress"

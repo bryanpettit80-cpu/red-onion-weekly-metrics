@@ -16,6 +16,8 @@ The operator launcher creates a machine-local virtual environment at:
 %LOCALAPPDATA%\RedOnionMetrics\.venv
 ```
 
+Runtime dependencies are exactly pinned in both `requirements.txt` and `pyproject.toml` so repeated launcher installs use the same compatible direct versions. Change the two files together and validate all supported Python versions when deliberately upgrading a pin.
+
 ## Validation
 
 Run these checks before committing code changes:
@@ -23,6 +25,12 @@ Run these checks before committing code changes:
 ```powershell
 python -m pytest -q
 python -m py_compile red_onion_weekly_metrics.py
+```
+
+Launcher integrity behavior can be checked separately with:
+
+```powershell
+python -m pytest -q tests\test_launcher_integrity.py
 ```
 
 From the repository root, this compile check is also valid:
@@ -43,6 +51,26 @@ When the repository is used outside that named Dropbox folder, the same numbered
 
 The master workbook is rebuilt from active daily reports plus archived daily reports found under `03 Archive`.
 
+Each successful run also creates tamper-detection evidence, not immutable storage:
+
+- `03 Archive\generated-workbooks\week-ending-YYYY-MM-DD\<run-id>\` contains hashed copies of that run's generated workbooks.
+- `03 Archive\run-manifests\<timestamp>-<kind>-<run-id>.json` records source and generated-file hashes and links to the prior manifest by root-relative path and hash.
+
+Hash verification detects a later change. It cannot prevent an editor from changing or deleting Dropbox content, so these artifacts do not replace restricted folder permissions, version history, or an independently retained backup.
+
+A maintainer must explicitly initialize or verify the starting state before the first protected run, using `.\Run-WeeklySnapshot.ps1 -InitializeIntegrityBaseline` (or `python red_onion_weekly_metrics.py --initialize-integrity-baseline`). Ordinary runs fail closed when the baseline or manifest history is missing and never silently replace it. Subsequent runs fail before workbook generation if the chain, archived raw inputs, archived generated workbooks, published public reports, or protected generated portions of the master no longer match. The weekly publish is staged and run-locked; exact captured source bytes are used for calculation and archiving, and active source files are quarantined and deleted only after verified archive copies, final outputs, the generated-workbook snapshot, and the new manifest are committed.
+
+## Deployed Release Preflight
+
+When the repository folder is named exactly `Red Onion Weekly Metrics Automation`, `Run-WeeklySnapshot.ps1` fails closed unless all of these local checks pass before any runtime mutation:
+
+- Git is available and the folder is a work tree.
+- `git status --porcelain=v1 --untracked-files=all` is empty.
+- The checkout is attached to branch `main`.
+- `HEAD` equals the existing local `refs/remotes/origin/main` commit.
+
+The launcher does not fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root.
+
 ## Master Workbook Management Layer
 
 The master workbook separates performance level from momentum:
@@ -58,10 +86,21 @@ The management `Server Scorecard` shows the action, current sample, performance,
 
 `Management Setup` targets, owner names, and manual `Action Board` fields are read from the existing master before regeneration. The new workbook is written to a temporary file and atomically replaces the prior master only after validation succeeds.
 
-Technical calculation and raw-detail sheets remain in the workbook but are hidden by default. Do not delete them from the generator; they provide auditability and chart sources.
+The supported management edit surface is intentionally narrow:
+
+- `Management Setup` configured-entity target cells in columns `B:G`.
+- The visible Owner Roster table beginning at `A20:B20`, with `Owner Name` and `Active` fields. Add new managers and mark departing managers inactive so historical assignments remain readable.
+- `Action Board` data cells for Status (`D`), Owner (`E`), Due Date (`F`), and Manager Notes (`N`).
+
+All other cells are locked, technical sheets are `veryHidden`, and workbook structure is protected. This guards against accidental manipulation but is not encryption; Dropbox access and the manifest/backup controls remain necessary.
+
+Technical calculation and raw-detail sheets remain in the workbook as `veryHidden` sheets. Do not delete them from the generator; they provide auditability and chart sources.
 
 ## Maintenance Notes
 
 - Keep dependencies small and listed in `pyproject.toml` and `requirements.txt`.
 - Do not add external services or credentials for the weekly run.
 - Do not commit customer-facing workbooks, Toast source files, or archive contents unless explicitly requested.
+- Keep the deployed Dropbox checkout clean, on `main`, and aligned with its local `origin/main`; never add a launcher bypass for the release preflight.
+- On personal Dropbox plans, reserve edit access to the automation, archive, and manifests for the stable owner/technical maintainer. Give weekly submitters only the intake access they require and report consumers view-only access to finished reports.
+- Require two-factor authentication and preserve Dropbox version history, while maintaining a separate independently retained backup and a documented restore test outside this repository.

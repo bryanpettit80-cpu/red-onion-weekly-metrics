@@ -4,12 +4,18 @@ import argparse
 import filecmp
 import hashlib
 import json
+import math
 import os
 import re
+import secrets
 import shutil
+import stat
+import tempfile
+import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,10 +25,26 @@ from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.data_source import AxDataSource, StrRef
 from openpyxl.chart.series import SeriesLabel
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.workbook.protection import WorkbookProtection
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableStyleInfo
+
+from red_onion_integrity import (
+    FileFingerprint,
+    IntegrityError,
+    build_raw_inventory,
+    canonical_json_sha256,
+    collect_provenance,
+    fingerprint_file,
+    read_json_manifest,
+    sha256_file,
+    verify_manifest_chain,
+    verify_raw_inventory,
+    write_chained_manifest_atomic,
+)
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -169,6 +191,17 @@ DAILY_REPORT_PREFIX = "daily report"
 DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
 DAILY_REPORT_FORMAT_LABEL = ".xls or .xlsx"
 CANONICAL_DAILY_ARCHIVE_FOLDER = "processed-daily-reports"
+INTEGRITY_MANIFEST_FOLDER = "run-manifests"
+GENERATED_WORKBOOK_ARCHIVE_FOLDER = "generated-workbooks"
+OWNER_ROSTER_TABLE_NAME = "OwnerRoster"
+OWNER_ROSTER_DEFINED_NAME = "ActiveOwnerChoices"
+OWNER_VALIDATION_SHEET = "_Validation Lists"
+OWNER_ROSTER_HEADERS = ("Owner Name", "Active")
+OWNER_ROSTER_MIN_EDIT_ROWS = 50
+OWNER_ROSTER_SPARE_ROWS = 10
+OWNER_ROSTER_MAX_ROWS = 200
+WORKBOOK_DIGEST_SCHEME = "red-onion-generated-content-v2"
+RUN_NOTES_DIGEST_LABEL = "Generated Content SHA-256"
 EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 UNTRUSTED_WORKBOOK_TEXT_HEADERS = frozenset(
     {"Raw Server", "Display Name", "Source File", "Server", "Person / Area"}
@@ -217,6 +250,7 @@ class HistoryMigrationPlan:
     effective_records_by_path: dict[Path, list[MetricRecord]]
     duplicate_paths: tuple[Path, ...]
     business_dates: tuple[date, ...]
+    captured_sources: tuple[CapturedActiveInput, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,6 +258,33 @@ class HistoryMigrationResult:
     copied_paths: tuple[Path, ...]
     duplicate_files_ignored: int
     business_dates_considered: int
+
+
+@dataclass(frozen=True)
+class VerifiedArchiveCopy:
+    source: Path
+    destination: Path
+    created: bool
+    sha256: str
+
+
+@dataclass(frozen=True)
+class CapturedActiveInput:
+    """One immutable, in-memory snapshot of an operator drop-folder file."""
+
+    source: Path
+    fingerprint: FileFingerprint
+    content: bytes
+
+
+@dataclass(frozen=True)
+class OutputRollback:
+    """Evidence needed to restore a replaced output without losing a newer edit."""
+
+    backup: Path | None
+    original_sha256: str | None
+    backup_sha256: str | None
+    displaced: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -476,8 +537,241 @@ def daily_report_paths(input_dir: Path) -> list[Path]:
     return find_daily_report_paths(input_dir, recursive=False)
 
 
+def path_is_link_or_reparse(path: Path) -> bool:
+    """Return whether a directory entry redirects through a link/reparse point."""
+
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & 0x400
+    )
+
+
+def managed_subdirectory(
+    root: Path,
+    *parts: str,
+    purpose: str,
+    create: bool,
+) -> Path:
+    """Traverse/create managed directories without accepting links or junctions."""
+
+    current = root.resolve()
+    for part in parts:
+        if not part or Path(part).name != part:
+            raise IntegrityError(f"Unsafe managed {purpose} directory component: {part!r}")
+        candidate = current / part
+        if os.path.lexists(candidate):
+            if path_is_link_or_reparse(candidate):
+                raise IntegrityError(
+                    f"Refusing {purpose} directory link or Windows junction: {candidate}"
+                )
+            if not candidate.is_dir():
+                raise IntegrityError(f"Managed {purpose} path is not a directory: {candidate}")
+        elif create:
+            candidate.mkdir()
+        current = candidate
+    return current
+
+
+def validate_managed_tree_no_reparse(root: Path, *, purpose: str) -> None:
+    """Reject every link/reparse entry below a managed inventory root."""
+
+    if not os.path.lexists(root):
+        return
+    if path_is_link_or_reparse(root) or not root.is_dir():
+        raise IntegrityError(f"Managed {purpose} root is unsafe: {root}")
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in [*directory_names, *file_names]:
+            candidate = current_path / name
+            if path_is_link_or_reparse(candidate):
+                raise IntegrityError(
+                    f"Refusing {purpose} link or Windows reparse point: {candidate}"
+                )
+
+
+def managed_direct_child(
+    root: Path,
+    supplied: Path,
+    *,
+    purpose: str,
+    require_file: bool,
+) -> Path:
+    """Return a direct child without ever resolving a managed leaf through a link."""
+
+    root = root.resolve()
+    supplied = Path(supplied)
+    try:
+        parent = supplied.parent.resolve()
+    except OSError as exc:
+        raise IntegrityError(f"Could not validate {purpose}: {supplied}") from exc
+    if parent != root or supplied.name in {"", ".", ".."}:
+        raise IntegrityError(f"Refusing {purpose} outside its managed folder: {supplied}")
+    candidate = root / supplied.name
+    if os.path.lexists(candidate) and path_is_link_or_reparse(candidate):
+        raise IntegrityError(
+            f"Refusing {purpose} link or Windows reparse point: {candidate.name}. "
+            "Replace it with a normal file inside the managed folder."
+        )
+    if require_file and not candidate.is_file():
+        raise IntegrityError(f"Managed {purpose} file is missing: {candidate}")
+    if os.path.lexists(candidate) and not candidate.is_file():
+        raise IntegrityError(f"Managed {purpose} entry is not a regular file: {candidate}")
+    return candidate
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int | None, int | None]:
+    return (
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        getattr(metadata, "st_dev", None),
+        getattr(metadata, "st_ino", None),
+    )
+
+
+def capture_regular_file(source: Path, *, fingerprint_path: str) -> CapturedActiveInput:
+    """Capture one regular file while proving its directory entry stayed stable."""
+
+    before = os.lstat(source)
+    if path_is_link_or_reparse(source) or not stat.S_ISREG(before.st_mode):
+        raise IntegrityError(f"Managed source is not a normal file: {source}")
+    digest = hashlib.sha256()
+    chunks: list[bytes] = []
+    with source.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if _file_identity(opened) != _file_identity(before):
+            raise IntegrityError(f"Managed source changed while opening: {source.name}")
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            chunks.append(chunk)
+    after = os.lstat(source)
+    if path_is_link_or_reparse(source) or _file_identity(after) != _file_identity(before):
+        raise IntegrityError(
+            f"Managed source changed while it was captured: {source.name}. Rerun after "
+            "Dropbox has finished syncing."
+        )
+    content = b"".join(chunks)
+    return CapturedActiveInput(
+        source,
+        FileFingerprint(
+            path=fingerprint_path,
+            size=len(content),
+            sha256=digest.hexdigest(),
+        ),
+        content,
+    )
+
+
+def managed_recursive_file(roots: Iterable[Path], supplied: Path, *, purpose: str) -> Path:
+    """Validate a recursive managed source without resolving through reparse points."""
+
+    candidate = supplied.absolute()
+    matching_root: Path | None = None
+    relative: Path | None = None
+    for root in roots:
+        resolved_root = root.resolve()
+        try:
+            relative = candidate.relative_to(resolved_root)
+            matching_root = resolved_root
+            break
+        except ValueError:
+            continue
+    if matching_root is None or relative is None or not relative.parts:
+        raise IntegrityError(f"Refusing {purpose} outside its declared source folder: {supplied}")
+    cursor = matching_root
+    for part in relative.parts:
+        cursor = cursor / part
+        if os.path.lexists(cursor) and path_is_link_or_reparse(cursor):
+            raise IntegrityError(
+                f"Refusing {purpose} link or Windows reparse point: {cursor}"
+            )
+    if not candidate.is_file():
+        raise IntegrityError(f"Managed {purpose} file is missing: {candidate}")
+    return candidate
+
+
+def capture_migration_inputs(
+    source_paths: Iterable[Path], source_roots: Iterable[Path]
+) -> list[CapturedActiveInput]:
+    roots = [root.resolve() for root in source_roots]
+    captures: list[CapturedActiveInput] = []
+    for supplied in source_paths:
+        source = managed_recursive_file(roots, supplied, purpose="history migration source")
+        captures.append(
+            capture_regular_file(source, fingerprint_path=source.name)
+        )
+    return captures
+
+
+def capture_active_inputs(
+    source_paths: Iterable[Path], input_dir: Path
+) -> list[CapturedActiveInput]:
+    """Pin the exact bytes used for parsing, archiving, manifesting, and cleanup."""
+
+    captures: list[CapturedActiveInput] = []
+    seen_names: set[str] = set()
+    for supplied in source_paths:
+        source = managed_direct_child(
+            input_dir, supplied, purpose="active input", require_file=True
+        )
+        key = source.name.casefold()
+        if key in seen_names:
+            raise IntegrityError(f"Duplicate active input name: {source.name}")
+        seen_names.add(key)
+
+        captures.append(capture_regular_file(source, fingerprint_path=source.name))
+    return captures
+
+
+def verify_captured_active_inputs(
+    captures: Iterable[CapturedActiveInput], input_dir: Path
+) -> None:
+    """Require every live pathname to remain the exact captured input version."""
+
+    for capture in captures:
+        source = managed_direct_child(
+            input_dir, capture.source, purpose="active input", require_file=True
+        )
+        if source.stat().st_size != capture.fingerprint.size:
+            raise IntegrityError(
+                f"Active input was replaced during the run: {source.name}. "
+                "No active source files were deleted."
+            )
+        if sha256_file(source) != capture.fingerprint.sha256:
+            raise IntegrityError(
+                f"Active input was replaced during the run: {source.name}. "
+                "No active source files were deleted."
+            )
+
+
+def verify_captured_migration_inputs(
+    captures: Iterable[CapturedActiveInput],
+) -> None:
+    """Stop a migration when its external source changed after plan construction."""
+
+    for capture in captures:
+        source = capture.source.absolute()
+        if (
+            path_is_link_or_reparse(source)
+            or not source.is_file()
+            or source.stat().st_size != capture.fingerprint.size
+            or sha256_file(source) != capture.fingerprint.sha256
+        ):
+            raise IntegrityError(
+                f"History migration source changed during the run: {source.name}. "
+                "No migration files were committed; rebuild the plan and rerun."
+            )
+
+
 def canonical_daily_archive_dir(archive_dir: Path) -> Path:
-    return archive_dir / CANONICAL_DAILY_ARCHIVE_FOLDER
+    return managed_subdirectory(
+        archive_dir,
+        CANONICAL_DAILY_ARCHIVE_FOLDER,
+        purpose="canonical raw archive",
+        create=False,
+    )
 
 
 def archived_daily_report_paths(archive_dir: Path) -> list[Path]:
@@ -715,26 +1009,335 @@ def archive_destination_for(
         counter += 1
 
 
+def verified_copy_file(source: Path, destination: Path, *, replace: bool = False) -> str:
+    """Copy one file through a verified same-folder temporary file."""
+    source = source.absolute()
+    destination = destination.absolute()
+    if not source.is_file():
+        raise FileNotFoundError(f"Source file was not found: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(destination) and not replace:
+        raise FileExistsError(f"Copy destination already exists: {destination}")
+
+    expected_hash = sha256_file(source)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{destination.name}.",
+            suffix=".copying",
+            dir=str(destination.parent),
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+        shutil.copy2(source, temp_path)
+        copied_hash = sha256_file(temp_path)
+        current_source_hash = sha256_file(source)
+        if copied_hash != expected_hash or current_source_hash != expected_hash:
+            raise IntegrityError(
+                f"File changed or failed verification while copying {source.name}; "
+                "no active source files were deleted."
+            )
+        if os.path.lexists(destination) and not replace:
+            raise FileExistsError(f"Copy destination appeared during the run: {destination}")
+        if replace:
+            os.replace(temp_path, destination)
+        elif os.name == "nt":
+            try:
+                os.rename(temp_path, destination)
+            except OSError as exc:
+                if os.path.lexists(destination):
+                    raise FileExistsError(
+                        f"Copy destination appeared during the run: {destination}"
+                    ) from exc
+                raise
+        else:
+            os.link(temp_path, destination)
+            temp_path.unlink()
+        temp_path = None
+        return expected_hash
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def copy_processed_files_verified(
+    source_paths: Iterable[Path], archive_root: Path, week_end: date
+) -> list[VerifiedArchiveCopy]:
+    """Create and verify archive copies without deleting active source files."""
+    raw_root = managed_subdirectory(
+        archive_root,
+        CANONICAL_DAILY_ARCHIVE_FOLDER,
+        purpose="canonical raw archive",
+        create=True,
+    )
+    archive_dir = managed_subdirectory(
+        raw_root,
+        f"week-ending-{week_end.isoformat()}",
+        purpose="raw archive week",
+        create=True,
+    )
+    reserved: set[Path] = set()
+    plans: list[tuple[Path, Path, bool]] = []
+    for source_path in source_paths:
+        destination, already_archived = archive_destination_for(
+            source_path, archive_dir, reserved
+        )
+        plans.append((source_path.resolve(), destination.resolve(), already_archived))
+        reserved.add(destination)
+
+    completed: list[VerifiedArchiveCopy] = []
+    try:
+        for source, destination, already_archived in plans:
+            source_hash = sha256_file(source)
+            if already_archived:
+                if sha256_file(destination) != source_hash:
+                    raise IntegrityError(
+                        f"Existing archive copy no longer matches {source.name}; "
+                        "no active source files were deleted."
+                    )
+                created = False
+            else:
+                copied_hash = verified_copy_file(source, destination)
+                if copied_hash != source_hash:
+                    raise IntegrityError(f"Archive verification failed for {source.name}.")
+                created = True
+            completed.append(
+                VerifiedArchiveCopy(source, destination, created, source_hash)
+            )
+    except Exception:
+        created = [copy for copy in completed if copy.created]
+        conflicts = rollback_created_files(
+            [copy.destination for copy in created],
+            archive_dir,
+            expected_hashes={copy.destination: copy.sha256 for copy in created},
+        )
+        if conflicts:
+            raise IntegrityError(
+                "Archive rollback preserved a file that changed during the failed copy: "
+                f"{conflicts[0]}"
+            )
+        raise
+    return completed
+
+
+def verified_write_bytes(content: bytes, destination: Path, *, replace: bool = False) -> str:
+    """Write pinned bytes atomically and verify the exact persisted content."""
+
+    destination = destination.absolute()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(destination) and not replace:
+        raise FileExistsError(f"Write destination already exists: {destination}")
+    expected_hash = hashlib.sha256(content).hexdigest()
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{destination.name}.",
+            suffix=".writing",
+            dir=str(destination.parent),
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if sha256_file(temp_path) != expected_hash:
+            raise IntegrityError(f"Pinned-byte write verification failed for {destination.name}.")
+        if os.path.lexists(destination) and not replace:
+            raise FileExistsError(f"Write destination appeared during the run: {destination}")
+        if replace:
+            os.replace(temp_path, destination)
+        elif os.name == "nt":
+            try:
+                os.rename(temp_path, destination)
+            except OSError as exc:
+                if os.path.lexists(destination):
+                    raise FileExistsError(
+                        f"Write destination appeared during the run: {destination}"
+                    ) from exc
+                raise
+        else:
+            os.link(temp_path, destination)
+            temp_path.unlink()
+        temp_path = None
+        if sha256_file(destination) != expected_hash:
+            raise IntegrityError(f"Pinned-byte write changed after publication: {destination.name}.")
+        return expected_hash
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def archive_destination_for_capture(
+    capture: CapturedActiveInput,
+    archive_dir: Path,
+    reserved_destinations: set[Path] | None = None,
+) -> tuple[Path, bool]:
+    """Choose a collision-safe archive name using the pinned input fingerprint."""
+
+    reserved_destinations = reserved_destinations or set()
+    counter = 0
+    while True:
+        suffix = "" if counter == 0 else f" ({counter})"
+        candidate = archive_dir / (
+            f"{capture.source.stem}{suffix}{capture.source.suffix}"
+        )
+        if candidate in reserved_destinations:
+            counter += 1
+            continue
+        if not os.path.lexists(candidate):
+            return candidate, False
+        managed_direct_child(
+            archive_dir, candidate, purpose="raw archive destination", require_file=True
+        )
+        if (
+            candidate.stat().st_size == capture.fingerprint.size
+            and sha256_file(candidate) == capture.fingerprint.sha256
+        ):
+            return candidate, True
+        counter += 1
+
+
+def copy_captured_active_files_verified(
+    captures: Iterable[CapturedActiveInput], archive_root: Path, week_end: date
+) -> list[VerifiedArchiveCopy]:
+    """Archive the exact bytes that were parsed, never a later pathname version."""
+
+    raw_root = managed_subdirectory(
+        archive_root,
+        CANONICAL_DAILY_ARCHIVE_FOLDER,
+        purpose="canonical raw archive",
+        create=True,
+    )
+    archive_dir = managed_subdirectory(
+        raw_root,
+        f"week-ending-{week_end.isoformat()}",
+        purpose="raw archive week",
+        create=True,
+    )
+    reserved: set[Path] = set()
+    plans: list[tuple[CapturedActiveInput, Path, bool]] = []
+    for capture in captures:
+        destination, already_archived = archive_destination_for_capture(
+            capture, archive_dir, reserved
+        )
+        plans.append((capture, destination, already_archived))
+        reserved.add(destination)
+
+    completed: list[VerifiedArchiveCopy] = []
+    try:
+        for capture, destination, already_archived in plans:
+            if already_archived:
+                created = False
+            else:
+                copied_hash = verified_write_bytes(capture.content, destination)
+                if copied_hash != capture.fingerprint.sha256:
+                    raise IntegrityError(
+                        f"Pinned archive verification failed for {capture.source.name}."
+                    )
+                created = True
+            completed.append(
+                VerifiedArchiveCopy(
+                    capture.source,
+                    destination,
+                    created,
+                    capture.fingerprint.sha256,
+                )
+            )
+    except Exception:
+        created = [copy for copy in completed if copy.created]
+        conflicts = rollback_created_files(
+            [copy.destination for copy in created],
+            archive_dir,
+            expected_hashes={copy.destination: copy.sha256 for copy in created},
+        )
+        if conflicts:
+            raise IntegrityError(
+                "Pinned archive rollback preserved a changed replacement: "
+                f"{conflicts[0]}"
+            )
+        raise
+    return completed
+
+
+def quarantine_and_delete_captured_inputs(
+    captures: Iterable[CapturedActiveInput],
+    copies: Iterable[VerifiedArchiveCopy],
+    input_dir: Path,
+    run_id: str,
+) -> None:
+    """Atomically move verified inputs aside before unlinking their exact entries."""
+
+    captures_by_name = {capture.source.name.casefold(): capture for capture in captures}
+    for copy in copies:
+        capture = captures_by_name[copy.source.name.casefold()]
+        if sha256_file(copy.destination) != capture.fingerprint.sha256:
+            raise IntegrityError(
+                f"Archive copy changed before cleanup: {copy.destination.name}. "
+                "The active source was not deleted."
+            )
+        verify_captured_active_inputs([capture], input_dir)
+        source = managed_direct_child(
+            input_dir, capture.source, purpose="active input", require_file=True
+        )
+        quarantine = input_dir.resolve() / (
+            f".{source.name}.{run_id}.{uuid.uuid4().hex}.processed"
+        )
+        if os.path.lexists(quarantine):
+            raise IntegrityError(f"Unexpected cleanup quarantine collision: {quarantine.name}")
+        os.replace(source, quarantine)
+        try:
+            quarantine_is_expected = (
+                not path_is_link_or_reparse(quarantine)
+                and quarantine.is_file()
+                and quarantine.stat().st_size == capture.fingerprint.size
+                and sha256_file(quarantine) == capture.fingerprint.sha256
+            )
+            if not quarantine_is_expected:
+                if not os.path.lexists(source):
+                    os.replace(quarantine, source)
+                raise IntegrityError(
+                    f"Active input changed at cleanup time: {source.name}. "
+                    "The replacement was not deleted."
+                )
+            quarantine.unlink()
+        except OSError as exc:
+            raise IntegrityError(
+                f"The run was committed, but active source cleanup failed for "
+                f"{source.name}: {exc}. The archive and generated outputs are intact."
+            ) from exc
+
+
+def delete_verified_active_sources(copies: Iterable[VerifiedArchiveCopy]) -> None:
+    """Delete active inputs only after their hashes and archive copies still match."""
+    copies = list(copies)
+    for copy in copies:
+        if sha256_file(copy.source) != copy.sha256:
+            raise IntegrityError(
+                f"Active source changed before cleanup: {copy.source.name}. "
+                "The verified outputs and archive remain, but the source was not deleted."
+            )
+        if sha256_file(copy.destination) != copy.sha256:
+            raise IntegrityError(
+                f"Archive copy changed before cleanup: {copy.destination.name}. "
+                "The active source was not deleted."
+            )
+    for copy in copies:
+        try:
+            copy.source.unlink()
+        except OSError as exc:
+            raise IntegrityError(
+                f"The run was committed, but active source cleanup failed for "
+                f"{copy.source.name}: {exc}. The archive and generated outputs are intact; "
+                "remove the duplicate active file after confirming it is closed."
+            ) from exc
+
+
 def archive_processed_files(
     source_paths: Iterable[Path], archive_root: Path, week_end: date
 ) -> list[Path]:
-    archive_dir = canonical_daily_archive_dir(archive_root) / f"week-ending-{week_end.isoformat()}"
-    archive_dir.mkdir(parents=True, exist_ok=True)
-
-    move_plan: list[tuple[Path, Path, bool]] = []
-    for source_path in source_paths:
-        destination, already_archived = archive_destination_for(source_path, archive_dir)
-        move_plan.append((source_path, destination, already_archived))
-
-    archived_paths: list[Path] = []
-    for source_path, destination, already_archived in move_plan:
-        if already_archived:
-            source_path.unlink()
-        else:
-            shutil.move(str(source_path), str(destination))
-        archived_paths.append(destination)
-
-    return archived_paths
+    copies = copy_processed_files_verified(source_paths, archive_root, week_end)
+    delete_verified_active_sources(copies)
+    return [copy.destination for copy in copies]
 
 
 def migration_daily_report_paths(source_dirs: Iterable[Path]) -> list[Path]:
@@ -750,7 +1353,10 @@ def migration_daily_report_paths(source_dirs: Iterable[Path]) -> list[Path]:
                 f"migration source: {source_dir}"
             )
         for path in source_paths:
-            paths[path.resolve()] = None
+            safe_path = managed_recursive_file(
+                [source_dir], path, purpose="history migration source"
+            )
+            paths[safe_path] = None
     return sorted(paths, key=lambda path: str(path).casefold())
 
 
@@ -759,8 +1365,27 @@ def build_history_migration_plan(
     archive_root: Path,
     config: dict[str, Any],
 ) -> HistoryMigrationPlan:
+    source_dirs = [Path(path).resolve() for path in source_dirs]
     source_paths = migration_daily_report_paths(source_dirs)
-    source_records_by_path = read_reports_by_path(source_paths, config)
+    captured_sources = capture_migration_inputs(source_paths, source_dirs)
+    source_records_by_path: dict[Path, list[MetricRecord]] = {}
+    with tempfile.TemporaryDirectory(prefix=".history-migration-read-") as stage_name:
+        stage_root = Path(stage_name)
+        for index, capture in enumerate(captured_sources):
+            staged_path = stage_root / str(index) / capture.source.name
+            verified_write_bytes(capture.content, staged_path)
+            try:
+                records = parse_daily_report(staged_path, config)
+            except Exception as exc:
+                raise ValueError(
+                    f"Could not process {capture.source.name}: {exc}"
+                ) from exc
+            if not records:
+                raise ValueError(f"No metric rows were found in {capture.source}")
+            source_records_by_path[capture.source] = records
+    captures_by_path = {
+        capture.source.absolute(): capture for capture in captured_sources
+    }
     canonical_paths = archived_daily_report_paths(archive_root)
     canonical_records_by_path = (
         read_reports_by_path(canonical_paths, config) if canonical_paths else {}
@@ -788,11 +1413,16 @@ def build_history_migration_plan(
             key=lambda path: (path.suffix.lower() != ".xlsx", str(path).casefold()),
         )
         _, week_end = week_period_for(report_date)
-        destination_dir = canonical_daily_archive_dir(archive_root) / (
-            f"week-ending-{week_end.isoformat()}"
+        destination_dir = managed_subdirectory(
+            canonical_daily_archive_dir(archive_root),
+            f"week-ending-{week_end.isoformat()}",
+            purpose="raw archive week",
+            create=False,
         )
-        destination, already_present = archive_destination_for(
-            source_path, destination_dir, reserved_destinations
+        destination, already_present = archive_destination_for_capture(
+            captures_by_path[source_path.absolute()],
+            destination_dir,
+            reserved_destinations,
         )
         if not already_present:
             copy_pairs.append((source_path, destination))
@@ -803,6 +1433,7 @@ def build_history_migration_plan(
         effective_records_by_path=resolution.records_by_path,
         duplicate_paths=resolution.duplicate_paths,
         business_dates=resolution.business_dates,
+        captured_sources=tuple(captured_sources),
     )
 
 
@@ -813,19 +1444,80 @@ def apply_history_migration_plan(plan: HistoryMigrationPlan) -> tuple[Path, ...]
             "History migration preflight selected the same destination more than once. "
             "No files were copied."
         )
-    conflicts = [destination for destination in destinations if destination.exists()]
+    conflicts = [destination for destination in destinations if os.path.lexists(destination)]
     if conflicts:
         raise RuntimeError(
             f"History migration destination appeared after preflight: {conflicts[0]}. "
             "No files were copied; rerun the migration."
         )
 
+    captures_by_path = {
+        capture.source.absolute(): capture for capture in plan.captured_sources
+    }
     copied_paths: list[Path] = []
-    for source_path, destination in plan.copy_pairs:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_path, destination)
-        copied_paths.append(destination)
+    copied_hashes: dict[Path, str] = {}
+    try:
+        for source_path, destination in plan.copy_pairs:
+            raw_root = destination.parent.parent
+            safe_raw_root = managed_subdirectory(
+                raw_root.parent,
+                raw_root.name,
+                purpose="canonical raw archive",
+                create=True,
+            )
+            safe_week = managed_subdirectory(
+                safe_raw_root,
+                destination.parent.name,
+                purpose="raw archive week",
+                create=True,
+            )
+            if safe_week / destination.name != destination.absolute():
+                raise IntegrityError(
+                    f"History migration destination escaped the raw archive: {destination}"
+                )
+            capture = captures_by_path.get(source_path.absolute())
+            if capture is None:
+                copied_hash = verified_copy_file(source_path, destination)
+            else:
+                copied_hash = verified_write_bytes(capture.content, destination)
+                if copied_hash != capture.fingerprint.sha256:
+                    raise IntegrityError(
+                        f"Pinned history migration copy failed for {source_path.name}."
+                    )
+            copied_paths.append(destination)
+            copied_hashes[destination.absolute()] = copied_hash
+    except Exception:
+        conflicts = rollback_created_files(
+            copied_paths,
+            destinations[0].parent.parent if destinations else Path.cwd(),
+            expected_hashes=copied_hashes,
+        )
+        if conflicts:
+            raise IntegrityError(
+                "History migration rollback preserved a changed replacement: "
+                f"{conflicts[0]}"
+            )
+        raise
     return tuple(copied_paths)
+
+
+def history_migration_expected_hashes(
+    plan: HistoryMigrationPlan, copied_paths: Iterable[Path]
+) -> dict[Path, str]:
+    captures = {
+        capture.source.absolute(): capture.fingerprint.sha256
+        for capture in plan.captured_sources
+    }
+    source_for_destination = {
+        destination.absolute(): source.absolute()
+        for source, destination in plan.copy_pairs
+    }
+    expected: dict[Path, str] = {}
+    for supplied in copied_paths:
+        destination = supplied.absolute()
+        source = source_for_destination[destination]
+        expected[destination] = captures.get(source) or sha256_file(source)
+    return expected
 
 
 def migrate_history_files(
@@ -833,6 +1525,8 @@ def migrate_history_files(
     archive_root: Path,
     config: dict[str, Any],
 ) -> HistoryMigrationResult:
+    archive_root = archive_root.resolve()
+    archive_root.mkdir(parents=True, exist_ok=True)
     plan = build_history_migration_plan(source_dirs, archive_root, config)
     copied_paths = apply_history_migration_plan(plan)
     return HistoryMigrationResult(
@@ -4003,17 +4697,156 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
     return records
 
 
+def owner_active_value(value: Any) -> bool:
+    """Normalize the user-facing owner status without silently accepting typos."""
+    if is_blank(value):
+        return True
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().casefold()
+    if text in {"yes", "active"}:
+        return True
+    if text in {"no", "inactive"}:
+        return False
+    raise ValueError(
+        f"Owner Roster Active values must be Yes or No; received {value!r}. "
+        "No workbooks were created and no source files were moved."
+    )
+
+
+def normalize_owner_roster(entries: Iterable[Any]) -> list[dict[str, str]]:
+    """Return a validated, display-safe owner roster in stable workbook order."""
+    roster: list[dict[str, str]] = []
+    seen: dict[str, str] = {}
+    for entry in entries:
+        if isinstance(entry, dict):
+            raw_name = entry.get("Owner Name", entry.get("Name"))
+            raw_active = entry.get("Active")
+        else:
+            raw_name = entry
+            raw_active = True
+        if is_blank(raw_name):
+            continue
+        name = str(excel_safe_text(str(raw_name).strip()))
+        duplicate_key = name.casefold()
+        if duplicate_key in seen:
+            raise ValueError(
+                f"Owner Roster contains the duplicate name {name!r}. "
+                "Keep one row per owner; no workbooks were created and no source files were moved."
+            )
+        seen[duplicate_key] = name
+        roster.append(
+            {
+                "Owner Name": name,
+                "Active": "Yes" if owner_active_value(raw_active) else "No",
+            }
+        )
+        if len(roster) > OWNER_ROSTER_MAX_ROWS:
+            raise ValueError(
+                f"Owner Roster supports at most {OWNER_ROSTER_MAX_ROWS} people. "
+                "No workbooks were created and no source files were moved."
+            )
+    return roster
+
+
+def active_owner_names(roster: Iterable[Any]) -> list[str]:
+    return [
+        row["Owner Name"]
+        for row in normalize_owner_roster(roster)
+        if row["Active"] == "Yes"
+    ]
+
+
+def owner_roster_from_sheet(ws) -> list[dict[str, str]]:
+    """Read the current roster table, falling back to the legacy J6:J25 list."""
+    entries: list[dict[str, Any]] = []
+    if OWNER_ROSTER_TABLE_NAME in ws.tables:
+        table = ws.tables[OWNER_ROSTER_TABLE_NAME]
+        min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+        if (min_col, min_row, max_col) != (1, 20, 2):
+            raise ValueError(
+                "Owner Roster must remain anchored at A20 with exactly two columns. "
+                "No workbooks were created and no source files were moved."
+            )
+        if max_row - min_row > OWNER_ROSTER_MAX_ROWS:
+            raise ValueError(
+                f"Owner Roster supports at most {OWNER_ROSTER_MAX_ROWS} rows. "
+                "No workbooks were created and no source files were moved."
+            )
+        actual_headers = tuple(
+            str(ws.cell(row=min_row, column=col).value or "")
+            for col in range(min_col, max_col + 1)
+        )
+        if actual_headers != OWNER_ROSTER_HEADERS:
+            raise ValueError(
+                "Owner Roster headers must be Owner Name and Active in that order. "
+                "No workbooks were created and no source files were moved."
+            )
+        headers = {
+            str(ws.cell(row=min_row, column=col).value): col
+            for col in range(min_col, max_col + 1)
+            if ws.cell(row=min_row, column=col).value
+        }
+        name_col = headers.get("Owner Name")
+        active_col = headers.get("Active")
+        if name_col is None or active_col is None:
+            raise ValueError(
+                "Owner Roster must contain Owner Name and Active columns. "
+                "No workbooks were created and no source files were moved."
+            )
+        for row in range(min_row + 1, max_row + 1):
+            name = excel_safe_cell_value(ws.cell(row=row, column=name_col))
+            if is_blank(name):
+                continue
+            active_value = excel_safe_cell_value(ws.cell(row=row, column=active_col))
+            if is_blank(active_value):
+                raise ValueError(
+                    f"Owner Roster row {row} has a name but no Active value. Choose Yes or No; "
+                    "no workbooks were created and no source files were moved."
+                )
+            entries.append(
+                {
+                    "Owner Name": name,
+                    "Active": active_value,
+                }
+            )
+    else:
+        for row in range(6, min(ws.max_row, 25) + 1):
+            value = excel_safe_cell_value(ws.cell(row=row, column=10))
+            if not is_blank(value):
+                entries.append({"Owner Name": value, "Active": "Yes"})
+    return normalize_owner_roster(entries)
+
+
+def owner_roster_capacity_from_sheet(ws) -> int:
+    if OWNER_ROSTER_TABLE_NAME not in ws.tables:
+        return 20
+    _, min_row, _, max_row = range_boundaries(ws.tables[OWNER_ROSTER_TABLE_NAME].ref)
+    capacity = max(1, max_row - min_row)
+    if capacity > OWNER_ROSTER_MAX_ROWS:
+        raise ValueError(
+            f"Owner Roster supports at most {OWNER_ROSTER_MAX_ROWS} rows. "
+            "No workbooks were created and no source files were moved."
+        )
+    return capacity
+
+
 def read_management_state(output_path: Path) -> dict[str, Any]:
     state: dict[str, Any] = {
         "targets": {},
         "owners": [],
+        "owner_roster": [],
+        "owner_roster_capacity": OWNER_ROSTER_MIN_EDIT_ROWS,
         "active_actions": [],
         "action_history": [],
     }
     if not output_path.exists():
         return state
     try:
+        verify_existing_management_workbook_integrity(output_path)
         wb = load_workbook(output_path, data_only=False)
+    except IntegrityError:
+        raise
     except Exception as exc:
         raise RuntimeError(
             f"Could not read the existing master workbook at {output_path}. "
@@ -4043,10 +4876,9 @@ def read_management_state(output_path: Path) -> dict[str, Any]:
                             values[field] = None
                     state["targets"][str(entity)] = values
                     row += 1
-            for row in range(6, min(ws.max_row, 25) + 1):
-                value = excel_safe_cell_value(ws.cell(row=row, column=10))
-                if not is_blank(value):
-                    state["owners"].append(str(value).strip())
+            state["owner_roster"] = owner_roster_from_sheet(ws)
+            state["owners"] = active_owner_names(state["owner_roster"])
+            state["owner_roster_capacity"] = owner_roster_capacity_from_sheet(ws)
         if "Action Board" in wb.sheetnames:
             state["active_actions"] = records_from_sheet(wb["Action Board"], "Action ID")
         if "Action History" in wb.sheetnames:
@@ -4054,6 +4886,548 @@ def read_management_state(output_path: Path) -> dict[str, Any]:
     finally:
         wb.close()
     return state
+
+
+def workbook_digest_value(value: Any) -> Any:
+    if isinstance(value, (datetime, date, time)):
+        return {"type": type(value).__name__, "value": value.isoformat()}
+    if isinstance(value, float) and not math.isfinite(value):
+        raise IntegrityError("Workbook integrity cannot hash NaN or infinite values.")
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    formula_text = getattr(value, "text", None)
+    if isinstance(formula_text, str):
+        return {"type": type(value).__name__, "value": formula_text}
+    return {"type": type(value).__name__, "value": str(value)}
+
+
+def workbook_digest_xml_element(node: Any) -> dict[str, Any]:
+    """Convert an openpyxl XML element into canonical JSON-safe content."""
+    return {
+        "tag": str(node.tag),
+        "attributes": {
+            str(key): str(value)
+            for key, value in sorted(node.attrib.items(), key=lambda item: str(item[0]))
+        },
+        "text": node.text,
+        "children": [workbook_digest_xml_element(child) for child in list(node)],
+    }
+
+
+def workbook_digest_serialisable(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    to_tree = getattr(value, "to_tree", None)
+    if not callable(to_tree):
+        raise IntegrityError(
+            f"Workbook integrity cannot serialize {type(value).__name__}."
+        )
+    try:
+        return workbook_digest_xml_element(to_tree())
+    except Exception as exc:
+        raise IntegrityError(
+            f"Workbook integrity could not serialize {type(value).__name__}: {exc}"
+        ) from exc
+
+
+def workbook_digest_style_payload(styleable: Any) -> dict[str, Any]:
+    return {
+        "font": workbook_digest_serialisable(styleable.font),
+        "fill": workbook_digest_serialisable(styleable.fill),
+        "border": workbook_digest_serialisable(styleable.border),
+        "alignment": workbook_digest_serialisable(styleable.alignment),
+        "number_format": styleable.number_format,
+        "protection": workbook_digest_serialisable(styleable.protection),
+    }
+
+
+def workbook_digest_hyperlink_payload(
+    hyperlink: Any,
+    *,
+    sheet_name: str,
+    coordinate: str,
+) -> dict[str, Any] | None:
+    if hyperlink is None:
+        return None
+    target = hyperlink.target
+    if target and not str(target).strip().startswith("#"):
+        raise IntegrityError(
+            "External hyperlinks are not allowed in the protected master workbook: "
+            f"{sheet_name}!{coordinate}."
+        )
+    return {
+        "target": target,
+        "location": hyperlink.location,
+        "tooltip": hyperlink.tooltip,
+        "display": hyperlink.display,
+    }
+
+
+def workbook_digest_comment_payload(comment: Any) -> dict[str, Any] | None:
+    if comment is None:
+        return None
+    return {
+        "text": comment.text,
+        "author": comment.author,
+        "height": comment.height,
+        "width": comment.width,
+    }
+
+
+def workbook_digest_editable_scalar(value: Any, *, sheet_name: str, coordinate: str) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise IntegrityError(
+            f"Editable workbook value is not finite at {sheet_name}!{coordinate}."
+        )
+    if value is None or isinstance(
+        value,
+        (str, int, float, bool, datetime, date, time, timedelta),
+    ):
+        return
+    raise IntegrityError(
+        "Only scalar values are allowed in editable workbook cells: "
+        f"{sheet_name}!{coordinate}."
+    )
+
+
+def workbook_digest_dimension_payload(dimension: Any) -> dict[str, Any]:
+    payload = {
+        "hidden": bool(dimension.hidden),
+        "outline_level": dimension.outlineLevel,
+        "collapsed": bool(dimension.collapsed),
+        "style": (
+            workbook_digest_style_payload(dimension)
+            if dimension.has_style
+            else None
+        ),
+    }
+    for attribute in (
+        "min", "max", "width", "bestFit", "height", "thickTop", "thickBot",
+    ):
+        if hasattr(dimension, attribute):
+            payload[attribute] = getattr(dimension, attribute)
+    return payload
+
+
+def workbook_digest_sheet_view_payload(ws: Any) -> dict[str, Any]:
+    view = ws.sheet_view
+    fields = (
+        "windowProtection", "showFormulas", "showGridLines", "showRowColHeaders",
+        "showZeros", "rightToLeft", "showRuler", "showOutlineSymbols",
+        "defaultGridColor", "showWhiteSpace", "view", "colorId", "zoomScale",
+        "zoomScaleNormal", "zoomScaleSheetLayoutView", "zoomScalePageLayoutView",
+        "zoomToFit",
+    )
+    freeze_panes = ws.freeze_panes
+    if hasattr(freeze_panes, "coordinate"):
+        freeze_panes = freeze_panes.coordinate
+    pane = view.pane
+    return {
+        "settings": {field: getattr(view, field) for field in fields},
+        "freeze_panes": freeze_panes,
+        "pane": (
+            {
+                "x_split": pane.xSplit,
+                "y_split": pane.ySplit,
+                "top_left_cell": pane.topLeftCell,
+                "active_pane": pane.activePane,
+                "state": pane.state,
+            }
+            if pane is not None
+            else None
+        ),
+    }
+
+
+def workbook_digest_chart_payload(chart: Any) -> dict[str, Any]:
+    plots = getattr(chart, "_charts", [chart])
+    axes = getattr(chart, "_axes", {})
+    return {
+        "type": type(chart).__name__,
+        "plots": [
+            {
+                "type": type(plot).__name__,
+                "definition": workbook_digest_serialisable(plot),
+            }
+            for plot in plots
+        ],
+        "title": workbook_digest_serialisable(getattr(chart, "title", None)),
+        "legend": workbook_digest_serialisable(getattr(chart, "legend", None)),
+        "layout": workbook_digest_serialisable(getattr(chart, "layout", None)),
+        "graphical_properties": workbook_digest_serialisable(
+            getattr(chart, "graphical_properties", None)
+        ),
+        "axes": [
+            {
+                "id": axis_id,
+                "definition": workbook_digest_serialisable(axis),
+            }
+            for axis_id, axis in axes.items()
+        ],
+        "style": getattr(chart, "style", None),
+        "rounded_corners": getattr(chart, "roundedCorners", None),
+        "display_blanks": getattr(chart, "display_blanks", None),
+        "visible_cells_only": getattr(chart, "visible_cells_only", None),
+        "index_base": getattr(chart, "idx_base", None),
+        "pivot_source": workbook_digest_serialisable(
+            getattr(chart, "pivotSource", None)
+        ),
+        "pivot_formats": [
+            workbook_digest_serialisable(pivot_format)
+            for pivot_format in (getattr(chart, "pivotFormats", None) or [])
+        ],
+        "anchor": (
+            workbook_digest_serialisable(chart.anchor)
+            if hasattr(chart.anchor, "to_tree")
+            else str(chart.anchor)
+        ),
+    }
+
+
+def workbook_digest_excluded_cells(wb: Workbook) -> set[tuple[str, str]]:
+    """Exclude only the self-referential digest value, never a user input."""
+    excluded: set[tuple[str, str]] = set()
+    if "Run Notes" not in wb.sheetnames:
+        return excluded
+    ws = wb["Run Notes"]
+    for row in range(1, ws.max_row + 1):
+        if ws.cell(row=row, column=1).value == RUN_NOTES_DIGEST_LABEL:
+            excluded.add((ws.title, ws.cell(row=row, column=2).coordinate))
+    return excluded
+
+
+def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
+    approved: set[tuple[str, str]] = set()
+    if "Management Setup" in wb.sheetnames:
+        ws = wb["Management Setup"]
+        target_header_row = find_sheet_header_row(ws, "Entity")
+        if target_header_row:
+            headers = {
+                ws.cell(row=target_header_row, column=col).value: col
+                for col in range(1, ws.max_column + 1)
+                if ws.cell(row=target_header_row, column=col).value
+            }
+            target_columns = [headers[label] for _, label in TARGET_FIELDS if label in headers]
+            row = target_header_row + 1
+            while row <= ws.max_row and not is_blank(ws.cell(row=row, column=headers["Entity"]).value):
+                for col in target_columns:
+                    approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+                row += 1
+        if OWNER_ROSTER_TABLE_NAME in ws.tables:
+            min_col, min_row, max_col, max_row = range_boundaries(
+                ws.tables[OWNER_ROSTER_TABLE_NAME].ref
+            )
+            for row in range(min_row + 1, max_row + 1):
+                for col in range(min_col, max_col + 1):
+                    approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+        else:
+            for row in range(6, 26):
+                approved.add((ws.title, f"J{row}"))
+    if "Action Board" in wb.sheetnames:
+        ws = wb["Action Board"]
+        header_row = find_sheet_header_row(ws, "Action ID")
+        if header_row:
+            headers = {
+                ws.cell(row=header_row, column=col).value: col
+                for col in range(1, ws.max_column + 1)
+                if ws.cell(row=header_row, column=col).value
+            }
+            for header in ("Status", "Owner", "Due Date", "Manager Notes"):
+                col = headers.get(header)
+                if col is None:
+                    continue
+                for row in range(header_row + 1, ws.max_row + 1):
+                    approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+    return approved
+
+
+def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
+    """Build a stable semantic view that excludes only approved scalar values."""
+    try:
+        wb = load_workbook(path, data_only=False, read_only=False)
+    except Exception as exc:
+        raise IntegrityError(f"Could not inspect master workbook integrity at {path}: {exc}") from exc
+    try:
+        approved = approved_management_input_cells(wb)
+        digest_cells = workbook_digest_excluded_cells(wb)
+        sheets: list[dict[str, Any]] = []
+        for ws in wb.worksheets:
+            cells: list[dict[str, Any]] = []
+            for cell in sorted(ws._cells.values(), key=lambda item: (item.row, item.column)):
+                key = (ws.title, cell.coordinate)
+                is_approved = key in approved
+                is_digest_cell = key in digest_cells
+                hyperlink = workbook_digest_hyperlink_payload(
+                    cell.hyperlink,
+                    sheet_name=ws.title,
+                    coordinate=cell.coordinate,
+                )
+                comment = workbook_digest_comment_payload(cell.comment)
+                if (
+                    cell.value is None
+                    and not cell.has_style
+                    and hyperlink is None
+                    and comment is None
+                    and not is_approved
+                    and not is_digest_cell
+                ):
+                    continue
+                if is_approved or is_digest_cell:
+                    if cell.data_type == "f":
+                        raise IntegrityError(
+                            "Formulas are not allowed in editable or digest-excluded cells: "
+                            f"{ws.title}!{cell.coordinate}."
+                        )
+                    workbook_digest_editable_scalar(
+                        cell.value,
+                        sheet_name=ws.title,
+                        coordinate=cell.coordinate,
+                    )
+                    value_payload: Any = {
+                        "excluded": (
+                            "approved-management-scalar"
+                            if is_approved
+                            else "self-referential-digest"
+                        )
+                    }
+                    data_type = "excluded-scalar"
+                else:
+                    value_payload = workbook_digest_value(cell.value)
+                    data_type = cell.data_type
+                cells.append(
+                    {
+                        "coordinate": cell.coordinate,
+                        "data_type": data_type,
+                        "value": value_payload,
+                        "style_name": getattr(cell, "style", None),
+                        "style": workbook_digest_style_payload(cell),
+                        "quote_prefix": bool(getattr(cell, "quotePrefix", False)),
+                        "pivot_button": bool(getattr(cell, "pivotButton", False)),
+                        "hyperlink": hyperlink,
+                        "comment": comment,
+                    }
+                )
+            tables: list[dict[str, Any]] = []
+            for table in ws.tables.values():
+                tables.append(
+                    {
+                        "name": table.name,
+                        "definition": workbook_digest_serialisable(table),
+                    }
+                )
+            validations = [
+                workbook_digest_serialisable(validation)
+                for validation in ws.data_validations.dataValidation
+            ]
+            conditional_formats = []
+            for conditional_format in ws.conditional_formatting:
+                conditional_formats.append(
+                    {
+                        "definition": workbook_digest_serialisable(conditional_format),
+                        "differential_styles": [
+                            workbook_digest_serialisable(rule.dxf)
+                            for rule in conditional_format.rules
+                        ],
+                    }
+                )
+            charts = [workbook_digest_chart_payload(chart) for chart in ws._charts]
+            unlocked_cells = sorted(
+                cell.coordinate
+                for cell in ws._cells.values()
+                if cell.protection.locked is False
+            )
+            sheets.append(
+                {
+                    "name": ws.title,
+                    "state": ws.sheet_state,
+                    "cells": cells,
+                    "tables": sorted(tables, key=lambda item: item["name"].casefold()),
+                    "data_validations": validations,
+                    "conditional_formats": conditional_formats,
+                    "charts": charts,
+                    "merged_cells": sorted(str(cell_range) for cell_range in ws.merged_cells.ranges),
+                    "row_dimensions": [
+                        {
+                            "index": index,
+                            **workbook_digest_dimension_payload(dimension),
+                        }
+                        for index, dimension in sorted(ws.row_dimensions.items())
+                    ],
+                    "column_dimensions": [
+                        {
+                            "index": index,
+                            **workbook_digest_dimension_payload(dimension),
+                        }
+                        for index, dimension in sorted(ws.column_dimensions.items())
+                    ],
+                    "sheet_properties": workbook_digest_serialisable(ws.sheet_properties),
+                    "sheet_format": workbook_digest_serialisable(ws.sheet_format),
+                    "sheet_view": workbook_digest_sheet_view_payload(ws),
+                    "auto_filter": workbook_digest_serialisable(ws.auto_filter),
+                    "page_margins": workbook_digest_serialisable(ws.page_margins),
+                    "page_setup": workbook_digest_serialisable(ws.page_setup),
+                    "print_options": workbook_digest_serialisable(ws.print_options),
+                    "header_footer": workbook_digest_serialisable(ws.HeaderFooter),
+                    "row_breaks": workbook_digest_serialisable(ws.row_breaks),
+                    "column_breaks": workbook_digest_serialisable(ws.col_breaks),
+                    "unlocked_cells": unlocked_cells,
+                    "protection": workbook_digest_serialisable(ws.protection),
+                }
+            )
+        defined_names = [
+            {
+                "name": name,
+                "definition": workbook_digest_serialisable(defined_name),
+            }
+            for name, defined_name in sorted(
+                wb.defined_names.items(), key=lambda item: item[0].casefold()
+            )
+        ]
+        return {
+            "sheet_order": list(wb.sheetnames),
+            "workbook_protection": workbook_digest_serialisable(wb.security),
+            "calculation": workbook_digest_serialisable(wb.calculation),
+            "defined_names": defined_names,
+            "sheets": sheets,
+        }
+    finally:
+        wb.close()
+
+
+def workbook_generated_content_sha256(path: Path) -> str:
+    return canonical_json_sha256(workbook_generated_content_payload(path))
+
+
+def stamped_workbook_digest(wb: Workbook) -> str | None:
+    if "Run Notes" not in wb.sheetnames:
+        return None
+    ws = wb["Run Notes"]
+    for row in range(1, ws.max_row + 1):
+        if ws.cell(row=row, column=1).value == RUN_NOTES_DIGEST_LABEL:
+            value = ws.cell(row=row, column=2).value
+            return str(value).strip().lower() if value else None
+    return None
+
+
+def stamp_generated_content_digest(path: Path) -> str:
+    digest = workbook_generated_content_sha256(path)
+    wb = load_workbook(path, data_only=False)
+    try:
+        if "Run Notes" not in wb.sheetnames:
+            raise IntegrityError("Generated master workbook is missing Run Notes.")
+        ws = wb["Run Notes"]
+        digest_row = next(
+            (
+                row
+                for row in range(1, ws.max_row + 1)
+                if ws.cell(row=row, column=1).value == RUN_NOTES_DIGEST_LABEL
+            ),
+            None,
+        )
+        if digest_row is None:
+            raise IntegrityError("Run Notes is missing the generated-content digest field.")
+        ws.cell(row=digest_row, column=2, value=digest)
+        wb.save(path)
+    finally:
+        wb.close()
+    if workbook_generated_content_sha256(path) != digest:
+        raise IntegrityError("Generated master workbook digest was not stable after save/reload.")
+    return digest
+
+
+def validate_management_workbook(path: Path, expected_digest: str | None = None) -> str:
+    """Validate protection, visibility, editable cells, tables, and digest."""
+    wb = load_workbook(path, data_only=False)
+    try:
+        missing = [name for name in VISIBLE_MANAGEMENT_SHEETS if name not in wb.sheetnames]
+        if missing:
+            raise IntegrityError(
+                f"Generated master workbook is missing required sheets: {', '.join(missing)}"
+            )
+        if wb.security is None or not wb.security.lockStructure:
+            raise IntegrityError("Generated master workbook structure protection is missing.")
+        if not wb.security.workbookPassword:
+            raise IntegrityError("Generated master workbook structure password is missing.")
+        if (
+            wb.calculation.calcMode != "auto"
+            or wb.calculation.fullCalcOnLoad is not True
+            or wb.calculation.forceFullCalc is not True
+        ):
+            raise IntegrityError(
+                "Generated master workbook automatic/full recalculation controls are missing."
+            )
+        approved = approved_management_input_cells(wb)
+        actual_unlocked = {
+            (ws.title, cell.coordinate)
+            for ws in wb.worksheets
+            for cell in ws._cells.values()
+            if cell.protection.locked is False
+        }
+        if actual_unlocked != approved:
+            unexpected = sorted(actual_unlocked - approved)
+            missing_unlocked = sorted(approved - actual_unlocked)
+            detail = unexpected[:1] or missing_unlocked[:1]
+            raise IntegrityError(
+                "Generated master workbook editable-cell protection does not match the "
+                f"approved allowlist ({detail[0] if detail else 'unknown mismatch'})."
+            )
+        for ws in wb.worksheets:
+            expected_state = "visible" if ws.title in VISIBLE_MANAGEMENT_SHEETS else "veryHidden"
+            if ws.sheet_state != expected_state:
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} has state {ws.sheet_state!r}; "
+                    f"expected {expected_state!r}."
+                )
+            if not ws.protection.sheet or not ws.protection.password:
+                raise IntegrityError(f"Worksheet {ws.title!r} is not password-protected.")
+        setup = wb["Management Setup"]
+        if "ManagementTargets" not in setup.tables or OWNER_ROSTER_TABLE_NAME not in setup.tables:
+            raise IntegrityError("Management Setup is missing a required protected input table.")
+        if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
+            raise IntegrityError("The active-owner workbook name is missing.")
+        owner_validations = {
+            validation.formula1
+            for validation in wb["Action Board"].data_validations.dataValidation
+            if validation.type == "list"
+        }
+        if wb["Action Board"].max_row > 4 and f"={OWNER_ROSTER_DEFINED_NAME}" not in owner_validations:
+            raise IntegrityError("The Action Board owner validation is missing.")
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    actual_digest = workbook_generated_content_sha256(path)
+    required_digest = expected_digest or stamped
+    if not required_digest or actual_digest != required_digest.lower():
+        raise IntegrityError(
+            "Master workbook generated-content verification failed: "
+            f"expected {required_digest or 'a stamped digest'}; actual {actual_digest}. "
+            "No outputs were replaced and no active source files were moved."
+        )
+    return actual_digest
+
+
+def verify_existing_management_workbook_integrity(path: Path) -> str | None:
+    """Verify new-schema workbooks while allowing one-way migration from legacy files."""
+    if not path.exists():
+        return None
+    wb = load_workbook(path, data_only=False)
+    try:
+        is_new_schema = (
+            "Management Setup" in wb.sheetnames
+            and OWNER_ROSTER_TABLE_NAME in wb["Management Setup"].tables
+        )
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    if not is_new_schema and stamped is None:
+        return None
+    if stamped is None:
+        raise IntegrityError(
+            "The existing master workbook uses the protected owner-roster schema but its "
+            "generated-content digest is missing. Restore an earlier Dropbox version or "
+            "approved archive copy; no outputs were created and no source files were moved."
+        )
+    return validate_management_workbook(path, stamped)
 
 
 def action_episode_id(entity_key: str, first_seen: date) -> str:
@@ -4347,6 +5721,46 @@ def merge_management_actions(
     return current, history_rows
 
 
+def inactive_owner_assignments(
+    current_actions: Iterable[dict[str, Any]],
+    roster: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """Keep prior assignments visible while flagging owners unavailable for new work."""
+    normalized = normalize_owner_roster(roster)
+    active = {
+        row["Owner Name"].casefold()
+        for row in normalized
+        if row["Active"] == "Yes"
+    }
+    known = {row["Owner Name"].casefold(): row["Active"] for row in normalized}
+    warnings: list[dict[str, Any]] = []
+    for action in current_actions:
+        status = str(action.get("Status") or "Open").strip().casefold()
+        owner = str(action.get("Owner") or "").strip()
+        if not owner or status in {"complete", "dismissed"} or owner.casefold() in active:
+            continue
+        warnings.append(
+            {
+                "Owner": owner,
+                "Action ID": action.get("Action ID"),
+                "Location": action.get("Location"),
+                "Person / Area": action.get("Person / Area"),
+                "Status": action.get("Status") or "Open",
+                "Reason": (
+                    "Inactive"
+                    if known.get(owner.casefold()) == "No"
+                    else "Not on roster"
+                ),
+            }
+        )
+    return sorted(
+        warnings,
+        key=lambda row: (
+            str(row["Reason"]), str(row["Owner"]), str(row.get("Action ID") or "")
+        ),
+    )
+
+
 def remove_sheet_if_present(wb: Workbook, name: str) -> None:
     if name in wb.sheetnames:
         wb.remove(wb[name])
@@ -4382,17 +5796,36 @@ def style_management_title(ws, title: str, end_col: int) -> None:
 def write_management_setup_sheet(
     wb: Workbook,
     targets: dict[str, dict[str, float | None]],
-    owners: list[str],
+    owners: list[Any],
     config: dict[str, Any],
+    roster_capacity: int | None = None,
 ) -> None:
+    roster = normalize_owner_roster(owners)
+    active_names = active_owner_names(roster)
     remove_sheet_if_present(wb, "Management Setup")
     ws = wb.create_sheet("Management Setup")
-    style_management_title(ws, "Management Setup", 10)
+    style_management_title(ws, "Management Setup", 7)
     ws.merge_cells("A3:G3")
-    ws["A3"] = "Blue cells are management inputs. Changes are preserved and applied on the next weekly run. Blank targets use the rolling four-full-week baseline."
+    ws["A3"] = (
+        "Blue cells are the only management inputs. The designated custodian maintains targets "
+        "and the owner roster; managers update task fields on the Action Board. Changes are "
+        "preserved on the next weekly run."
+    )
     ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
     ws["A3"].fill = PatternFill("solid", fgColor="D9EAF7")
-    ws.row_dimensions[3].height = 34
+    ws.row_dimensions[3].height = 46
+    ws.merge_cells("A4:G4")
+    ws["A4"] = (
+        f"{len(active_names)} active owner{'s' if len(active_names) != 1 else ''} available "
+        "for new assignments."
+        if active_names
+        else "ATTENTION: No active owners are configured. Add names in the Owner Roster below."
+    )
+    ws["A4"].fill = PatternFill(
+        "solid", fgColor="D9EAD3" if active_names else "FFF2CC"
+    )
+    ws["A4"].font = Font(bold=True, color="274E13" if active_names else "7F6000")
+    ws["A4"].alignment = Alignment(wrap_text=True, vertical="center")
 
     headers = ["Entity", *[label for _, label in TARGET_FIELDS]]
     for col, header in enumerate(headers, start=1):
@@ -4410,6 +5843,7 @@ def write_management_setup_sheet(
             cell = ws.cell(row=row_index, column=col, value=value)
             cell.fill = PatternFill("solid", fgColor="D9EAF7")
             cell.alignment = Alignment(horizontal="right")
+            cell.protection = Protection(locked=False)
     for row in range(6, 6 + len(entities)):
         ws.cell(row=row, column=2).number_format = "$#,##0"
         ws.cell(row=row, column=3).number_format = "#,##0"
@@ -4423,14 +5857,6 @@ def write_management_setup_sheet(
         showRowStripes=True, showColumnStripes=False
     )
     ws.add_table(table)
-
-    ws["J5"] = "Owner List"
-    ws["J5"].fill = PatternFill("solid", fgColor="D9E1F2")
-    ws["J5"].font = Font(bold=True)
-    for row in range(6, 26):
-        owner = owners[row - 6] if row - 6 < len(owners) else None
-        ws.cell(row=row, column=10, value=excel_safe_text(owner))
-        ws.cell(row=row, column=10).fill = PatternFill("solid", fgColor="D9EAF7")
 
     threshold_headers = ["Metric", "Neutral Band", "Strong Band", "Better Direction", "Use"]
     for col, header in enumerate(threshold_headers, start=1):
@@ -4464,10 +5890,110 @@ def write_management_setup_sheet(
             ws.cell(row=row, column=2).number_format = "0.000" if field != "average_ticket_time_seconds" else "0.0"
             ws.cell(row=row, column=3).number_format = "0.000" if field != "average_ticket_time_seconds" else "0.0"
 
-    widths = {"A": 22, "B": 18, "C": 18, "D": 22, "E": 18, "F": 16, "G": 22, "J": 24}
+    roster_title_row = 18
+    roster_header_row = 20
+    style_section_header(ws, roster_title_row, 1, 2, "Owner Roster")
+    ws.merge_cells(start_row=19, start_column=1, end_row=19, end_column=7)
+    ws.cell(
+        row=19,
+        column=1,
+        value=(
+            "Add one person per row and use Yes/No to control new assignments. Mark departing "
+            "people No instead of deleting them so existing and historical assignments remain clear."
+        ),
+    )
+    ws.cell(row=19, column=1).alignment = Alignment(wrap_text=True, vertical="center")
+    ws.cell(row=19, column=1).fill = PatternFill("solid", fgColor="F3F4F6")
+    ws.row_dimensions[19].height = 34
+    for col, header in enumerate(OWNER_ROSTER_HEADERS, start=1):
+        cell = ws.cell(row=roster_header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    roster_data_rows = max(
+        OWNER_ROSTER_MIN_EDIT_ROWS,
+        len(roster) + OWNER_ROSTER_SPARE_ROWS,
+        int(roster_capacity or 0),
+    )
+    roster_data_rows = min(OWNER_ROSTER_MAX_ROWS, roster_data_rows)
+    roster_last_row = roster_header_row + roster_data_rows
+    for offset in range(roster_data_rows):
+        row_index = roster_header_row + 1 + offset
+        entry = roster[offset] if offset < len(roster) else None
+        name_cell = ws.cell(
+            row=row_index,
+            column=1,
+            value=excel_safe_text(entry["Owner Name"]) if entry else None,
+        )
+        active_cell = ws.cell(
+            row=row_index,
+            column=2,
+            value=entry["Active"] if entry else None,
+        )
+        for cell in (name_cell, active_cell):
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.protection = Protection(locked=False)
+        active_cell.alignment = Alignment(horizontal="center")
+
+    roster_table = Table(
+        displayName=OWNER_ROSTER_TABLE_NAME,
+        ref=f"A{roster_header_row}:B{roster_last_row}",
+    )
+    roster_table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(roster_table)
+    active_validation = DataValidation(type="list", formula1='"Yes,No"', allow_blank=True)
+    ws.add_data_validation(active_validation)
+    active_validation.add(f"B{roster_header_row + 1}:B{roster_last_row}")
+
+    widths = {"A": 30, "B": 18, "C": 18, "D": 22, "E": 30, "F": 16, "G": 22}
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
+
+
+def write_owner_validation_sheet(
+    wb: Workbook,
+    owners: list[Any],
+    roster_capacity: int | None = None,
+) -> None:
+    roster = normalize_owner_roster(owners)
+    capacity = min(
+        OWNER_ROSTER_MAX_ROWS,
+        max(
+            OWNER_ROSTER_MIN_EDIT_ROWS,
+            len(roster) + OWNER_ROSTER_SPARE_ROWS,
+            int(roster_capacity or 0),
+        ),
+    )
+    remove_sheet_if_present(wb, OWNER_VALIDATION_SHEET)
+    ws = wb.create_sheet(OWNER_VALIDATION_SHEET)
+    ws["A1"] = "Active Owners"
+    for offset in range(capacity):
+        setup_row = 21 + offset
+        ws.cell(
+            row=2 + offset,
+            column=1,
+            value=(
+                f'=IF(\'Management Setup\'!$B${setup_row}="Yes",'
+                f'\'Management Setup\'!$A${setup_row},"")'
+            ),
+        )
+    end_row = capacity + 1
+    wb.defined_names.pop(OWNER_ROSTER_DEFINED_NAME, None)
+    wb.defined_names.add(
+        DefinedName(
+            OWNER_ROSTER_DEFINED_NAME,
+            attr_text=f"'{OWNER_VALIDATION_SHEET}'!$A$2:$A${end_row}",
+        )
+    )
+    ws.sheet_state = "veryHidden"
 
 
 def action_row_values(row: dict[str, Any]) -> list[Any]:
@@ -4547,17 +6073,29 @@ def write_action_tracking_sheet(
         if editable:
             for row in range(first, last + 1):
                 for col in (4, 5, 6, 14):
-                    ws.cell(row=row, column=col).fill = blue_fill
+                    cell = ws.cell(row=row, column=col)
+                    cell.fill = blue_fill
+                    cell.protection = Protection(locked=False)
             status_validation = DataValidation(
                 type="list", formula1='"Open,In Progress,Blocked,Complete,Dismissed"', allow_blank=False
             )
             owner_validation = DataValidation(
-                type="list", formula1="'Management Setup'!$J$6:$J$25", allow_blank=True
+                type="list", formula1=f"={OWNER_ROSTER_DEFINED_NAME}", allow_blank=True
             )
             ws.add_data_validation(status_validation)
             ws.add_data_validation(owner_validation)
             status_validation.add(f"D{first}:D{last}")
             owner_validation.add(f"E{first}:E{last}")
+            ws.conditional_formatting.add(
+                f"E{first}:E{last}",
+                FormulaRule(
+                    formula=[
+                        f'AND($E{first}<>"",COUNTIF({OWNER_ROSTER_DEFINED_NAME},$E{first})=0,'
+                        f'$D{first}<>"Complete",$D{first}<>"Dismissed")'
+                    ],
+                    fill=amber_fill,
+                ),
+            )
 
 
 def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
@@ -4832,6 +6370,7 @@ def write_management_data_quality_sheet(
     weekly_location_rows: list[dict[str, Any]],
     config: dict[str, Any],
     readiness: LatestWeekReadiness | None = None,
+    owner_warnings: list[dict[str, Any]] | None = None,
 ) -> None:
     remove_sheet_if_present(wb, "Data Quality")
     ws = wb.create_sheet("Data Quality")
@@ -4905,6 +6444,47 @@ def write_management_data_quality_sheet(
         for col, value in enumerate(values, start=1):
             ws.cell(row=row_index, column=col, value=value)
         ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
+    warning_start = max(14, 13 + len(historical))
+    ws.merge_cells(
+        start_row=warning_start,
+        start_column=1,
+        end_row=warning_start,
+        end_column=6,
+    )
+    ws.cell(row=warning_start, column=1, value="Owner Assignment Review")
+    ws.cell(row=warning_start, column=1).font = Font(bold=True)
+    ws.cell(row=warning_start, column=1).fill = PatternFill("solid", fgColor="FFF2CC")
+    warning_headers = [
+        "Owner", "Action ID", "Location", "Person / Area", "Status", "Reason"
+    ]
+    for col, header in enumerate(warning_headers, start=1):
+        cell = ws.cell(row=warning_start + 1, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="F3F4F6")
+        cell.font = Font(bold=True)
+    warnings = owner_warnings or []
+    if not warnings:
+        ws.merge_cells(
+            start_row=warning_start + 2,
+            start_column=1,
+            end_row=warning_start + 2,
+            end_column=6,
+        )
+        ws.cell(
+            row=warning_start + 2,
+            column=1,
+            value="No open actions are assigned to inactive or unlisted owners.",
+        )
+    else:
+        for row_index, warning in enumerate(warnings, start=warning_start + 2):
+            for col, header in enumerate(warning_headers, start=1):
+                ws.cell(
+                    row=row_index,
+                    column=col,
+                    value=excel_safe_text(warning.get(header)),
+                )
+            ws.cell(row=row_index, column=6).fill = PatternFill(
+                "solid", fgColor="FFF2CC"
+            )
     for column, width in {"A": 16, "B": 22, "C": 14, "D": 14, "E": 16, "F": 24}.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
@@ -4939,7 +6519,7 @@ def write_management_chart_data(
     for row_index, row in enumerate(group_rows, start=2):
         ws.cell(row=row_index, column=6, value=row["week_end"].strftime("%m/%d"))
         ws.cell(row=row_index, column=7, value=row["guest_count"])
-    ws.sheet_state = "hidden"
+    ws.sheet_state = "veryHidden"
     return len(week_ends), len(group_rows)
 
 
@@ -5424,8 +7004,20 @@ def write_management_run_notes(
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 96
     report_audit = config.get("_report_audit", {})
+    integrity = config.get("_integrity", {})
+    provenance = integrity.get("provenance", {})
+    git_provenance = provenance.get("git", {})
+    config_provenance = provenance.get("config", {})
+    requirements_provenance = provenance.get("requirements", {})
     note_rows = [
         ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Run ID", integrity.get("run_id", "Standalone workbook generation")),
+        ("Generator Commit", git_provenance.get("commit", "Not available")),
+        ("Config SHA-256", config_provenance.get("sha256", integrity.get("effective_config_sha256", "Not available"))),
+        ("Requirements SHA-256", requirements_provenance.get("sha256", "Not available")),
+        ("Previous Manifest SHA-256", integrity.get("previous_manifest_sha256", "Integrity baseline or standalone generation")),
+        ("Digest Scheme", WORKBOOK_DIGEST_SCHEME),
+        (RUN_NOTES_DIGEST_LABEL, "Pending save/reload validation"),
         ("Source Folder", str(source_dir)),
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed."),
         ("Raw Reports Read", len({record.source_file for record in records})),
@@ -5452,13 +7044,29 @@ def write_management_run_notes(
         ws.row_dimensions[row].height = 45 if label == "8-Week Direction" else 30
 
 
+def protect_worksheet(ws, password: str) -> None:
+    """Enable an accidental-edit boundary while keeping review controls usable."""
+    ws.protection.set_password(password)
+    ws.protection.sheet = True
+    ws.protection.autoFilter = False
+    ws.protection.sort = False
+    ws.protection.selectLockedCells = False
+    ws.protection.selectUnlockedCells = False
+
+
 def finalize_management_workbook(wb: Workbook) -> None:
+    # Excel's legacy worksheet/workbook protection password format accepts at
+    # most 15 characters. Longer values are written by openpyxl but Excel
+    # silently drops their hashes on save, so keep the random recovery token
+    # comfortably inside that compatibility limit.
+    protection_password = secrets.token_hex(6)
     for sheet in wb.worksheets:
         if sheet.title in VISIBLE_MANAGEMENT_SHEETS:
             sheet.sheet_state = "visible"
             add_management_navigation(sheet)
         else:
-            sheet.sheet_state = "hidden"
+            sheet.sheet_state = "veryHidden"
+        protect_worksheet(sheet, protection_password)
     ordered = [wb[name] for name in VISIBLE_MANAGEMENT_SHEETS if name in wb.sheetnames]
     ordered.extend(sheet for sheet in wb.worksheets if sheet.title not in VISIBLE_MANAGEMENT_SHEETS)
     wb._sheets = ordered
@@ -5472,6 +7080,8 @@ def finalize_management_workbook(wb: Workbook) -> None:
     for name, color in tab_colors.items():
         if name in wb.sheetnames:
             wb[name].sheet_properties.tabColor = color
+    wb.security = WorkbookProtection(lockStructure=True, lockWindows=False)
+    wb.security.set_workbook_password(protection_password)
 
 
 def write_master_workbook(
@@ -5512,6 +7122,9 @@ def write_master_workbook(
             server_rows, store_rows, group_rows, weekly_location_rows, readiness
         )
         current_actions, action_history = merge_management_actions(signals, state, readiness)
+        owner_warnings = inactive_owner_assignments(
+            current_actions, state["owner_roster"]
+        )
         visible_server_rows = server_rows if readiness.ready else []
 
         if "Data Quality" in wb.sheetnames:
@@ -5522,7 +7135,18 @@ def write_master_workbook(
             "Server Scorecard", "Store & Group Scorecards", "Action History", "Management Setup",
         ):
             remove_sheet_if_present(wb, name)
-        write_management_setup_sheet(wb, state["targets"], state["owners"], config)
+        write_management_setup_sheet(
+            wb,
+            state["targets"],
+            state["owner_roster"],
+            config,
+            state["owner_roster_capacity"],
+        )
+        write_owner_validation_sheet(
+            wb,
+            state["owner_roster"],
+            state["owner_roster_capacity"],
+        )
         write_action_tracking_sheet(wb, "Action Board", current_actions, editable=True)
         write_server_scorecard_sheet(wb, visible_server_rows)
         write_store_group_scorecards_sheet(
@@ -5535,7 +7159,9 @@ def write_master_workbook(
         )
         write_rising_falling_sheet(wb, visible_server_rows)
         write_action_tracking_sheet(wb, "Action History", action_history, editable=False)
-        write_management_data_quality_sheet(wb, weekly_location_rows, config, readiness)
+        write_management_data_quality_sheet(
+            wb, weekly_location_rows, config, readiness, owner_warnings
+        )
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
             wb, records, weekly_location_rows, weekly_group_rows, visible_server_rows,
@@ -5548,11 +7174,8 @@ def write_master_workbook(
         wb.save(temp_path)
         wb.close()
         wb = None
-        validation = load_workbook(temp_path, read_only=True, data_only=False)
-        missing = [name for name in VISIBLE_MANAGEMENT_SHEETS if name not in validation.sheetnames]
-        validation.close()
-        if missing:
-            raise RuntimeError(f"Generated master workbook is missing required sheets: {', '.join(missing)}")
+        digest = stamp_generated_content_digest(temp_path)
+        validate_management_workbook(temp_path, digest)
         os.replace(temp_path, output_path)
     except PermissionError as exc:
         raise RuntimeError(
@@ -5567,7 +7190,750 @@ def write_master_workbook(
     return output_path
 
 
+def integrity_manifest_dir(archive_dir: Path) -> Path:
+    return managed_subdirectory(
+        archive_dir,
+        INTEGRITY_MANIFEST_FOLDER,
+        purpose="integrity manifest",
+        create=False,
+    )
+
+
+@contextmanager
+def workflow_run_lock(archive_dir: Path) -> Iterable[Path]:
+    """Hold one OS-enforced, nonblocking lock for the complete workflow run."""
+
+    archive_dir = archive_dir.resolve()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    root = managed_subdirectory(
+        archive_dir,
+        INTEGRITY_MANIFEST_FOLDER,
+        purpose="integrity manifest",
+        create=True,
+    )
+    lock_path = root / ".weekly-snapshot.lock"
+    if os.path.lexists(lock_path) and path_is_link_or_reparse(lock_path):
+        raise IntegrityError(
+            "The workflow lock is a link or reparse point. Restore the normal lock file "
+            "inside 03 Archive\\run-manifests before rerunning."
+        )
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise IntegrityError(
+                "Another weekly snapshot or integrity operation is already running. "
+                "Let it finish before launching again."
+            ) from exc
+        acquired = True
+        yield lock_path
+    finally:
+        if acquired:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def generated_workbook_archive_dir(archive_dir: Path) -> Path:
+    return managed_subdirectory(
+        archive_dir,
+        GENERATED_WORKBOOK_ARCHIVE_FOLDER,
+        purpose="generated-workbook archive",
+        create=False,
+    )
+
+
+def inventory_dicts(items: Iterable[FileFingerprint]) -> list[dict[str, Any]]:
+    return [item.to_dict() for item in items]
+
+
+def manifest_inventory(payload: dict[str, Any], field: str) -> tuple[FileFingerprint, ...]:
+    values = payload.get(field)
+    if not isinstance(values, list):
+        raise IntegrityError(f"Integrity manifest is missing the {field!r} inventory.")
+    try:
+        return tuple(FileFingerprint.from_mapping(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise IntegrityError(f"Integrity manifest has an invalid {field!r} inventory: {exc}") from exc
+
+
+def latest_integrity_manifest_path(archive_dir: Path) -> Path | None:
+    root = integrity_manifest_dir(archive_dir)
+    if not root.exists():
+        return None
+    manifests = sorted(
+        (
+            path
+            for path in root.glob("*.json")
+            if path.is_file() and not path.name.startswith(".")
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    return manifests[-1] if manifests else None
+
+
+def managed_published_output_paths(output_dir: Path) -> list[Path]:
+    if not output_dir.exists():
+        return []
+    paths: list[Path] = []
+    for path in output_dir.glob("*.xlsx"):
+        if path.name == "Red_Onion_Server_Master.xlsx" or path.name.startswith((".", "~$")):
+            continue
+        paths.append(
+            managed_direct_child(
+                output_dir,
+                path,
+                purpose="published workbook",
+                require_file=True,
+            )
+        )
+    return sorted(paths, key=lambda path: path.name.casefold())
+
+
+def effective_config_sha256(config: dict[str, Any]) -> str:
+    return canonical_json_sha256(
+        {key: value for key, value in config.items() if not str(key).startswith("_")}
+    )
+
+
+def workflow_provenance(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
+    repository_root = REPOSITORY_ROOT.resolve()
+    requirements_path = PROGRAM_DIR / "requirements.txt"
+    config_for_provenance: Path | None = None
+    try:
+        resolved_config = config_path.resolve()
+        resolved_config.relative_to(repository_root)
+        if resolved_config.is_file():
+            config_for_provenance = resolved_config
+    except ValueError:
+        pass
+    provenance = collect_provenance(
+        repository_root,
+        config_path=config_for_provenance,
+        requirements_path=requirements_path,
+    )
+    provenance["effective_config_sha256"] = effective_config_sha256(config)
+    if config_for_provenance is None:
+        provenance["config"] = {
+            "path": config_path.name,
+            "exists": config_path.is_file(),
+            "sha256": sha256_file(config_path) if config_path.is_file() else None,
+            "effective_sha256": provenance["effective_config_sha256"],
+        }
+    return provenance
+
+
+def timestamped_manifest_path(root: Path, run_id: str, kind: str) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    safe_kind = re.sub(r"[^a-z0-9-]+", "-", kind.casefold()).strip("-")
+    return root / f"{timestamp}-{safe_kind}-{run_id}.json"
+
+
+def current_master_digest(output_dir: Path) -> str | None:
+    master_path = output_dir / "Red_Onion_Server_Master.xlsx"
+    if not os.path.lexists(master_path):
+        return None
+    master_path = managed_direct_child(
+        output_dir,
+        master_path,
+        purpose="master workbook",
+        require_file=True,
+    )
+    return workbook_generated_content_sha256(master_path)
+
+
+def build_integrity_state(
+    archive_dir: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    raw_root = canonical_daily_archive_dir(archive_dir)
+    derived_root = generated_workbook_archive_dir(archive_dir)
+    validate_managed_tree_no_reparse(raw_root, purpose="canonical raw archive")
+    validate_managed_tree_no_reparse(
+        derived_root, purpose="generated-workbook archive"
+    )
+    raw_inventory = build_raw_inventory(raw_root)
+    derived_inventory = build_raw_inventory(derived_root)
+    public_paths = managed_published_output_paths(output_dir)
+    public_inventory = build_raw_inventory(output_dir, public_paths)
+    return {
+        "raw_inventory": inventory_dicts(raw_inventory),
+        "derived_archive_inventory": inventory_dicts(derived_inventory),
+        "published_output_inventory": inventory_dicts(public_inventory),
+        "master_generated_content_sha256": current_master_digest(output_dir),
+    }
+
+
+def merge_inventory(
+    base: Iterable[FileFingerprint], updates: Iterable[FileFingerprint]
+) -> tuple[FileFingerprint, ...]:
+    """Apply explicit fingerprint additions/replacements to a recorded inventory."""
+
+    merged = {item.path.casefold(): item for item in base}
+    for item in updates:
+        merged[item.path.casefold()] = item
+    return tuple(sorted(merged.values(), key=lambda item: item.path.casefold()))
+
+
+def fingerprint_matching(
+    root: Path,
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_size: int | None = None,
+) -> FileFingerprint:
+    """Fingerprint a planned file and require its content to match the plan."""
+
+    fingerprint = fingerprint_file(root, path)
+    if fingerprint.sha256 != expected_sha256 or (
+        expected_size is not None and fingerprint.size != expected_size
+    ):
+        raise IntegrityError(
+            f"Managed file changed during the transaction: {fingerprint.path}."
+        )
+    return fingerprint
+
+
+def expected_integrity_state(
+    previous_payload: dict[str, Any],
+    *,
+    raw_updates: Iterable[FileFingerprint] = (),
+    derived_updates: Iterable[FileFingerprint] = (),
+    published_updates: Iterable[FileFingerprint] = (),
+    master_generated_content_sha256: str | None | object = Ellipsis,
+) -> dict[str, Any]:
+    """Build prior-state-plus-explicit-delta without inventorying unrelated changes."""
+
+    master_digest = (
+        previous_payload.get("master_generated_content_sha256")
+        if master_generated_content_sha256 is Ellipsis
+        else master_generated_content_sha256
+    )
+    return {
+        "raw_inventory": inventory_dicts(
+            merge_inventory(manifest_inventory(previous_payload, "raw_inventory"), raw_updates)
+        ),
+        "derived_archive_inventory": inventory_dicts(
+            merge_inventory(
+                manifest_inventory(previous_payload, "derived_archive_inventory"),
+                derived_updates,
+            )
+        ),
+        "published_output_inventory": inventory_dicts(
+            merge_inventory(
+                manifest_inventory(previous_payload, "published_output_inventory"),
+                published_updates,
+            )
+        ),
+        "master_generated_content_sha256": master_digest,
+    }
+
+
+def verify_expected_integrity_state(
+    archive_dir: Path,
+    output_dir: Path,
+    expected_state: dict[str, Any],
+) -> None:
+    """Reject every post-state change not represented by the explicit run delta."""
+
+    actual_state = build_integrity_state(archive_dir, output_dir)
+    if canonical_json_sha256(actual_state) != canonical_json_sha256(expected_state):
+        raise IntegrityError(
+            "Managed raw data or derivative state changed outside this run's planned "
+            "transaction. No new integrity manifest was committed."
+        )
+
+
+def assert_manifest_head(
+    archive_dir: Path,
+    expected_manifest: Path,
+    expected_sha256: str,
+) -> None:
+    """Compare-and-swap guard for a single linear manifest history."""
+
+    latest = latest_integrity_manifest_path(archive_dir)
+    if latest is None or latest.resolve() != expected_manifest.resolve():
+        raise IntegrityError(
+            "The integrity manifest head changed during this run; refusing to create a "
+            "forked history."
+        )
+    payload = read_json_manifest(latest, root=integrity_manifest_dir(archive_dir))
+    if canonical_json_sha256(payload) != expected_sha256:
+        raise IntegrityError(
+            "The integrity manifest head changed after preflight; refusing to extend it."
+        )
+
+
+def write_integrity_manifest(
+    *,
+    archive_dir: Path,
+    output_dir: Path,
+    config_path: Path,
+    config: dict[str, Any],
+    kind: str,
+    run_id: str,
+    previous_manifest: Path | None,
+    expected_previous_sha256: str | None = None,
+    integrity_state: dict[str, Any] | None = None,
+    details: dict[str, Any] | None = None,
+) -> Path:
+    root = integrity_manifest_dir(archive_dir)
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": kind,
+        "run_id": run_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        **(
+            build_integrity_state(archive_dir, output_dir)
+            if integrity_state is None
+            else integrity_state
+        ),
+        "provenance": workflow_provenance(config_path, config),
+    }
+    if details:
+        payload["details"] = details
+    manifest_path = timestamped_manifest_path(root, run_id, kind)
+    return write_chained_manifest_atomic(
+        manifest_path,
+        payload,
+        root,
+        previous_manifest_path=previous_manifest,
+        expected_previous_sha256=expected_previous_sha256,
+    )
+
+
+def verify_integrity_state(
+    archive_dir: Path,
+    output_dir: Path,
+    latest_manifest: Path,
+) -> tuple[dict[str, Any], str]:
+    root = integrity_manifest_dir(archive_dir)
+    chain = verify_manifest_chain(latest_manifest, root)
+    if not chain:
+        raise IntegrityError("The integrity manifest chain is empty.")
+    payload = dict(chain[0].payload)
+    if payload.get("schema_version") != 1:
+        raise IntegrityError(
+            f"Unsupported integrity manifest schema: {payload.get('schema_version')!r}."
+        )
+
+    raw_root = canonical_daily_archive_dir(archive_dir)
+    derived_root = generated_workbook_archive_dir(archive_dir)
+    validate_managed_tree_no_reparse(raw_root, purpose="canonical raw archive")
+    validate_managed_tree_no_reparse(
+        derived_root, purpose="generated-workbook archive"
+    )
+    try:
+        verify_raw_inventory(raw_root, manifest_inventory(payload, "raw_inventory"))
+    except IntegrityError as exc:
+        raise IntegrityError(f"Canonical raw archive verification failed. {exc}") from exc
+    try:
+        verify_raw_inventory(
+            derived_root,
+            manifest_inventory(payload, "derived_archive_inventory"),
+        )
+    except IntegrityError as exc:
+        raise IntegrityError(f"Generated-workbook archive verification failed. {exc}") from exc
+    try:
+        verify_raw_inventory(
+            output_dir,
+            manifest_inventory(payload, "published_output_inventory"),
+            managed_published_output_paths(output_dir),
+        )
+    except IntegrityError as exc:
+        raise IntegrityError(f"Published workbook verification failed. {exc}") from exc
+
+    expected_master = payload.get("master_generated_content_sha256")
+    master_path = output_dir / "Red_Onion_Server_Master.xlsx"
+    if expected_master is not None:
+        if not isinstance(expected_master, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_master):
+            raise IntegrityError("Integrity manifest contains an invalid master workbook digest.")
+        if not os.path.lexists(master_path):
+            raise IntegrityError(
+                "Master workbook verification failed: the recorded master workbook is missing."
+            )
+        master_path = managed_direct_child(
+            output_dir,
+            master_path,
+            purpose="master workbook",
+            require_file=True,
+        )
+        actual_master = workbook_generated_content_sha256(master_path)
+        if actual_master != expected_master:
+            raise IntegrityError(
+                "Master workbook generated-content verification failed: "
+                f"expected {expected_master}; actual {actual_master}. Restore the recorded "
+                "Dropbox or generated-workbook archive version before rerunning."
+            )
+        # New-schema workbooks receive the stricter protection-contract validation as well.
+        verify_existing_management_workbook_integrity(master_path)
+    elif os.path.lexists(master_path):
+        raise IntegrityError(
+            "An unrecorded master workbook appeared after the integrity baseline. "
+            "Reconcile it before running the automation."
+        )
+    return payload, chain[0].sha256
+
+
+def ensure_integrity_preflight(
+    archive_dir: Path,
+    output_dir: Path,
+    config_path: Path,
+    config: dict[str, Any],
+    *,
+    allow_initialize: bool = False,
+) -> tuple[Path, dict[str, Any], str]:
+    latest = latest_integrity_manifest_path(archive_dir)
+    created_baseline = False
+    if latest is None:
+        if not allow_initialize:
+            raise IntegrityError(
+                "No integrity baseline exists. Run the explicit "
+                "--initialize-integrity-baseline operation after confirming the current "
+                "raw archive and finished reports are the intended starting state."
+            )
+        run_id = str(uuid.uuid4())
+        latest = write_integrity_manifest(
+            archive_dir=archive_dir,
+            output_dir=output_dir,
+            config_path=config_path,
+            config=config,
+            kind="integrity-baseline",
+            run_id=run_id,
+            previous_manifest=None,
+            details={
+                "purpose": (
+                    "Initial clearly labeled inventory of existing raw history and derivatives."
+                )
+            },
+        )
+        created_baseline = True
+    try:
+        payload, manifest_hash = verify_integrity_state(
+            archive_dir, output_dir, latest
+        )
+    except Exception:
+        if created_baseline and latest.exists():
+            latest.unlink()
+        raise
+    return latest, payload, manifest_hash
+
+
+def rollback_created_files(
+    paths: Iterable[Path],
+    managed_root: Path,
+    *,
+    expected_hashes: dict[Path, str],
+) -> list[Path]:
+    """Delete only this run's exact files and preserve every conflicting replacement."""
+
+    root = managed_root.resolve()
+    normalized_hashes = {
+        path.absolute(): digest for path, digest in expected_hashes.items()
+    }
+    conflicts: list[Path] = []
+    for path in reversed(list(paths)):
+        candidate = path.absolute()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            conflicts.append(candidate)
+            continue
+        expected_hash = normalized_hashes.get(candidate)
+        if (
+            expected_hash is None
+            or path_is_link_or_reparse(candidate)
+            or not candidate.is_file()
+            or sha256_file(candidate) != expected_hash
+        ):
+            if os.path.lexists(candidate):
+                conflicts.append(candidate)
+            continue
+        if candidate.is_file():
+            candidate.unlink()
+    return conflicts
+
+
+def remove_snapshot_run(snapshot_run_dir: Path, generated_root: Path) -> None:
+    root = generated_root.resolve()
+    candidate = snapshot_run_dir.resolve()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise IntegrityError(f"Refusing snapshot rollback outside {root}: {candidate}") from exc
+    if len(relative.parts) < 2:
+        raise IntegrityError(f"Refusing broad snapshot rollback target: {candidate}")
+    if candidate.exists():
+        shutil.rmtree(candidate)
+
+
+def validate_staged_outputs(stage_dir: Path, paths: Iterable[Path]) -> list[Path]:
+    root = stage_dir.resolve()
+    validated: list[Path] = []
+    seen_names: set[str] = set()
+    for supplied in paths:
+        path = supplied.resolve()
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise IntegrityError(f"Generated output escaped the staging folder: {path}") from exc
+        if len(relative.parts) != 1 or not path.is_file():
+            raise IntegrityError(f"Generated output is missing or unexpectedly nested: {path}")
+        key = path.name.casefold()
+        if key in seen_names:
+            raise IntegrityError(f"Generated output name was duplicated: {path.name}")
+        seen_names.add(key)
+        sha256_file(path)
+        validated.append(path)
+    if not validated:
+        raise IntegrityError("The run did not create any staged workbooks.")
+    master = root / "Red_Onion_Server_Master.xlsx"
+    if master not in validated:
+        raise IntegrityError("The staged master workbook is missing.")
+    validate_management_workbook(master)
+    return validated
+
+
+def snapshot_and_publish_outputs(
+    *,
+    staged_paths: Iterable[Path],
+    output_dir: Path,
+    archive_dir: Path,
+    week_end: date,
+    run_id: str,
+    expected_existing_hashes: dict[str, str | None],
+) -> tuple[
+    list[Path],
+    Path,
+    dict[Path, OutputRollback],
+    dict[Path, str],
+    list[FileFingerprint],
+    list[FileFingerprint],
+]:
+    staged_paths = list(staged_paths)
+    generated_root = managed_subdirectory(
+        archive_dir,
+        GENERATED_WORKBOOK_ARCHIVE_FOLDER,
+        purpose="generated-workbook archive",
+        create=True,
+    )
+    generated_week = managed_subdirectory(
+        generated_root,
+        f"week-ending-{week_end.isoformat()}",
+        purpose="generated-workbook archive week",
+        create=True,
+    )
+    snapshot_run = managed_subdirectory(
+        generated_week,
+        run_id,
+        purpose="generated-workbook run snapshot",
+        create=True,
+    )
+    published_snapshot = managed_subdirectory(
+        snapshot_run,
+        "published",
+        purpose="published workbook snapshot",
+        create=True,
+    )
+    replaced_snapshot = managed_subdirectory(
+        snapshot_run,
+        "replaced",
+        purpose="replaced workbook snapshot",
+        create=True,
+    )
+    final_paths: list[Path] = []
+    rollback_backups: dict[Path, OutputRollback] = {}
+    staged_hashes: dict[Path, str] = {}
+    derived_updates: list[FileFingerprint] = []
+    published_updates: list[FileFingerprint] = []
+    try:
+        for staged in staged_paths:
+            final = managed_direct_child(
+                output_dir,
+                output_dir / staged.name,
+                purpose="published output",
+                require_file=False,
+            )
+            final_paths.append(final)
+            staged_hashes[final] = sha256_file(staged)
+            staged_size = staged.stat().st_size
+            published_backup = published_snapshot / staged.name
+            verified_copy_file(staged, published_backup)
+            derived_updates.append(
+                fingerprint_matching(
+                    generated_root,
+                    published_backup,
+                    expected_sha256=staged_hashes[final],
+                    expected_size=staged_size,
+                )
+            )
+            expected_original = expected_existing_hashes.get(staged.name.casefold(), Ellipsis)
+            if final.exists():
+                if expected_original is Ellipsis or expected_original is None:
+                    raise IntegrityError(
+                        f"An unrecorded output appeared during the run: {final.name}."
+                    )
+                actual_original = sha256_file(final)
+                if actual_original != expected_original:
+                    raise IntegrityError(
+                        f"{final.name} changed after it was imported for this run. "
+                        "The newer edit was preserved; rerun to carry it forward."
+                    )
+                backup = replaced_snapshot / staged.name
+                backup_hash = verified_copy_file(final, backup)
+                if backup_hash != actual_original:
+                    raise IntegrityError(f"Output backup verification failed for {final.name}.")
+                derived_updates.append(
+                    fingerprint_matching(
+                        generated_root,
+                        backup,
+                        expected_sha256=actual_original,
+                        expected_size=final.stat().st_size,
+                    )
+                )
+                rollback_backups[final] = OutputRollback(
+                    backup, actual_original, backup_hash
+                )
+            else:
+                if expected_original is not Ellipsis and expected_original is not None:
+                    raise IntegrityError(f"Recorded output disappeared during the run: {final.name}.")
+                rollback_backups[final] = OutputRollback(None, None, None)
+        for staged, final in zip(staged_paths, final_paths):
+            rollback = rollback_backups[final]
+            if rollback.original_sha256 is not None:
+                displaced = output_dir / f".{final.name}.{run_id}.replacing"
+                rollback = OutputRollback(
+                    rollback.backup,
+                    rollback.original_sha256,
+                    rollback.backup_sha256,
+                    displaced,
+                )
+                rollback_backups[final] = rollback
+                if os.path.lexists(displaced):
+                    raise IntegrityError(f"Unexpected output replacement collision: {displaced.name}")
+                os.replace(final, displaced)
+                if (
+                    path_is_link_or_reparse(displaced)
+                    or not displaced.is_file()
+                    or sha256_file(displaced) != rollback.original_sha256
+                ):
+                    if not os.path.lexists(final):
+                        os.replace(displaced, final)
+                    raise IntegrityError(
+                        f"{final.name} changed at publication time. The newer entry was "
+                        "preserved and this run was stopped."
+                    )
+            copied_hash = verified_copy_file(staged, final, replace=False)
+            if copied_hash != staged_hashes[final]:
+                raise IntegrityError(f"Published workbook verification failed for {final.name}.")
+            if final.name != "Red_Onion_Server_Master.xlsx":
+                published_updates.append(
+                    fingerprint_matching(
+                        output_dir,
+                        final,
+                        expected_sha256=staged_hashes[final],
+                        expected_size=staged.stat().st_size,
+                    )
+                )
+        for rollback in rollback_backups.values():
+            if rollback.displaced is not None and rollback.displaced.exists():
+                rollback.displaced.unlink()
+        return (
+            final_paths,
+            snapshot_run,
+            rollback_backups,
+            staged_hashes,
+            derived_updates,
+            published_updates,
+        )
+    except Exception as exc:
+        conflicts = rollback_published_outputs(rollback_backups, staged_hashes)
+        if conflicts:
+            raise IntegrityError(
+                "Output rollback preserved a newer conflicting file and retained the "
+                f"recovery snapshot at {snapshot_run}. Resolve {conflicts[0].name} before "
+                "rerunning."
+            ) from exc
+        remove_snapshot_run(snapshot_run, generated_root)
+        raise
+
+
+def rollback_published_outputs(
+    rollback_backups: dict[Path, OutputRollback],
+    staged_hashes: dict[Path, str],
+) -> list[Path]:
+    """Restore only this run's output, never a newer manager/Dropbox edit."""
+
+    conflicts: list[Path] = []
+    for final, rollback in reversed(list(rollback_backups.items())):
+        current_exists = os.path.lexists(final)
+        current_hash = (
+            sha256_file(final)
+            if current_exists and final.is_file() and not path_is_link_or_reparse(final)
+            else None
+        )
+        staged_hash = staged_hashes.get(final)
+        if rollback.backup is not None:
+            if (
+                not rollback.backup.is_file()
+                or sha256_file(rollback.backup) != rollback.backup_sha256
+            ):
+                conflicts.append(final)
+                continue
+            displaced_valid = (
+                rollback.displaced is not None
+                and rollback.displaced.is_file()
+                and not path_is_link_or_reparse(rollback.displaced)
+                and sha256_file(rollback.displaced) == rollback.original_sha256
+            )
+            if not current_exists or current_hash == staged_hash:
+                if displaced_valid:
+                    if current_exists:
+                        final.unlink()
+                    os.replace(rollback.displaced, final)
+                else:
+                    verified_copy_file(rollback.backup, final, replace=current_exists)
+            elif current_hash == rollback.original_sha256:
+                if displaced_valid:
+                    rollback.displaced.unlink()
+            else:
+                conflicts.append(final)
+                continue
+        elif current_hash == staged_hash:
+            final.unlink()
+        elif current_exists:
+            conflicts.append(final)
+    return conflicts
+
+
 def run(args: argparse.Namespace) -> list[Path]:
+    archive_dir = Path(args.archive_dir).resolve()
+    with workflow_run_lock(archive_dir):
+        return _run_with_lock_held(args)
+
+
+def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     archive_dir = Path(args.archive_dir).resolve()
@@ -5578,8 +7944,38 @@ def run(args: argparse.Namespace) -> list[Path]:
         Path(path).resolve() for path in (getattr(args, "migrate_history_from", None) or [])
     ]
     migration_only = bool(getattr(args, "migrate_history_only", False))
+    initialize_baseline = bool(
+        getattr(args, "initialize_integrity_baseline", False)
+    )
     if migration_only and not migration_sources:
         raise ValueError("--migrate-history-only requires at least one --migrate-history-from folder.")
+    if initialize_baseline and (migration_only or migration_sources):
+        raise ValueError(
+            "--initialize-integrity-baseline cannot be combined with history migration options."
+        )
+
+    if initialize_baseline:
+        latest, _, _ = ensure_integrity_preflight(
+            archive_dir,
+            output_dir,
+            config_path,
+            config,
+            allow_initialize=True,
+        )
+        return [latest]
+
+    active_paths: list[Path] = []
+    if not migration_only:
+        active_paths = daily_report_paths(input_dir)
+        if not active_paths:
+            raise FileNotFoundError(
+                f"No active daily reports ({DAILY_REPORT_FORMAT_LABEL}) found in {input_dir}. "
+                "Drop current Toast reports into 01 Daily Reports - Drop Here and rerun."
+            )
+
+    previous_manifest, previous_payload, previous_manifest_hash = ensure_integrity_preflight(
+        archive_dir, output_dir, config_path, config
+    )
 
     migration_plan = (
         build_history_migration_plan(migration_sources, archive_dir, config)
@@ -5588,16 +7984,74 @@ def run(args: argparse.Namespace) -> list[Path]:
     )
     if migration_only:
         assert migration_plan is not None
-        return list(apply_history_migration_plan(migration_plan))
+        copied_paths: list[Path] = []
+        copied_hashes: dict[Path, str] = {}
+        migration_manifest: Path | None = None
+        try:
+            assert_manifest_head(archive_dir, previous_manifest, previous_manifest_hash)
+            verify_integrity_state(archive_dir, output_dir, previous_manifest)
+            verify_captured_migration_inputs(migration_plan.captured_sources)
+            copied_paths = list(apply_history_migration_plan(migration_plan))
+            copied_hashes = history_migration_expected_hashes(
+                migration_plan, copied_paths
+            )
+            if copied_paths:
+                raw_root = canonical_daily_archive_dir(archive_dir)
+                raw_updates = [fingerprint_file(raw_root, path) for path in copied_paths]
+                expected_state = expected_integrity_state(
+                    previous_payload, raw_updates=raw_updates
+                )
+                verify_expected_integrity_state(archive_dir, output_dir, expected_state)
+                assert_manifest_head(
+                    archive_dir, previous_manifest, previous_manifest_hash
+                )
+                migration_manifest = write_integrity_manifest(
+                    archive_dir=archive_dir,
+                    output_dir=output_dir,
+                    config_path=config_path,
+                    config=config,
+                    kind="history-migration",
+                    run_id=str(uuid.uuid4()),
+                    previous_manifest=previous_manifest,
+                    expected_previous_sha256=previous_manifest_hash,
+                    integrity_state=expected_state,
+                    details={
+                        "copied_raw_files": [path.name for path in copied_paths],
+                        "source_manifest_sha256": previous_manifest_hash,
+                    },
+                )
+                verify_integrity_state(archive_dir, output_dir, migration_manifest)
+        except Exception:
+            if migration_manifest is not None and migration_manifest.exists():
+                migration_manifest.unlink()
+            conflicts = rollback_created_files(
+                copied_paths,
+                canonical_daily_archive_dir(archive_dir),
+                expected_hashes=copied_hashes,
+            )
+            if conflicts:
+                raise IntegrityError(
+                    "History migration rollback preserved a changed replacement: "
+                    f"{conflicts[0]}"
+                )
+            raise
+        return copied_paths
 
-    active_paths = daily_report_paths(input_dir)
-    if not active_paths:
-        raise FileNotFoundError(
-            f"No active daily reports ({DAILY_REPORT_FORMAT_LABEL}) found in {input_dir}. "
-            "Drop current Toast reports into 01 Daily Reports - Drop Here and rerun."
-        )
-
-    raw_active_records_by_path = read_reports_by_path(active_paths, config)
+    active_captures = capture_active_inputs(active_paths, input_dir)
+    with tempfile.TemporaryDirectory(
+        prefix=".weekly-input-", dir=str(integrity_manifest_dir(archive_dir))
+    ) as input_stage_name:
+        input_stage = Path(input_stage_name)
+        captured_parse_paths: list[Path] = []
+        for capture in active_captures:
+            staged_input = input_stage / capture.source.name
+            written_hash = verified_write_bytes(capture.content, staged_input)
+            if written_hash != capture.fingerprint.sha256:
+                raise IntegrityError(
+                    f"Input staging verification failed for {capture.source.name}."
+                )
+            captured_parse_paths.append(staged_input)
+        raw_active_records_by_path = read_reports_by_path(captured_parse_paths, config)
     active_resolution = resolve_report_duplicates(raw_active_records_by_path)
     active_records_by_path = active_resolution.records_by_path
     _, active_week_end = active_week_for_paths(active_records_by_path)
@@ -5648,35 +8102,207 @@ def run(args: argparse.Namespace) -> list[Path]:
     if not selected_records:
         raise ValueError(f"No records found between {public_start} and {public_end}.")
 
-    if migration_plan is not None:
-        apply_history_migration_plan(migration_plan)
-
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = str(uuid.uuid4())
+    provenance = workflow_provenance(config_path, config)
+    config["_integrity"] = {
+        "run_id": run_id,
+        "previous_manifest_sha256": previous_manifest_hash,
+        "effective_config_sha256": provenance["effective_config_sha256"],
+        "provenance": provenance,
+    }
 
-    generated: list[Path] = []
-    for location in config["locations"]:
-        location_records = [record for record in selected_records if record.location == location]
-        if not location_records:
-            continue
-        generated.append(
-            write_public_workbook(
-                location, selected_records, output_dir, config, public_start, public_end
+    migration_copied: list[Path] = []
+    migration_copied_hashes: dict[Path, str] = {}
+    active_copies: list[VerifiedArchiveCopy] = []
+    final_paths: list[Path] = []
+    snapshot_run: Path | None = None
+    rollback_backups: dict[Path, OutputRollback] = {}
+    staged_hashes: dict[Path, str] = {}
+    derived_updates: list[FileFingerprint] = []
+    published_updates: list[FileFingerprint] = []
+    manifest_committed = False
+    new_manifest_path: Path | None = None
+    with tempfile.TemporaryDirectory(prefix=".weekly-run-", dir=str(output_dir)) as stage_name:
+        stage_dir = Path(stage_name)
+        try:
+            staged_paths: list[Path] = []
+            for location in config["locations"]:
+                location_records = [
+                    record for record in selected_records if record.location == location
+                ]
+                if not location_records:
+                    continue
+                staged_paths.append(
+                    write_public_workbook(
+                        location,
+                        selected_records,
+                        stage_dir,
+                        config,
+                        public_start,
+                        public_end,
+                    )
+                )
+
+            staged_master = stage_dir / "Red_Onion_Server_Master.xlsx"
+            current_master = output_dir / staged_master.name
+            expected_existing_hashes = {
+                Path(item.path).name.casefold(): item.sha256
+                for item in manifest_inventory(
+                    previous_payload, "published_output_inventory"
+                )
+            }
+            if current_master.exists():
+                managed_direct_child(
+                    output_dir,
+                    current_master,
+                    purpose="master workbook",
+                    require_file=True,
+                )
+                expected_existing_hashes[current_master.name.casefold()] = (
+                    verified_copy_file(current_master, staged_master)
+                )
+            else:
+                expected_existing_hashes[current_master.name.casefold()] = None
+            staged_paths.append(
+                write_master_workbook(
+                    records,
+                    staged_master,
+                    config,
+                    input_dir,
+                    public_start,
+                    public_end,
+                )
             )
-        )
+            staged_paths = validate_staged_outputs(stage_dir, staged_paths)
+            staged_master_digest = workbook_generated_content_sha256(staged_master)
 
-    master_path = output_dir / "Red_Onion_Server_Master.xlsx"
-    generated.append(
-        write_master_workbook(
-            records,
-            master_path,
-            config,
-            input_dir,
-            public_start,
-            public_end,
-        )
-    )
-    archive_processed_files(active_paths, archive_dir, active_week_end)
-    return generated
+            verify_captured_active_inputs(active_captures, input_dir)
+            assert_manifest_head(archive_dir, previous_manifest, previous_manifest_hash)
+            verify_integrity_state(archive_dir, output_dir, previous_manifest)
+            if migration_plan is not None:
+                verify_captured_migration_inputs(migration_plan.captured_sources)
+                migration_copied = list(apply_history_migration_plan(migration_plan))
+                migration_copied_hashes = history_migration_expected_hashes(
+                    migration_plan, migration_copied
+                )
+            active_copies = copy_captured_active_files_verified(
+                active_captures, archive_dir, active_week_end
+            )
+            (
+                final_paths,
+                snapshot_run,
+                rollback_backups,
+                staged_hashes,
+                derived_updates,
+                published_updates,
+            ) = snapshot_and_publish_outputs(
+                staged_paths=staged_paths,
+                output_dir=output_dir,
+                archive_dir=archive_dir,
+                week_end=active_week_end,
+                run_id=run_id,
+                expected_existing_hashes=expected_existing_hashes,
+            )
+
+            verify_captured_active_inputs(active_captures, input_dir)
+            input_inventory = tuple(capture.fingerprint for capture in active_captures)
+            raw_root = canonical_daily_archive_dir(archive_dir).resolve()
+            archived_destinations = [
+                copy.destination.resolve().relative_to(raw_root).as_posix()
+                for copy in active_copies
+            ]
+            capture_by_name = {
+                capture.source.name.casefold(): capture for capture in active_captures
+            }
+            raw_updates = [fingerprint_file(raw_root, path) for path in migration_copied]
+            raw_updates.extend(
+                fingerprint_matching(
+                    raw_root,
+                    copy.destination,
+                    expected_sha256=copy.sha256,
+                    expected_size=capture_by_name[
+                        copy.source.name.casefold()
+                    ].fingerprint.size,
+                )
+                for copy in active_copies
+            )
+            expected_state = expected_integrity_state(
+                previous_payload,
+                raw_updates=raw_updates,
+                derived_updates=derived_updates,
+                published_updates=published_updates,
+                master_generated_content_sha256=staged_master_digest,
+            )
+            verify_expected_integrity_state(archive_dir, output_dir, expected_state)
+            assert_manifest_head(archive_dir, previous_manifest, previous_manifest_hash)
+            new_manifest_path = write_integrity_manifest(
+                archive_dir=archive_dir,
+                output_dir=output_dir,
+                config_path=config_path,
+                config=config,
+                kind="weekly-run",
+                run_id=run_id,
+                previous_manifest=previous_manifest,
+                expected_previous_sha256=previous_manifest_hash,
+                integrity_state=expected_state,
+                details={
+                    "source_manifest_sha256": previous_manifest_hash,
+                    "active_input_inventory": inventory_dicts(input_inventory),
+                    "archived_destinations": archived_destinations,
+                    "history_migration_files": [path.name for path in migration_copied],
+                    "public_snapshot_start": public_start.isoformat(),
+                    "public_snapshot_end": public_end.isoformat(),
+                    "active_week_end": active_week_end.isoformat(),
+                    "published_workbooks": [path.name for path in final_paths],
+                },
+            )
+            verify_integrity_state(archive_dir, output_dir, new_manifest_path)
+            manifest_committed = True
+            quarantine_and_delete_captured_inputs(
+                active_captures, active_copies, input_dir, run_id
+            )
+            return final_paths
+        except Exception as exc:
+            if not manifest_committed:
+                if new_manifest_path is not None and new_manifest_path.exists():
+                    new_manifest_path.unlink()
+                output_conflicts: list[Path] = []
+                if rollback_backups:
+                    output_conflicts = rollback_published_outputs(
+                        rollback_backups, staged_hashes
+                    )
+                active_created = [copy for copy in active_copies if copy.created]
+                raw_conflicts = rollback_created_files(
+                    [copy.destination for copy in active_copies if copy.created],
+                    canonical_daily_archive_dir(archive_dir),
+                    expected_hashes={
+                        copy.destination: copy.sha256 for copy in active_created
+                    },
+                )
+                raw_conflicts.extend(
+                    rollback_created_files(
+                        migration_copied,
+                        canonical_daily_archive_dir(archive_dir),
+                        expected_hashes=migration_copied_hashes,
+                    )
+                )
+                if snapshot_run is not None and not output_conflicts:
+                    remove_snapshot_run(
+                        snapshot_run, generated_workbook_archive_dir(archive_dir)
+                    )
+                if output_conflicts:
+                    raise IntegrityError(
+                        "The failed run preserved a newer output and retained its recovery "
+                        f"snapshot at {snapshot_run}. Resolve {output_conflicts[0].name} "
+                        "before rerunning."
+                    ) from exc
+                if raw_conflicts:
+                    raise IntegrityError(
+                        "The failed run preserved a changed raw-archive replacement instead "
+                        f"of deleting it: {raw_conflicts[0]}. Reconcile it before rerunning."
+                    ) from exc
+            raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -5714,6 +8340,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Perform the copy-only history migration without generating weekly workbooks.",
     )
+    parser.add_argument(
+        "--initialize-integrity-baseline",
+        action="store_true",
+        help=(
+            "Create or verify the clearly labeled raw/derivative integrity baseline without "
+            "generating workbooks or moving active reports."
+        ),
+    )
     return parser
 
 
@@ -5723,7 +8357,11 @@ def main() -> None:
         generated = run(args)
     except Exception as exc:
         raise SystemExit(f"ERROR: {exc}") from exc
-    if args.migrate_history_only:
+    if args.initialize_integrity_baseline:
+        print("Integrity baseline verified:")
+        for path in generated:
+            print(f"  {path}")
+    elif args.migrate_history_only:
         if generated:
             print("History copied to the canonical archive:")
             for path in generated:

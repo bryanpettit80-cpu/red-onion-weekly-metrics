@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "Red Onion weekly Toast metrics workbook builder"
 requires-python = ">=3.9"
 dependencies = [
-    "pandas>=2.2",
-    "openpyxl>=3.1",
-    "xlrd>=2.0.1",
+    "pandas==2.3.3",
+    "openpyxl==3.1.5",
+    "xlrd==2.0.2",
 ]
 
 [project.optional-dependencies]
@@ -19,4 +19,4 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["red_onion_weekly_metrics"]
+py-modules = ["red_onion_integrity", "red_onion_weekly_metrics"]
