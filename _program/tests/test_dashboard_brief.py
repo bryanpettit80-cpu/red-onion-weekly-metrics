@@ -240,7 +240,7 @@ def test_scorecard_charts_use_latest_eight_complete_weeks() -> None:
     scorecards = wb["Store & Group Scorecards"]
     chart_data = wb["_Dashboard Chart Data"]
     assert len(scorecards._charts) == 2
-    assert chart_data.sheet_state == "hidden"
+    assert chart_data.sheet_state == "veryHidden"
     assert [chart_data.cell(row=row, column=1).value for row in range(2, 10)] == [
         week_end.strftime("%m/%d") for week_end in complete_week_ends[-8:]
     ]

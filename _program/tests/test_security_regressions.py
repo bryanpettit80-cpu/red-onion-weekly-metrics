@@ -11,6 +11,16 @@ import pytest
 import red_onion_weekly_metrics as metrics
 
 
+def initialize_integrity(args: Namespace) -> None:
+    values = vars(args).copy()
+    values.update(
+        initialize_integrity_baseline=True,
+        migrate_history_from=[],
+        migrate_history_only=False,
+    )
+    metrics.run(Namespace(**values))
+
+
 def make_record(
     day: date,
     *,
@@ -206,18 +216,29 @@ def test_carried_forward_management_text_is_sanitized(tmp_path: Path) -> None:
 
     state = metrics.read_management_state(existing_path)
     assert state["owners"] == [f"'{malicious}"]
+    assert state["owner_roster"] == [
+        {"Owner Name": f"'{malicious}", "Active": "Yes"}
+    ]
     assert state["active_actions"][0]["Owner"] == f"'{malicious}"
     assert state["active_actions"][0]["Person / Area"] == f"'{malicious}"
     assert state["active_actions"][0]["Manager Notes"] == f"'{malicious}"
 
     regenerated = Workbook()
     metrics.write_management_setup_sheet(
-        regenerated, {}, state["owners"], metrics.DEFAULT_CONFIG
+        regenerated,
+        {},
+        state["owner_roster"],
+        metrics.DEFAULT_CONFIG,
+        state["owner_roster_capacity"],
     )
     metrics.write_action_tracking_sheet(
         regenerated, "Action Board", state["active_actions"], editable=True
     )
-    assert regenerated["Management Setup"]["J6"].data_type == "s"
+    setup = regenerated["Management Setup"]
+    assert metrics.OWNER_ROSTER_TABLE_NAME in setup.tables
+    assert setup["A21"].value == f"'{malicious}"
+    assert setup["A21"].data_type == "s"
+    assert setup["B21"].value == "Yes"
     for coordinate in ("E5", "H5", "N5"):
         assert regenerated["Action Board"][coordinate].data_type == "s"
     regenerated.close()
@@ -298,7 +319,7 @@ def test_run_rejects_excessive_history_span_before_writes_or_moves(
     archived_day = date(1000, 1, 1)
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        day = active_day if path == active_source else archived_day
+        day = active_day if path.name == active_source.name else archived_day
         return [make_record(day, source_file=path.name)]
 
     def unexpected_writer(*args, **kwargs):
@@ -318,6 +339,7 @@ def test_run_rejects_excessive_history_span_before_writes_or_moves(
         migrate_history_only=False,
     )
 
+    initialize_integrity(args)
     with pytest.raises(ValueError, match="Data Quality date coverage"):
         metrics.run(args)
 
@@ -345,6 +367,7 @@ def test_active_and_archive_identical_reports_are_used_once(
     archived_source.write_text("archived copy", encoding="utf-8")
     active_source.write_text("active copy", encoding="utf-8")
     master_records: list[metrics.MetricRecord] = []
+    real_master_writer = metrics.write_master_workbook
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
         return [make_record(date(2026, 7, 18), source_file=path.name)]
@@ -357,9 +380,9 @@ def test_active_and_archive_identical_reports_are_used_once(
 
     def fake_master(records, output_path, config, source_dir, start, end):
         master_records.extend(records)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("master", encoding="utf-8")
-        return output_path
+        return real_master_writer(
+            records, output_path, config, source_dir, start, end
+        )
 
     monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)
     monkeypatch.setattr(metrics, "write_public_workbook", fake_public)
@@ -375,6 +398,7 @@ def test_active_and_archive_identical_reports_are_used_once(
         migrate_history_only=False,
     )
 
+    initialize_integrity(args)
     metrics.run(args)
 
     assert len(master_records) == 1
@@ -401,7 +425,7 @@ def test_active_and_archive_conflict_stops_before_writes_or_moves(
     active_source.write_text("active", encoding="utf-8")
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        gross_sales = 125.0 if path == active_source else 100.0
+        gross_sales = 125.0 if path.name == active_source.name else 100.0
         return [
             make_record(
                 date(2026, 7, 18), source_file=path.name, gross_sales=gross_sales
@@ -420,6 +444,7 @@ def test_active_and_archive_conflict_stops_before_writes_or_moves(
         migrate_history_only=False,
     )
 
+    initialize_integrity(args)
     with pytest.raises(ValueError, match="Conflicting daily reports"):
         metrics.run(args)
 
