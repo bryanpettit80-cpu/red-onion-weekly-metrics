@@ -6650,17 +6650,18 @@ def write_action_tracking_sheet(
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[header_row].height = 30
     for row_index, row in enumerate(rows, start=header_row + 1):
         for col, value in enumerate(action_row_values(row), start=1):
             cell = ws.cell(row=row_index, column=col, value=value)
-            cell.alignment = Alignment(vertical="top", wrap_text=col in {10, 11, 13})
+            cell.alignment = Alignment(vertical="top", wrap_text=col in {10, 11, 12, 14})
         priority_style = priority_fill(row.get("Priority"))
         if priority_style:
             ws.cell(row=row_index, column=3).fill = priority_style
         ws.cell(row=row_index, column=6).number_format = "m/d/yyyy"
         ws.cell(row=row_index, column=12).number_format = "m/d/yyyy"
         ws.cell(row=row_index, column=16).number_format = "m/d/yyyy"
-        ws.row_dimensions[row_index].height = 36
+        ws.row_dimensions[row_index].height = 60
     if rows:
         table = Table(
             displayName="ActionBoardTable" if editable else "ActionHistoryTable",
@@ -6787,6 +6788,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
     )
     ws.freeze_panes = "D4"
     ws.sheet_view.zoomScale = 80
+    ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
         for col in (1, 5, 6, 7, 8):
             fill = priority_fill(ws.cell(row=row, column=col).value)
@@ -6794,7 +6796,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
                 ws.cell(row=row, column=col).fill = fill
         for col in (4, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 42
+        ws.row_dimensions[row].height = 48
 
 
 def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
@@ -6840,6 +6842,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
     )
     ws.freeze_panes = "E4"
     ws.sheet_view.zoomScale = 80
+    ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
         for col in (1, 2, 6, 7, 8):
             fill = priority_fill(ws.cell(row=row, column=col).value)
@@ -6847,7 +6850,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
                 ws.cell(row=row, column=col).fill = fill
         for col in (5, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 42
+        ws.row_dimensions[row].height = 48
 
 
 def format_management_value(field: str, value: float | None) -> tuple[Any, str]:
@@ -7049,6 +7052,7 @@ def write_management_data_quality_sheet(
     ws["A3"].fill = PatternFill("solid", fgColor="D9EAD3" if latest_complete else "F4CCCC")
     ws["A3"].font = Font(bold=True)
     ws["A3"].alignment = Alignment(wrap_text=True)
+    ws.row_dimensions[3].height = 36
     for col, header in enumerate(["Latest Week", "Location", "Active Days", "Source Days", "Status", "Management Use"], start=1):
         cell = ws.cell(row=5, column=col, value=header)
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
@@ -7520,7 +7524,7 @@ def write_management_dashboard_sheet(
                 ws.cell(row=row_index, column=col).alignment = Alignment(
                     wrap_text=True, vertical="center"
                 )
-            ws.row_dimensions[row_index].height = 42
+            ws.row_dimensions[row_index].height = 66
     else:
         ws.merge_cells("A13:L15")
         ws["A13"] = (
