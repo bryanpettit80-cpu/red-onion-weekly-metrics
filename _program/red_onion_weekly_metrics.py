@@ -6659,8 +6659,8 @@ def write_action_tracking_sheet(
         if priority_style:
             ws.cell(row=row_index, column=3).fill = priority_style
         ws.cell(row=row_index, column=6).number_format = "m/d/yyyy"
-        ws.cell(row=row_index, column=12).number_format = "m/d/yyyy"
-        ws.cell(row=row_index, column=16).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=13).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=17).number_format = "m/d/yyyy"
         ws.row_dimensions[row_index].height = 60
     if rows:
         table = Table(
