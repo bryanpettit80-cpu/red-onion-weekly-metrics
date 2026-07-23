@@ -16,7 +16,29 @@ The operator launcher creates a machine-local virtual environment at:
 %LOCALAPPDATA%\RedOnionMetrics\.venv
 ```
 
-Runtime dependencies are exactly pinned in both `requirements.txt` and `pyproject.toml` so repeated launcher installs use the same compatible direct versions. Change the two files together and validate all supported Python versions when deliberately upgrading a pin.
+Runtime dependencies are exactly pinned in both `requirements.txt` and
+`pyproject.toml`. `requirements.lock` records the reviewed transitive graph and
+artifact hashes; `requirements-constraints.txt` keeps that lock compatible with
+Python 3.10-3.12.
+
+The launcher records the Python identity and lock digest in
+`%LOCALAPPDATA%\RedOnionMetrics\environment-state.json`. A normal weekly run
+verifies installed versions and `pip check`; it does not invoke an installer.
+A maintainer can deliberately rebuild with:
+
+```powershell
+.\Run-WeeklySnapshot.ps1 -RebuildEnvironment -HealthCheck
+```
+
+That maintenance-only combination rebuilds and validates the environment
+without processing weekly reports. Omit `-HealthCheck` only when the rebuild
+should be followed by the weekly run.
+
+For a replacement-machine restore, follow the audited procedure in
+`..\RECOVERY.md` and use
+`-RebindRestoredIntegrityAnchor <SOURCE_ANCHOR_JSON>`. The command verifies the
+restored head and managed outputs before creating the new path-bound anchor; it
+does not process weekly reports.
 
 ## Validation
 
@@ -25,6 +47,7 @@ Run these checks before committing code changes:
 ```powershell
 python -m pytest -q
 python -m py_compile red_onion_weekly_metrics.py
+python red_onion_config.py --config red_onion_config.json
 ```
 
 Launcher integrity behavior can be checked separately with:
@@ -55,6 +78,8 @@ Each successful run also creates tamper-detection evidence, not immutable storag
 
 - `03 Archive\generated-workbooks\week-ending-YYYY-MM-DD\<run-id>\` contains hashed copies of that run's generated workbooks.
 - `03 Archive\run-manifests\<timestamp>-<kind>-<run-id>.json` records source and generated-file hashes and links to the prior manifest by root-relative path and hash.
+- `03 Archive\run-attempts\<timestamp>-attempt-<run-id>.json` records each attempt, stage, safe error, and separate readiness dimensions.
+- `02 Finished Reports\LAST RUN STATUS.txt` is the atomic operator summary.
 
 Hash verification detects a later change. It cannot prevent an editor from changing or deleting Dropbox content, so these artifacts do not replace restricted folder permissions, version history, or an independently retained backup.
 
@@ -88,6 +113,11 @@ The master workbook separates performance level from momentum:
 
 The management `Server Scorecard` shows the action, current sample, performance, both trend horizons, and the exact weeks and guests used. The hidden `Server Week-over-Week Detail` tab remains an audit view of adjacent-week changes; it is not the management coaching trend.
 
+`Action Focus` is the single execution view and links to editable fields on
+`Action Board`. `Evidence Detail` is protected/read-only and records stable
+codes, exact evidence weeks, source SHA-256/format/parser/date-source,
+methodology version, and metric evidence.
+
 `Management Setup` targets, owner names, and manual `Action Board` fields are read from the existing master before regeneration. The new workbook is written to a temporary file and atomically replaces the prior master only after validation succeeds.
 
 The supported management edit surface is intentionally narrow:
@@ -99,6 +129,17 @@ The supported management edit surface is intentionally narrow:
 All other cells are locked, technical sheets are `veryHidden`, and workbook structure is protected. This guards against accidental manipulation but is not encryption; Dropbox access and the manifest/backup controls remain necessary.
 
 Technical calculation and raw-detail sheets remain in the workbook as `veryHidden` sheets. Do not delete them from the generator; they provide auditability and chart sources.
+
+## Read-Only Health Check
+
+```powershell
+.\Run-WeeklySnapshot.ps1 -HealthCheck
+python red_onion_weekly_metrics.py --health-check-json
+```
+
+The command does not create folders, acquire the workflow lock, install
+packages, generate reports, or claim that independent backup freshness is
+known. Recovery remains `NotChecked` until separately verified.
 
 ## Maintenance Notes
 

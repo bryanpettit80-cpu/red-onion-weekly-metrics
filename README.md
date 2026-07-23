@@ -58,7 +58,16 @@ Excel temporary files whose names start with `~$` are ignored.
 03 Archive\run-manifests\<timestamp>-<kind>-<run-id>.json
 ```
 
+- Writes atomic attempt/status records for successful and failed runs:
+
+```text
+03 Archive\run-attempts\<timestamp>-attempt-<run-id>.json
+02 Finished Reports\LAST RUN STATUS.txt
+```
+
 - The master workbook opens to a management dashboard with current KPIs, store and group trends, selective rising/falling stars, and prioritized follow-up actions.
+- `Action Focus` presents only immediate manager work and links each row back to the editable `Action Board`.
+- `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, metric inputs, and methodology version.
 - Server actions require a credible sample: at least 25 guests, 3 active days, 2 prior full weeks, and 50 prior-period guests.
 - Partial weeks stay visible in Data Quality but are excluded from management baselines and prominent server actions.
 - Management can assign action owners, due dates, status, and notes in the master workbook. Those fields carry forward on the next successful run.
@@ -107,7 +116,13 @@ If the master workbook cannot be read or replaced, the run stops before moving t
 
 If the launcher reports `Release preflight failed`, do not alter files to make the warning disappear. Ask the technical maintainer to restore the deployed repository to a clean `main` checkout whose `HEAD` matches local `origin/main`. The preflight does not download updates.
 
-If Python is missing, install Python 3.9 or newer and select `Add python.exe to PATH`.
+If Python is missing, install Python 3.10 or newer and select `Add python.exe to PATH`.
+
+A normal weekly run verifies the existing local environment and does not
+reinstall packages. Technical maintainers can explicitly repair it with
+`-RebuildEnvironment -HealthCheck`, or run a read-only local check with
+`-HealthCheck`. The combined maintenance command rebuilds and validates without
+processing weekly reports.
 
 ## Configuration
 
@@ -134,9 +149,13 @@ For a personal Dropbox plan, split access by responsibility rather than giving e
 - Report consumers receive view-only access to `02 Finished Reports`; grant archive access only when their role requires it.
 - Do not share the full parent folder with edit rights merely to make intake convenient. Dropbox editors can add, edit, delete, share, and download content; view-only users can still download or share copies.
 
-Enable Dropbox two-factor authentication for every account with access, store recovery codes securely, set folder membership management to the owner, and review access whenever managers change. Dropbox version history provides a plan-dependent recovery window, but sync propagates changes and deletions. A separately administered, independently retained backup outside the live synced Dropbox tree is still required; choosing its owner, schedule, retention, and restore-test cadence is an operational follow-up and is not performed by this repository.
+Enable Dropbox two-factor authentication for every account with access, store recovery codes securely, set folder membership management to the owner, and review access whenever managers change. Dropbox version history provides a plan-dependent recovery window, but sync propagates changes and deletions. A separately administered, independently retained backup outside the live synced Dropbox tree is still required. `Build-RecoveryBundle.ps1` creates a verified local release/recovery bundle for that private destination; it never uploads automatically. Retain 13 weekly and 12 monthly bundles and perform a documented restore test quarterly.
 
 Official references: [Dropbox sharing permissions](https://help.dropbox.com/share/set-file-folder-permissions), [file requests](https://help.dropbox.com/share/create-file-request), [version history](https://help.dropbox.com/delete-restore/version-history-overview), and [two-factor authentication](https://help.dropbox.com/account-access/enable-2-factor-authentication).
+
+Maintainers should also follow [MAINTAINER.md](MAINTAINER.md),
+[RECOVERY.md](RECOVERY.md), [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md), and
+[DATA_GOVERNANCE.md](DATA_GOVERNANCE.md).
 
 ## Standalone Use
 

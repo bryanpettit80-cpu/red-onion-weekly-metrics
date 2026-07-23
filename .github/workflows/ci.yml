@@ -18,17 +18,34 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Reject whitespace errors
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}" HEAD
+          else
+            git diff --check HEAD^ HEAD
+          fi
       - name: Install dependencies
         working-directory: _program
-        run: python -m pip install -e ".[dev]"
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install -e ".[dev]"
+          python -m pip check
+      - name: Validate configuration
+        working-directory: _program
+        run: python red_onion_config.py --config red_onion_config.json
       - name: Run tests
         working-directory: _program
         run: python -m pytest -q
       - name: Compile script
-        run: python -m py_compile _program/red_onion_weekly_metrics.py
+        working-directory: _program
+        run: python -m py_compile red_onion_config.py red_onion_integrity.py red_onion_runtime.py red_onion_weekly_metrics.py
 
   windows-launcher-test:
     runs-on: windows-latest
@@ -39,7 +56,10 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         working-directory: _program
-        run: python -m pip install -e ".[dev]"
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install -e ".[dev]"
+          python -m pip check
       - name: Run Windows launcher behavior tests
         working-directory: _program
         run: python -m pytest -q tests/test_launcher_integrity.py

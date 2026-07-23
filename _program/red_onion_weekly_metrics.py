@@ -10,6 +10,7 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 import tempfile
 import uuid
 from collections import defaultdict
@@ -46,73 +47,15 @@ from red_onion_integrity import (
     write_chained_manifest_atomic,
     write_json_manifest_atomic,
 )
+from red_onion_config import DEFAULT_CONFIG, load_config
+from red_onion_runtime import (
+    RunAttemptRecorder,
+    RunReadiness,
+    RunStage,
+    safe_message,
+    write_json_atomic,
+)
 
-
-DEFAULT_CONFIG: dict[str, Any] = {
-    "locations": {
-        "RC Richmond": {"short_code": "RVA"},
-        "RC Virginia Beach": {"short_code": "VB"},
-    },
-    "public_min_guest_count": 1,
-    "master_min_guest_count_for_rankings": 1,
-    "dashboard_min_guest_count_for_trends": 25,
-    "dashboard_min_active_days_for_trends": 3,
-    "dashboard_min_prior_full_weeks": 2,
-    "dashboard_min_prior_guest_count": 50,
-    "dashboard_baseline_full_weeks": 4,
-    "dashboard_long_term_full_weeks": 8,
-    "dashboard_long_term_block_weeks": 4,
-    "dashboard_long_term_full_min_recent_guests": 100,
-    "dashboard_long_term_full_min_earlier_guests": 100,
-    "dashboard_long_term_developing_min_total_weeks": 6,
-    "dashboard_long_term_developing_min_recent_weeks": 3,
-    "dashboard_long_term_developing_min_earlier_weeks": 2,
-    "dashboard_long_term_developing_min_recent_guests": 75,
-    "dashboard_long_term_developing_min_earlier_guests": 50,
-    "dashboard_exclude_name_contains": ["Banquet", "Server"],
-    "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout"],
-    "management_score_thresholds": {
-        "check_average": {"neutral": 2.5, "strong": 5.0, "lower_is_better": False},
-        "wine_pct": {"neutral": 0.005, "strong": 0.01, "lower_is_better": False},
-        "rate_of_sale_by_guest_count": {
-            "neutral": 0.005,
-            "strong": 0.01,
-            "lower_is_better": True,
-        },
-        "average_ticket_time_seconds": {
-            "neutral": 150.0,
-            "strong": 300.0,
-            "lower_is_better": True,
-        },
-    },
-    "management_materiality": {
-        "sales_pct": 0.05,
-        "guest_pct": 0.05,
-        "check_average": 2.5,
-        "wine_pct": 0.005,
-        "rate": 0.005,
-        "ticket_minutes": 2.5,
-    },
-    "public_name_aliases": {
-        "Bar 1 Bar 1": "Bar",
-        "Bar Server": "Bar",
-        "BarPatio Bartender Patio": "Patio",
-    },
-    "public_exclude_name_contains": [
-        "Banquet",
-        "Takeout",
-        "Server Server",
-        "Jonathan Josephs",
-        "Sean Kelly",
-        "Bryan Pettit",
-        "Christina Rivera",
-        "Paul Sorensen",
-        "Paula Friedrich",
-        "Cicily McFadden",
-        "AGM",
-        "manager",
-    ],
-}
 
 METRICS = [
     ("gross_sales", "Gross Sales"),
@@ -178,13 +121,53 @@ ACTION_STATUS_CHOICES: tuple[str, ...] = (
     "Complete",
     "Dismissed",
 )
+MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v1"
+EVIDENCE_DETAIL_HEADERS: tuple[str, ...] = (
+    "Evidence ID",
+    "Action ID",
+    "Action Code",
+    "Reason Code",
+    "Priority",
+    "Status",
+    "Owner",
+    "Due Date",
+    "Location",
+    "Person / Area",
+    "Evidence Week Ends",
+    "Evidence Sources",
+    "Metric Evidence",
+    "Methodology Version",
+    "Last Seen",
+)
+ACTION_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "Evidence ID",
+    "Action Code",
+    "Reason Code",
+    "Evidence Week Ends",
+    "Evidence Sources",
+    "Metric Evidence",
+    "Methodology Version",
+)
 
-VISIBLE_MANAGEMENT_SHEETS = [
+PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS = [
     "Dashboard",
     "Action Board",
     "Server Scorecard",
     "Store & Group Scorecards",
     "Rising & Falling Stars",
+    "Action History",
+    "Data Quality",
+    "Management Setup",
+    "Run Notes",
+]
+VISIBLE_MANAGEMENT_SHEETS = [
+    "Dashboard",
+    "Action Focus",
+    "Action Board",
+    "Server Scorecard",
+    "Store & Group Scorecards",
+    "Rising & Falling Stars",
+    "Evidence Detail",
     "Action History",
     "Data Quality",
     "Management Setup",
@@ -201,6 +184,8 @@ DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
 DAILY_REPORT_FORMAT_LABEL = ".xls or .xlsx"
 CANONICAL_DAILY_ARCHIVE_FOLDER = "processed-daily-reports"
 INTEGRITY_MANIFEST_FOLDER = "run-manifests"
+RUN_ATTEMPT_FOLDER = "run-attempts"
+LAST_RUN_STATUS_FILE = "LAST RUN STATUS.txt"
 INTEGRITY_ANCHOR_ENVIRONMENT_VARIABLE = "RED_ONION_INTEGRITY_ANCHOR_DIR"
 INTEGRITY_ANCHOR_SCHEMA_VERSION = 1
 GENERATED_WORKBOOK_ARCHIVE_FOLDER = "generated-workbooks"
@@ -248,6 +233,10 @@ class MetricRecord:
     wine_pct: float
     rate_of_sale_by_guest_count: float
     average_ticket_time_seconds: float
+    source_sha256: str = ""
+    source_format: str = ""
+    parser_engine: str = ""
+    report_date_source: str = "Unknown"
 
 
 @dataclass(frozen=True)
@@ -323,16 +312,73 @@ class LatestWeekReadiness:
         return ", ".join(self.missing_parts)
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    config = json.loads(json.dumps(DEFAULT_CONFIG))
-    if path.exists():
-        user_config = json.loads(path.read_text(encoding="utf-8"))
-        for key, value in user_config.items():
-            if isinstance(value, dict) and isinstance(config.get(key), dict):
-                config[key].update(value)
-            else:
-                config[key] = value
-    return config
+@dataclass(frozen=True)
+class EvidenceRecord:
+    action_id: str
+    evidence_id: str
+    action_code: str
+    reason_code: str
+    location: str
+    person_or_area: str
+    priority: str
+    status: str
+    owner: str
+    due_date: str | None
+    recommended_next_step: str
+    why_it_matters: str
+    evidence_week_ends: str
+    evidence_sources: tuple[dict[str, Any], ...]
+    metric_evidence: dict[str, Any]
+    methodology_version: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_id": self.action_id,
+            "evidence_id": self.evidence_id,
+            "action_code": self.action_code,
+            "reason_code": self.reason_code,
+            "location": self.location,
+            "person_or_area": self.person_or_area,
+            "priority": self.priority,
+            "status": self.status,
+            "owner": self.owner,
+            "due_date": self.due_date,
+            "recommended_next_step": self.recommended_next_step,
+            "why_it_matters": self.why_it_matters,
+            "evidence_week_ends": self.evidence_week_ends,
+            "evidence_sources": list(self.evidence_sources),
+            "metric_evidence": self.metric_evidence,
+            "methodology_version": self.methodology_version,
+        }
+
+
+@dataclass(frozen=True)
+class ManagementEvidencePackageV1:
+    source: dict[str, Any]
+    records: tuple[EvidenceRecord, ...]
+    retention_delete_after: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": "ManagementEvidencePackageV1",
+            "schema_version": 1,
+            "classification": "Restricted Employee Performance Information",
+            "permitted_use": (
+                "Management-approved analysis of identifiable action and coaching evidence."
+            ),
+            "retention": {
+                "days": 365,
+                "delete_after": self.retention_delete_after,
+                "automatic_deletion": False,
+            },
+            "distribution": {
+                "mode": "Manual local export after exact-fingerprint approval",
+                "automatic_upload": False,
+                "automatic_send": False,
+            },
+            "source": self.source,
+            "records": [record.to_dict() for record in self.records],
+        }
 
 
 def is_blank(value: Any) -> bool:
@@ -390,18 +436,26 @@ def parse_date_text(text: str) -> date:
     raise ValueError(f"Could not parse report date: {text}")
 
 
-def parse_report_date(df: pd.DataFrame, path: Path) -> date:
+def parse_report_date_with_source(df: pd.DataFrame, path: Path) -> tuple[date, str]:
     for value in df.to_numpy().ravel():
         if isinstance(value, str) and "Date(s):" in value:
             match = re.search(r"Date\(s\):\s*([^\n]+)", value)
             if match:
                 date_text = match.group(1).split("-")[-1].strip()
-                return parse_date_text(date_text)
+                return parse_date_text(date_text), "Workbook Date(s) field"
     match = re.search(r"(\d{2})-(\d{2})-(\d{4})", path.name)
     if match:
         month, day, year = map(int, match.groups())
-        return date(year, month, day) - timedelta(days=FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS)
+        return (
+            date(year, month, day)
+            - timedelta(days=FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS),
+            "Filename fallback minus one business-date day",
+        )
     raise ValueError(f"Could not find report date in {path.name}")
+
+
+def parse_report_date(df: pd.DataFrame, path: Path) -> date:
+    return parse_report_date_with_source(df, path)[0]
 
 
 def find_header_row(df: pd.DataFrame) -> tuple[int, int, list[int]]:
@@ -456,7 +510,9 @@ def daily_report_excel_engine(path: Path) -> str:
 
 
 def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]:
-    with pd.ExcelFile(path, engine=daily_report_excel_engine(path)) as workbook:
+    parser_engine = daily_report_excel_engine(path)
+    source_sha256 = sha256_file(path)
+    with pd.ExcelFile(path, engine=parser_engine) as workbook:
         if "Report(All)" not in workbook.sheet_names:
             if "No Data Available" in workbook.sheet_names:
                 raise ValueError(
@@ -471,7 +527,7 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
                 "Daily Report export, then rerun."
             )
         df = workbook.parse("Report(All)", header=None)
-    report_date = parse_report_date(df, path)
+    report_date, report_date_source = parse_report_date_with_source(df, path)
     header_row, location_col, block_starts = find_header_row(df)
     location_names = set(config["locations"])
     records: list[MetricRecord] = []
@@ -520,6 +576,10 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
                     wine_pct=wine_pct,
                     rate_of_sale_by_guest_count=rate,
                     average_ticket_time_seconds=ticket_seconds,
+                    source_sha256=source_sha256,
+                    source_format=path.suffix.lower(),
+                    parser_engine=parser_engine,
+                    report_date_source=report_date_source,
                 )
             )
             break
@@ -1726,6 +1786,7 @@ def aggregate_records(
                     "ticket_weight": 0.0,
                     "active_dates": set(),
                     "source_files": set(),
+                    "source_evidence": set(),
                 }
             )
 
@@ -1745,6 +1806,16 @@ def aggregate_records(
         if record.guest_count > 0 or record.gross_sales > 0:
             group["active_dates"].add(record.report_date)
         group["source_files"].add(record.source_file)
+        group["source_evidence"].add(
+            (
+                record.source_file,
+                record.source_sha256,
+                record.source_format,
+                record.parser_engine,
+                record.report_date_source,
+                record.report_date.isoformat(),
+            )
+        )
 
     rollups: list[dict[str, Any]] = []
     for group in groups.values():
@@ -1765,6 +1836,17 @@ def aggregate_records(
         rollup["active_days"] = len(group["active_dates"])
         rollup["source_days"] = len(group["active_dates"])
         rollup["source_files"] = ", ".join(sorted(group["source_files"]))
+        rollup["source_evidence"] = [
+            {
+                "source_file": item[0],
+                "sha256": item[1] or None,
+                "format": item[2] or None,
+                "parser_engine": item[3] or None,
+                "report_date_source": item[4],
+                "report_date": item[5],
+            }
+            for item in sorted(group["source_evidence"])
+        ]
         for helper in (
             "rate_weighted_sum",
             "rate_weight",
@@ -4404,6 +4486,28 @@ def metric_driver(field: str, change: float) -> str:
     return f"Ticket {minutes:.1f} min {direction}"
 
 
+def merged_source_evidence(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        for item in row.get("source_evidence", []) or []:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                str(item.get("source_file") or ""),
+                str(item.get("sha256") or ""),
+                str(item.get("report_date") or ""),
+            )
+            evidence[key] = {
+                "source_file": excel_safe_text(key[0]),
+                "sha256": key[1] or None,
+                "report_date": key[2] or None,
+                "format": item.get("format"),
+                "parser_engine": item.get("parser_engine"),
+                "report_date_source": item.get("report_date_source") or "Unknown",
+            }
+    return [evidence[key] for key in sorted(evidence)]
+
+
 def recommended_server_follow_up(row: dict[str, Any]) -> str:
     negative_fields = [field for field, score in row["metric_scores"].items() if score < 0]
     positive_fields = [field for field, score in row["metric_scores"].items() if score > 0]
@@ -4711,6 +4815,19 @@ def management_server_rows(
             "confidence": confidence,
             "prominent": prominent,
             "why": " | ".join(why_parts) if why_parts else "No material movement",
+            "evidence_week_ends": [
+                week_end.isoformat()
+                for week_end in sorted(
+                    {
+                        latest_week_end,
+                        *eligible_week_ends,
+                        *history_week_ends,
+                    }
+                )
+            ],
+            "source_evidence": merged_source_evidence(
+                [current, *prior_rows, *server_history_rows]
+            ),
         }
         row["recommended_next_step"] = recommended_server_follow_up(row)
         context = server_trend_context(momentum, long_term_direction)
@@ -4835,6 +4952,15 @@ def management_entity_rows(
                 "priority": priority,
                 "status": status,
                 "recommended_focus": focus,
+                "evidence_week_ends": [
+                    week_end.isoformat()
+                    for week_end in sorted(
+                        {latest["week_end"], *prior_full_ends}
+                    )
+                ],
+                "source_evidence": merged_source_evidence(
+                    [latest, *baseline_rows]
+                ),
             }
         )
     output.sort(key=lambda row: (0 if row["entity"] == "All Stores" else 1, row["entity"]))
@@ -5036,6 +5162,7 @@ def read_management_state(
         "owner_roster_capacity": OWNER_ROSTER_MIN_EDIT_ROWS,
         "active_actions": [],
         "action_history": [],
+        "evidence_by_action_id": {},
     }
     if not output_path.exists():
         return state
@@ -5088,6 +5215,13 @@ def read_management_state(
             )
         if "Action History" in wb.sheetnames:
             state["action_history"] = records_from_sheet(wb["Action History"], "Action ID")
+        if "Evidence Detail" in wb.sheetnames:
+            evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
+            state["evidence_by_action_id"] = {
+                str(row.get("Action ID")): row
+                for row in evidence_rows
+                if row.get("Action ID")
+            }
     finally:
         wb.close()
     return state
@@ -5829,10 +5963,14 @@ def validate_management_workbook_controls(
     wb: Workbook,
     *,
     protect_objects_and_scenarios: bool,
+    visible_sheets: Iterable[str] | None = None,
 ) -> tuple[Any, Any]:
     """Validate controls shared by strict and manifest-bound pre-contract workbooks."""
 
-    missing = [name for name in VISIBLE_MANAGEMENT_SHEETS if name not in wb.sheetnames]
+    visible_sheet_names = tuple(
+        VISIBLE_MANAGEMENT_SHEETS if visible_sheets is None else visible_sheets
+    )
+    missing = [name for name in visible_sheet_names if name not in wb.sheetnames]
     if missing:
         raise IntegrityError(
             f"Generated master workbook is missing required sheets: {', '.join(missing)}"
@@ -5865,7 +6003,7 @@ def validate_management_workbook_controls(
             f"approved allowlist ({detail[0] if detail else 'unknown mismatch'})."
         )
     for ws in wb.worksheets:
-        expected_state = "visible" if ws.title in VISIBLE_MANAGEMENT_SHEETS else "veryHidden"
+        expected_state = "visible" if ws.title in visible_sheet_names else "veryHidden"
         if ws.sheet_state != expected_state:
             raise IntegrityError(
                 f"Worksheet {ws.title!r} has state {ws.sheet_state!r}; "
@@ -5970,6 +6108,52 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
     return actual_digest
 
 
+def validate_previous_action_schema_workbook(
+    path: Path, expected_digest: str
+) -> str:
+    """Verify the exact manifest-bound workbook emitted before Action Focus."""
+
+    required_digest = str(expected_digest).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
+        raise IntegrityError(
+            "The previous workbook schema requires a valid recorded digest."
+        )
+    reject_unapproved_workbook_drawings(path)
+    wb = load_workbook(path, data_only=False)
+    try:
+        if stamped_workbook_protection_contract(wb) != WORKBOOK_PROTECTION_CONTRACT:
+            raise IntegrityError(
+                "The previous workbook schema has an unsupported protection contract."
+            )
+        validate_management_workbook_controls(
+            wb,
+            protect_objects_and_scenarios=True,
+            visible_sheets=PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS,
+        )
+        expected_validations = expected_management_list_validations(wb)
+        require_exact_validation_count(
+            wb, expected_validations, contract_label="previous action schema"
+        )
+        for sheet_name, formula1, allow_blank, sqref, label in expected_validations:
+            require_stop_style_list_validation(
+                wb[sheet_name],
+                formula1=formula1,
+                label=label,
+                allow_blank=allow_blank,
+                sqref=sqref,
+            )
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    actual_digest = workbook_generated_content_sha256(path)
+    if stamped != required_digest or actual_digest != required_digest:
+        raise IntegrityError(
+            "Previous-schema workbook verification failed: the recorded, stamped, "
+            "and actual generated-content digests must match exactly."
+        )
+    return actual_digest
+
+
 def validate_pre_contract_management_workbook(path: Path, expected_digest: str) -> str:
     """Validate only the exact PR #9 workbook state pinned by an integrity manifest."""
 
@@ -5983,8 +6167,18 @@ def validate_pre_contract_management_workbook(path: Path, expected_digest: str) 
             raise IntegrityError(
                 "The compatibility verifier only accepts a markerless pre-contract workbook."
             )
+        legacy_visible_sheets = (
+            VISIBLE_MANAGEMENT_SHEETS
+            if all(
+                name in wb.sheetnames
+                for name in ("Action Focus", "Evidence Detail")
+            )
+            else PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS
+        )
         validate_management_workbook_controls(
-            wb, protect_objects_and_scenarios=False
+            wb,
+            protect_objects_and_scenarios=False,
+            visible_sheets=legacy_visible_sheets,
         )
         require_pre_contract_list_validations(wb)
         stamped = stamped_workbook_digest(wb)
@@ -6030,10 +6224,17 @@ def verify_existing_management_workbook_integrity(
         )
         stamped = stamped_workbook_digest(wb)
         protection_contract = stamped_workbook_protection_contract(wb)
+        has_action_focus_schema = all(
+            name in wb.sheetnames for name in ("Action Focus", "Evidence Detail")
+        )
     finally:
         wb.close()
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
-        return validate_management_workbook(path, expected_digest or stamped)
+        if has_action_focus_schema:
+            return validate_management_workbook(path, expected_digest or stamped)
+        return validate_previous_action_schema_workbook(
+            path, expected_digest or stamped or ""
+        )
     if protection_contract is not None:
         raise IntegrityError(
             "The existing master workbook declares an unsupported protection contract. "
@@ -6075,6 +6276,169 @@ def compact_server_evidence(row: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
+def stable_action_code(action: Any) -> str:
+    codes = {
+        "coach now": "COACH_NOW",
+        "protect performance": "PROTECT_PERFORMANCE",
+        "reinforce improvement": "REINFORCE_IMPROVEMENT",
+        "recognize & replicate": "RECOGNIZE_REPLICATE",
+        "coach fundamentals": "COACH_FUNDAMENTALS",
+        "store review": "STORE_REVIEW",
+        "group review": "GROUP_REVIEW",
+        "data quality": "DATA_QUALITY_REVIEW",
+        "paused carryover": "PAUSED_CARRYOVER",
+        "monitor": "MONITOR",
+    }
+    text = str(action or "").strip().casefold()
+    return codes.get(text, re.sub(r"[^A-Z0-9]+", "_", text.upper()).strip("_") or "REVIEW")
+
+
+def stable_reason_code(signal: dict[str, Any]) -> str:
+    action = str(signal.get("Action") or "").strip().casefold()
+    momentum = str(signal.get("Momentum") or "").strip().casefold()
+    performance = str(signal.get("Performance Level") or "").strip().casefold()
+    entity_key = str(signal.get("Entity Key") or "").casefold()
+    if action == "data quality":
+        return "DQ_INCOMPLETE_LATEST_WEEK"
+    if action == "paused carryover":
+        return "LATEST_WEEK_INCOMPLETE_PRIOR_ACTION_RETAINED"
+    if entity_key.startswith("server|"):
+        if momentum == "falling" and performance == "below benchmark":
+            return "SERVER_FALLING_BELOW_BENCHMARK"
+        if momentum == "falling":
+            return "SERVER_FALLING"
+        if momentum == "rising" and performance == "below benchmark":
+            return "SERVER_RISING_BELOW_BENCHMARK"
+        if momentum == "rising":
+            return "SERVER_RISING"
+        if performance == "below benchmark":
+            return "SERVER_BELOW_BENCHMARK"
+        return "SERVER_MATERIAL_SIGNAL"
+    if entity_key.startswith("store|"):
+        return "STORE_" + stable_action_code(signal.get("Signal"))
+    if entity_key.startswith("group|"):
+        return "GROUP_" + stable_action_code(signal.get("Signal"))
+    return stable_action_code(signal.get("Signal"))
+
+
+def enrich_management_signal(signal: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(signal)
+    week_ends = sorted(
+        {
+            str(value)
+            for value in enriched.pop("_evidence_week_ends", []) or []
+            if value
+        }
+    )
+    sources = enriched.pop("_source_evidence", []) or []
+    metric_evidence = enriched.pop("_metric_evidence", {}) or {}
+    action_code = stable_action_code(enriched.get("Action"))
+    reason_code = stable_reason_code(enriched)
+    evidence_payload = {
+        "entity_key": enriched.get("Entity Key"),
+        "last_seen": (
+            enriched.get("Last Seen").isoformat()
+            if isinstance(enriched.get("Last Seen"), (date, datetime))
+            else enriched.get("Last Seen")
+        ),
+        "action_code": action_code,
+        "reason_code": reason_code,
+        "week_ends": week_ends,
+        "sources": sources,
+        "metric_evidence": metric_evidence,
+        "methodology_version": MANAGEMENT_METHODOLOGY_VERSION,
+    }
+    enriched.update(
+        {
+            "Action Code": action_code,
+            "Reason Code": reason_code,
+            "Evidence ID": canonical_json_sha256(evidence_payload)[:16].upper(),
+            "Evidence Week Ends": ", ".join(week_ends),
+            "Evidence Sources": json.dumps(
+                sources, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+            "Metric Evidence": json.dumps(
+                metric_evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "Methodology Version": MANAGEMENT_METHODOLOGY_VERSION,
+        }
+    )
+    return enriched
+
+
+def refresh_management_evidence(
+    signal: dict[str, Any],
+    *,
+    additional_week_ends: Iterable[date | str] = (),
+    metric_evidence_updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Recompute evidence codes while preserving the prior evidence inputs."""
+
+    refreshed = dict(signal)
+    week_value = refreshed.get("Evidence Week Ends")
+    if isinstance(week_value, str):
+        week_ends = [
+            item.strip() for item in week_value.split(",") if item.strip()
+        ]
+    elif isinstance(week_value, (list, tuple)):
+        week_ends = [str(item) for item in week_value if item]
+    else:
+        last_seen = as_date(refreshed.get("Last Seen"))
+        week_ends = [last_seen.isoformat()] if last_seen else []
+    week_ends.extend(
+        value.isoformat() if isinstance(value, date) else str(value)
+        for value in additional_week_ends
+        if value
+    )
+
+    def decoded_json(value: Any, expected_type: type, label: str) -> Any:
+        if value in (None, ""):
+            return expected_type()
+        if isinstance(value, expected_type):
+            return value
+        try:
+            parsed = json.loads(str(value))
+        except json.JSONDecodeError as exc:
+            raise IntegrityError(f"{label} is not valid JSON: {exc.msg}.") from exc
+        if not isinstance(parsed, expected_type):
+            raise IntegrityError(
+                f"{label} must contain a JSON {expected_type.__name__}."
+            )
+        return parsed
+
+    sources = decoded_json(
+        refreshed.get("Evidence Sources"), list, "Evidence Sources"
+    )
+    metric_evidence = decoded_json(
+        refreshed.get("Metric Evidence"), dict, "Metric Evidence"
+    )
+    if metric_evidence_updates:
+        metric_evidence.update(metric_evidence_updates)
+    if not sources and not metric_evidence:
+        metric_evidence = {
+            "signal": refreshed.get("Signal"),
+            "why_it_matters": refreshed.get("Why It Matters"),
+            "confidence": refreshed.get("Confidence"),
+            "provenance_status": (
+                "Legacy action carried forward before row-level source evidence "
+                "was introduced."
+            ),
+        }
+    for field in ACTION_EVIDENCE_FIELDS:
+        refreshed.pop(field, None)
+    refreshed.update(
+        {
+            "_evidence_week_ends": week_ends,
+            "_source_evidence": sources,
+            "_metric_evidence": metric_evidence,
+        }
+    )
+    return enrich_management_signal(refreshed)
+
+
 def build_management_action_signals(
     server_rows: list[dict[str, Any]],
     store_rows: list[dict[str, Any]],
@@ -6108,6 +6472,21 @@ def build_management_action_signals(
                 "Momentum": row["momentum"],
                 "Confidence": row["confidence"],
                 "Last Seen": row["week_end"],
+                "_evidence_week_ends": row.get("evidence_week_ends", []),
+                "_source_evidence": row.get("source_evidence", []),
+                "_metric_evidence": {
+                    "current_sample": {
+                        "guest_count": row.get("guest_count"),
+                        "active_days": row.get("active_days"),
+                    },
+                    "recent_changes": row.get("changes"),
+                    "recent_metric_scores": row.get("metric_scores"),
+                    "long_term_changes": row.get("long_term_changes"),
+                    "long_term_metric_scores": row.get("long_term_metric_scores"),
+                    "benchmark_values": row.get("benchmark_values"),
+                    "benchmark_sources": row.get("benchmark_sources"),
+                    "history_used": row.get("history_used"),
+                },
             }
         )
     analytical_rows = (("store", store_rows), ("group", group_rows)) if analytical_ready else ()
@@ -6138,6 +6517,19 @@ def build_management_action_signals(
                     "Momentum": "Watch",
                     "Confidence": "High" if row["baseline_weeks"] >= 2 else "Low Sample",
                     "Last Seen": latest["week_end"],
+                    "_evidence_week_ends": row.get("evidence_week_ends", []),
+                    "_source_evidence": row.get("source_evidence", []),
+                    "_metric_evidence": {
+                        "latest": {
+                            field: latest.get(field)
+                            for field, _, _ in MANAGEMENT_METRICS
+                        },
+                        "benchmark_values": row.get("benchmark_values"),
+                        "benchmark_sources": row.get("benchmark_sources"),
+                        "prior_changes": row.get("prior_changes"),
+                        "benchmark_changes": row.get("benchmark_changes"),
+                        "baseline_weeks": row.get("baseline_weeks"),
+                    },
                 }
             )
     if readiness is not None and readiness.latest_week_end is not None:
@@ -6167,6 +6559,17 @@ def build_management_action_signals(
                     "Momentum": "Not Scored",
                     "Confidence": "Low Sample",
                     "Last Seen": readiness.latest_week_end,
+                    "_evidence_week_ends": [readiness.latest_week_end.isoformat()],
+                    "_source_evidence": (
+                        row.get("source_evidence", []) if row else []
+                    ),
+                    "_metric_evidence": {
+                        "source_days": source_days,
+                        "expected_source_days": OPERATING_WEEK_DAYS,
+                        "missing_dates": [
+                            item.isoformat() for item in readiness.missing_dates
+                        ],
+                    },
                 }
             )
         if readiness.missing_dates and not readiness.location_gaps:
@@ -6184,6 +6587,18 @@ def build_management_action_signals(
                     "Momentum": "Not Scored",
                     "Confidence": "Low Sample",
                     "Last Seen": readiness.latest_week_end,
+                    "_evidence_week_ends": [readiness.latest_week_end.isoformat()],
+                    "_source_evidence": merged_source_evidence(
+                        readiness.latest_location_rows
+                    ),
+                    "_metric_evidence": {
+                        "missing_dates": [
+                            item.isoformat() for item in readiness.missing_dates
+                        ],
+                        "expected_dates": [
+                            item.isoformat() for item in readiness.expected_dates
+                        ],
+                    },
                 }
             )
     elif weekly_location_rows:
@@ -6206,9 +6621,15 @@ def build_management_action_signals(
                     "Momentum": "Not Scored",
                     "Confidence": "Low Sample",
                     "Last Seen": latest_week_end,
+                    "_evidence_week_ends": [latest_week_end.isoformat()],
+                    "_source_evidence": row.get("source_evidence", []),
+                    "_metric_evidence": {
+                        "source_days": row.get("source_days"),
+                        "expected_source_days": OPERATING_WEEK_DAYS,
+                    },
                 }
             )
-    return signals
+    return [enrich_management_signal(signal) for signal in signals]
 
 
 def merge_management_actions(
@@ -6216,12 +6637,28 @@ def merge_management_actions(
     state: dict[str, Any],
     readiness: LatestWeekReadiness | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    evidence_by_action_id = state.get("evidence_by_action_id", {})
+    prior_rows = []
+    for row in state.get("active_actions", []):
+        enriched_prior = dict(row)
+        evidence = evidence_by_action_id.get(str(row.get("Action ID")), {})
+        enriched_prior.update(
+            {field: evidence.get(field) for field in ACTION_EVIDENCE_FIELDS}
+        )
+        prior_rows.append(enriched_prior)
     prior_active = {
         str(row.get("Entity Key", "")).casefold(): row
-        for row in state.get("active_actions", [])
+        for row in prior_rows
         if row.get("Entity Key")
     }
-    history = list(state.get("action_history", []))
+    history = []
+    for row in state.get("action_history", []):
+        enriched_history = dict(row)
+        evidence = evidence_by_action_id.get(str(row.get("Action ID")), {})
+        enriched_history.update(
+            {field: evidence.get(field) for field in ACTION_EVIDENCE_FIELDS}
+        )
+        history.append(enriched_history)
     current: list[dict[str, Any]] = []
     matched_keys: set[str] = set()
     completed_statuses = {"complete", "dismissed"}
@@ -6308,7 +6745,37 @@ def merge_management_actions(
             paused["Momentum"] = "Not Scored"
             paused["Confidence"] = "Paused"
             paused["Signal State"] = "Paused / Carryover"
-            current.append(paused)
+            paused_context = {
+                "latest_week_end": (
+                    readiness.latest_week_end.isoformat()
+                    if readiness.latest_week_end
+                    else None
+                ),
+                "expected_dates": [
+                    value.isoformat() for value in readiness.expected_dates
+                ],
+                "received_dates": sorted(
+                    value.isoformat() for value in readiness.received_dates
+                ),
+                "missing_dates": [
+                    value.isoformat() for value in readiness.missing_dates
+                ],
+                "location_gaps": list(readiness.location_gaps),
+                "missing_text": missing_text,
+            }
+            current.append(
+                refresh_management_evidence(
+                    paused,
+                    additional_week_ends=(
+                        [readiness.latest_week_end]
+                        if readiness.latest_week_end
+                        else []
+                    ),
+                    metric_evidence_updates={
+                        "paused_carryover": paused_context
+                    },
+                )
+            )
             continue
         cleared = dict(prior)
         cleared["Signal State"] = "Cleared"
@@ -6395,10 +6862,12 @@ def remove_sheet_if_present(wb: Workbook, name: str) -> None:
 def add_management_navigation(ws) -> None:
     links = [
         ("Dashboard", "Dashboard"),
+        ("Focus", "Action Focus"),
         ("Actions", "Action Board"),
         ("Servers", "Server Scorecard"),
         ("Stores", "Store & Group Scorecards"),
         ("Stars", "Rising & Falling Stars"),
+        ("Evidence", "Evidence Detail"),
         ("Quality", "Data Quality"),
         ("Setup", "Management Setup"),
     ]
@@ -6745,6 +7214,212 @@ def write_action_tracking_sheet(
             )
 
 
+def write_action_focus_sheet(
+    wb: Workbook, current_actions: list[dict[str, Any]]
+) -> None:
+    remove_sheet_if_present(wb, "Action Focus")
+    ws = wb.create_sheet("Action Focus")
+    headers = [
+        "Priority",
+        "Status",
+        "Owner",
+        "Due Date",
+        "Location",
+        "Person / Area",
+        "Action",
+        "Recommended Next Step",
+        "Why It Matters",
+        "Weeks Open",
+        "Open Action",
+    ]
+    style_management_title(ws, "Action Focus", len(headers))
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=len(headers))
+    ws.cell(
+        row=3,
+        column=1,
+        value=(
+            "Immediate manager work only. Use Open Action to update owner, due date, "
+            "status, or notes on the protected Action Board."
+        ),
+    )
+    ws.cell(row=3, column=1).fill = PatternFill("solid", fgColor="FFF2CC")
+    ws.cell(row=3, column=1).font = Font(bold=True)
+    ws.cell(row=3, column=1).alignment = Alignment(wrap_text=True)
+    actionable = [
+        row
+        for row in current_actions
+        if str(row.get("Status") or "").strip().casefold()
+        not in {"complete", "dismissed"}
+    ]
+    header_row = 5
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    board_rows = {
+        str(row.get("Action ID")): index
+        for index, row in enumerate(current_actions, start=5)
+    }
+    for row_index, action in enumerate(actionable, start=header_row + 1):
+        action_id = str(action.get("Action ID") or "")
+        values = [
+            action.get("Priority"),
+            action.get("Status"),
+            action.get("Owner"),
+            as_date(action.get("Due Date")),
+            action.get("Location"),
+            action.get("Person / Area"),
+            action.get("Action"),
+            action.get("Recommended Next Step"),
+            action.get("Why It Matters"),
+            action.get("Weeks Open"),
+            "Open in Action Board",
+        ]
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_index, column=col, value=excel_safe_text(value))
+            cell.alignment = Alignment(
+                vertical="top", wrap_text=col in {6, 7, 8, 9}
+            )
+        ws.cell(row=row_index, column=4).number_format = "m/d/yyyy"
+        target_row = board_rows.get(action_id)
+        if target_row:
+            link = ws.cell(row=row_index, column=11)
+            link.hyperlink = f"#'Action Board'!C{target_row}"
+            link.style = "Hyperlink"
+        fill = priority_fill(action.get("Priority"))
+        if fill:
+            ws.cell(row=row_index, column=1).fill = fill
+        ws.row_dimensions[row_index].height = 54
+    if actionable:
+        table = Table(
+            displayName="ActionFocusTable",
+            ref=f"A{header_row}:K{header_row + len(actionable)}",
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+    for column, width in {
+        "A": 12,
+        "B": 14,
+        "C": 18,
+        "D": 13,
+        "E": 20,
+        "F": 24,
+        "G": 23,
+        "H": 50,
+        "I": 44,
+        "J": 12,
+        "K": 19,
+    }.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = "E6"
+    ws.sheet_view.zoomScale = 85
+
+
+def action_with_evidence_fallback(action: dict[str, Any]) -> dict[str, Any]:
+    if (
+        action.get("Evidence ID")
+        and action.get("Action Code") == stable_action_code(action.get("Action"))
+        and action.get("Reason Code") == stable_reason_code(action)
+    ):
+        return dict(action)
+    return refresh_management_evidence(action)
+
+
+def write_evidence_detail_sheet(
+    wb: Workbook,
+    current_actions: list[dict[str, Any]],
+    action_history: list[dict[str, Any]],
+) -> None:
+    remove_sheet_if_present(wb, "Evidence Detail")
+    ws = wb.create_sheet("Evidence Detail")
+    style_management_title(ws, "Evidence Detail", len(EVIDENCE_DETAIL_HEADERS))
+    evidence_by_action: dict[str, dict[str, Any]] = {}
+    for action in [*action_history, *current_actions]:
+        action_id = str(action.get("Action ID") or "")
+        if action_id:
+            evidence_by_action[action_id] = action_with_evidence_fallback(action)
+    rows = sorted(
+        evidence_by_action.values(),
+        key=lambda row: (
+            str(row.get("Signal State") or "") != "Current",
+            as_date(row.get("Last Seen")) or date.min,
+            str(row.get("Action ID") or ""),
+        ),
+    )
+    header_row = 4
+    for col, header in enumerate(EVIDENCE_DETAIL_HEADERS, start=1):
+        cell = ws.cell(row=header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    board_rows = {
+        str(row.get("Action ID")): index
+        for index, row in enumerate(current_actions, start=5)
+    }
+    for row_index, action in enumerate(rows, start=header_row + 1):
+        for col, header in enumerate(EVIDENCE_DETAIL_HEADERS, start=1):
+            value = action.get(header)
+            cell = ws.cell(row=row_index, column=col, value=excel_safe_text(value))
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=header
+                in {"Evidence Sources", "Metric Evidence", "Evidence Week Ends"},
+            )
+            if header in {"Due Date", "Last Seen"}:
+                cell.number_format = "m/d/yyyy"
+        action_id = str(action.get("Action ID") or "")
+        target_row = board_rows.get(action_id)
+        if target_row:
+            evidence_cell = ws.cell(row=row_index, column=1)
+            evidence_cell.hyperlink = f"#'Action Board'!C{target_row}"
+            evidence_cell.style = "Hyperlink"
+        ws.row_dimensions[row_index].height = 72
+    if rows:
+        table = Table(
+            displayName="ManagementEvidenceDetail",
+            ref=(
+                f"A{header_row}:{get_column_letter(len(EVIDENCE_DETAIL_HEADERS))}"
+                f"{header_row + len(rows)}"
+            ),
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+    widths = {
+        "A": 20,
+        "B": 16,
+        "C": 25,
+        "D": 38,
+        "E": 12,
+        "F": 14,
+        "G": 18,
+        "H": 13,
+        "I": 20,
+        "J": 24,
+        "K": 42,
+        "L": 68,
+        "M": 68,
+        "N": 20,
+        "O": 13,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = "E5"
+    ws.sheet_view.zoomScale = 70
+
+
 def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     remove_sheet_if_present(wb, "Server Scorecard")
     headers = [
@@ -7020,6 +7695,7 @@ def write_management_data_quality_sheet(
     config: dict[str, Any],
     readiness: LatestWeekReadiness | None = None,
     owner_warnings: list[dict[str, Any]] | None = None,
+    records: list[MetricRecord] | None = None,
 ) -> None:
     remove_sheet_if_present(wb, "Data Quality")
     ws = wb.create_sheet("Data Quality")
@@ -7135,7 +7811,87 @@ def write_management_data_quality_sheet(
             ws.cell(row=row_index, column=6).fill = PatternFill(
                 "solid", fgColor="FFF2CC"
             )
-    for column, width in {"A": 16, "B": 22, "C": 14, "D": 14, "E": 16, "F": 24}.items():
+
+    source_start = warning_start + max(4, len(warnings) + 3)
+    ws.merge_cells(
+        start_row=source_start,
+        start_column=1,
+        end_row=source_start,
+        end_column=8,
+    )
+    ws.cell(
+        row=source_start,
+        column=1,
+        value="Source Parsing and Business-Date Provenance",
+    )
+    ws.cell(row=source_start, column=1).font = Font(bold=True)
+    ws.cell(row=source_start, column=1).fill = PatternFill(
+        "solid", fgColor="D9E1F2"
+    )
+    source_headers = [
+        "Source File",
+        "Report Date",
+        "Date Source",
+        "Format",
+        "Parser",
+        "SHA-256",
+        "Locations",
+        "Status",
+    ]
+    for col, header in enumerate(source_headers, start=1):
+        cell = ws.cell(row=source_start + 1, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="F3F4F6")
+        cell.font = Font(bold=True)
+    source_groups: dict[str, list[MetricRecord]] = defaultdict(list)
+    for record in records or []:
+        source_groups[record.source_file].append(record)
+    for row_index, (source_file, source_records) in enumerate(
+        sorted(source_groups.items()), start=source_start + 2
+    ):
+        first_record = source_records[0]
+        locations = sorted({record.location for record in source_records})
+        hashes = {record.source_sha256 for record in source_records if record.source_sha256}
+        date_sources = {
+            record.report_date_source for record in source_records
+        }
+        parsers = {record.parser_engine for record in source_records if record.parser_engine}
+        formats = {record.source_format for record in source_records if record.source_format}
+        status = (
+            "Verified"
+            if len(hashes) == 1
+            and len(date_sources) == 1
+            and len(parsers) == 1
+            and len(formats) == 1
+            else "Review"
+        )
+        values = [
+            excel_safe_text(source_file),
+            first_record.report_date,
+            "; ".join(sorted(date_sources)),
+            ", ".join(sorted(formats)) or "Unknown",
+            ", ".join(sorted(parsers)) or "Unknown",
+            next(iter(hashes)) if len(hashes) == 1 else "Unavailable",
+            ", ".join(locations),
+            status,
+        ]
+        for col, value in enumerate(values, start=1):
+            ws.cell(row=row_index, column=col, value=value)
+        ws.cell(row=row_index, column=2).number_format = "m/d/yyyy"
+        if status != "Verified":
+            ws.cell(row=row_index, column=8).fill = PatternFill(
+                "solid", fgColor="FFF2CC"
+            )
+
+    for column, width in {
+        "A": 44,
+        "B": 16,
+        "C": 34,
+        "D": 12,
+        "E": 16,
+        "F": 68,
+        "G": 30,
+        "H": 14,
+    }.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
 
@@ -7686,6 +8442,11 @@ def write_management_run_notes(
         ("Performance Level", "Latest metrics are assessed separately as Above Benchmark, On Track, or Below Benchmark."),
         ("Technical Trend Detail", "Server Week-over-Week Detail shows adjacent-week changes for audit use. Management coaching uses Recent Momentum and 8-Week Direction instead."),
         ("Action Tracking", "Owner, due date, status, and manager notes carry forward between weekly runs. Cleared signals move to Action History."),
+        (
+            "Evidence Contract",
+            "Action and reason codes, exact evidence weeks, source hashes/parser "
+            f"provenance, and metric inputs use methodology {MANAGEMENT_METHODOLOGY_VERSION}.",
+        ),
         ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
         ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
     ]
@@ -7725,9 +8486,11 @@ def finalize_management_workbook(wb: Workbook) -> None:
     wb._sheets = ordered
     wb.active = 0
     tab_colors = {
-        "Dashboard": "7A1E1E", "Action Board": "C00000", "Server Scorecard": "5B9BD5",
+        "Dashboard": "7A1E1E", "Action Focus": "C00000",
+        "Action Board": "C00000", "Server Scorecard": "5B9BD5",
         "Store & Group Scorecards": "70AD47", "Rising & Falling Stars": "FFC000",
-        "Action History": "A5A5A5", "Data Quality": "5B9BD5", "Management Setup": "4472C4",
+        "Evidence Detail": "8064A2", "Action History": "A5A5A5",
+        "Data Quality": "5B9BD5", "Management Setup": "4472C4",
         "Run Notes": "7F7F7F",
     }
     for name, color in tab_colors.items():
@@ -7793,8 +8556,9 @@ def write_master_workbook(
             remove_sheet_if_present(wb, "_Data Quality Detail")
             wb["Data Quality"].title = "_Data Quality Detail"
         for name in (
-            "Dashboard", "Action Board", "Rising & Falling Stars", "Run Notes",
+            "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars", "Run Notes",
             "Server Scorecard", "Store & Group Scorecards", "Action History", "Management Setup",
+            "Evidence Detail",
         ):
             remove_sheet_if_present(wb, name)
         write_management_setup_sheet(
@@ -7810,6 +8574,7 @@ def write_master_workbook(
             state["owner_roster_capacity"],
         )
         write_action_tracking_sheet(wb, "Action Board", current_actions, editable=True)
+        write_action_focus_sheet(wb, current_actions)
         write_server_scorecard_sheet(wb, visible_server_rows)
         write_store_group_scorecards_sheet(
             wb,
@@ -7821,8 +8586,14 @@ def write_master_workbook(
         )
         write_rising_falling_sheet(wb, visible_server_rows)
         write_action_tracking_sheet(wb, "Action History", action_history, editable=False)
+        write_evidence_detail_sheet(wb, current_actions, action_history)
         write_management_data_quality_sheet(
-            wb, weekly_location_rows, config, readiness, owner_warnings
+            wb,
+            weekly_location_rows,
+            config,
+            readiness,
+            owner_warnings,
+            records=records,
         )
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
@@ -8099,6 +8870,104 @@ def initialize_integrity_anchor(
         archive_dir, manifest, manifest_sha256, anchor_dir
     )
     return written
+
+
+def rebind_restored_integrity_anchor(
+    archive_dir: Path,
+    output_dir: Path,
+    source_anchor: Path,
+    anchor_dir: Path | None = None,
+) -> tuple[Path, Path]:
+    """Rebind a verified restored head to a replacement machine/path identity."""
+
+    archive_dir = archive_dir.resolve()
+    output_dir = output_dir.resolve()
+    source_anchor = regular_file_without_reparse_ancestors(
+        source_anchor, purpose="restored integrity anchor"
+    )
+    source_payload = read_json_manifest(source_anchor, root=source_anchor.parent)
+    if source_payload.get("schema_version") != INTEGRITY_ANCHOR_SCHEMA_VERSION:
+        raise IntegrityError(
+            "The restored integrity anchor has an unsupported schema version."
+        )
+    source_identity = str(source_payload.get("archive_identity_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_identity):
+        raise IntegrityError(
+            "The restored integrity anchor has an invalid archive identity."
+        )
+    manifest_name = source_payload.get("manifest_path")
+    if (
+        not isinstance(manifest_name, str)
+        or not manifest_name
+        or Path(manifest_name).name != manifest_name
+        or "/" in manifest_name
+        or "\\" in manifest_name
+    ):
+        raise IntegrityError(
+            "The restored integrity anchor contains an invalid manifest path."
+        )
+    source_manifest_sha256 = str(source_payload.get("manifest_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256):
+        raise IntegrityError(
+            "The restored integrity anchor contains an invalid manifest SHA-256."
+        )
+    latest = latest_integrity_manifest_path(archive_dir)
+    if latest is None or latest.name != manifest_name:
+        raise IntegrityError(
+            "The restored archive head does not match the manifest named by the "
+            "backed-up integrity anchor."
+        )
+    _, verified_sha256 = verify_integrity_state(
+        archive_dir, output_dir, latest
+    )
+    if not secrets.compare_digest(verified_sha256, source_manifest_sha256):
+        raise IntegrityError(
+            "The restored archive and managed outputs do not match the backed-up "
+            "integrity anchor."
+        )
+    destination = integrity_anchor_path(archive_dir, anchor_dir)
+    if os.path.lexists(destination):
+        raise IntegrityError(
+            "A trusted integrity anchor already exists for the restored archive; "
+            "refusing to replace it."
+        )
+    written = initialize_integrity_anchor(
+        archive_dir, latest, verified_sha256, anchor_dir
+    )
+    receipt = written.parent / (
+        "restore-rebind-"
+        f"{integrity_archive_identity(archive_dir)[:16]}-"
+        f"{verified_sha256[:16]}.receipt.json"
+    )
+    receipt_payload = {
+        "schema_version": 1,
+        "contract": "IntegrityAnchorRestoreRebindReceiptV1",
+        "rebound_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_anchor_file": source_anchor.name,
+        "source_anchor_sha256": sha256_file(source_anchor),
+        "source_archive_identity_sha256": source_identity,
+        "restored_archive_identity_sha256": integrity_archive_identity(
+            archive_dir
+        ),
+        "manifest_path": latest.name,
+        "manifest_sha256": verified_sha256,
+        "target_anchor_file": written.name,
+        "verification": (
+            "Full manifest chain, raw inventory, generated archive, published "
+            "outputs, and management workbook digest verified before rebind."
+        ),
+    }
+    try:
+        write_json_manifest_atomic(
+            receipt, receipt_payload, root=written.parent
+        )
+    except Exception as exc:
+        raise IntegrityError(
+            f"The restored anchor was rebound at {written}, but its audit receipt "
+            "could not be written. Preserve the anchor and investigate before "
+            "continuing."
+        ) from exc
+    return written, receipt
 
 
 def advance_integrity_anchor(
@@ -9000,10 +9869,128 @@ def rollback_published_outputs(
     return conflicts
 
 
+def record_run_stage(
+    args: argparse.Namespace,
+    stage: RunStage,
+    message: str,
+    *,
+    readiness: dict[str, RunReadiness | str] | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    recorder = getattr(args, "_run_attempt_recorder", None)
+    if isinstance(recorder, RunAttemptRecorder):
+        recorder.update(
+            stage,
+            message,
+            readiness=readiness,
+            details=details,
+        )
+
+
+def nearest_existing_directory(path: Path) -> Path:
+    candidate = path.absolute()
+    while not candidate.exists() and candidate.parent != candidate:
+        candidate = candidate.parent
+    if not candidate.exists():
+        raise OSError(f"No existing parent directory was found for {path}.")
+    return candidate
+
+
+def available_disk_bytes(path: Path) -> int:
+    return int(shutil.disk_usage(nearest_existing_directory(path)).free)
+
+
+def assert_staging_capacity(
+    output_dir: Path,
+    archive_dir: Path,
+    captured_inputs: Iterable[CapturedActiveInput],
+) -> int:
+    input_bytes = sum(item.fingerprint.size for item in captured_inputs)
+    required = max(256 * 1024 * 1024, input_bytes * 5)
+    for label, path in (("finished reports", output_dir), ("archive", archive_dir)):
+        free = available_disk_bytes(path)
+        if free < required:
+            raise OSError(
+                f"Insufficient disk space for {label}: {free / (1024 ** 2):.0f} MiB "
+                f"free; at least {required / (1024 ** 2):.0f} MiB required."
+            )
+    return required
+
+
 def run(args: argparse.Namespace) -> list[Path]:
+    config_path = Path(args.config).resolve()
+    # Validate before a folder, run lock, environment, or report artifact is created.
+    args._validated_config = load_config(config_path)
     archive_dir = Path(args.archive_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    operation = (
+        "integrity-baseline"
+        if bool(getattr(args, "initialize_integrity_baseline", False))
+        else "history-migration"
+        if bool(getattr(args, "migrate_history_only", False))
+        else "weekly-run"
+    )
+    run_id = str(uuid.uuid4())
+    args._attempt_run_id = run_id
     with workflow_run_lock(archive_dir):
-        return _run_with_lock_held(args)
+        attempt_root = managed_subdirectory(
+            archive_dir,
+            RUN_ATTEMPT_FOLDER,
+            purpose="run-attempt log",
+            create=True,
+        )
+        status_path = (
+            managed_direct_child(
+                output_dir,
+                output_dir / LAST_RUN_STATUS_FILE,
+                purpose="last-run status",
+                require_file=False,
+            )
+            if output_dir.is_dir()
+            else None
+        )
+        recorder = RunAttemptRecorder(
+            run_id=run_id,
+            operation=operation,
+            attempt_path=timestamped_manifest_path(
+                attempt_root, run_id, "attempt"
+            ),
+            status_path=status_path,
+        )
+        verified_release_commit = os.environ.get(
+            "RED_ONION_VERIFIED_RELEASE_COMMIT", ""
+        )
+        if re.fullmatch(r"[0-9a-fA-F]{40}", verified_release_commit):
+            recorder.readiness["release"] = RunReadiness.READY.value
+            recorder.details["verified_release_commit"] = (
+                verified_release_commit.lower()
+            )
+        args._run_attempt_recorder = recorder
+        recorder.update(
+            RunStage.WAITING_FOR_LOCK,
+            "Configuration validated and exclusive workflow lock acquired.",
+        )
+        try:
+            generated = _run_with_lock_held(args)
+        except Exception as exc:
+            try:
+                recorder.fail(exc)
+            except Exception:
+                # Attempt logging must never replace the original operational error.
+                pass
+            raise
+        if recorder.status_path is None and output_dir.is_dir():
+            recorder.status_path = managed_direct_child(
+                output_dir,
+                output_dir / LAST_RUN_STATUS_FILE,
+                purpose="last-run status",
+                require_file=False,
+            )
+        recorder.succeed(
+            "Run completed successfully.",
+            details={"generated_files": [path.name for path in generated]},
+        )
+        return generated
 
 
 def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
@@ -9011,7 +9998,9 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     output_dir = Path(args.output_dir).resolve()
     archive_dir = Path(args.archive_dir).resolve()
     config_path = Path(args.config).resolve()
-    config = load_config(config_path)
+    config = getattr(args, "_validated_config", None)
+    if config is None:
+        config = load_config(config_path)
     configured_anchor_dir = getattr(args, "integrity_anchor_dir", None)
     anchor_dir = (
         Path(configured_anchor_dir).expanduser().absolute()
@@ -9033,6 +10022,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             "--initialize-integrity-baseline cannot be combined with history migration options."
         )
 
+    record_run_stage(
+        args,
+        RunStage.INTEGRITY_PREFLIGHT,
+        "Verifying the trusted manifest head and managed report history.",
+        readiness={"integrity": RunReadiness.RUNNING},
+    )
     if initialize_baseline:
         latest, _, _ = ensure_integrity_preflight(
             archive_dir,
@@ -9155,6 +10150,11 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             raise
         return copied_paths
 
+    record_run_stage(
+        args,
+        RunStage.READING_INPUTS,
+        "Capturing and validating the active weekly input files.",
+    )
     active_captures = capture_active_inputs(active_paths, input_dir)
     with tempfile.TemporaryDirectory(
         prefix=".weekly-input-", dir=str(integrity_manifest_dir(archive_dir))
@@ -9225,8 +10225,23 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     if not selected_records:
         raise ValueError(f"No records found between {public_start} and {public_end}.")
 
+    required_staging_bytes = assert_staging_capacity(
+        output_dir, archive_dir, active_captures
+    )
+    print("Preflight summary:")
+    print(f"  Snapshot dates: {public_start:%Y-%m-%d} through {public_end:%Y-%m-%d}")
+    print(f"  Active input files: {len(active_captures)}")
+    print(f"  Unique business days in history: {len(combined_resolution.business_dates)}")
+    print(f"  Semantic duplicate files ignored: {len(duplicate_paths)}")
+    print(
+        "  Latest-week readiness: "
+        + ("Ready" if latest_week_readiness(records, weekly_rollups(records)[1], config).ready else "Preliminary")
+    )
+    print(
+        f"  Staging capacity reserved: {required_staging_bytes / (1024 ** 2):.0f} MiB minimum"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
-    run_id = str(uuid.uuid4())
+    run_id = str(getattr(args, "_attempt_run_id", None) or uuid.uuid4())
     provenance = workflow_provenance(config_path, config)
     config["_integrity"] = {
         "run_id": run_id,
@@ -9253,6 +10268,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     with tempfile.TemporaryDirectory(prefix=".weekly-run-", dir=str(output_dir)) as stage_name:
         stage_dir = Path(stage_name)
         try:
+            record_run_stage(
+                args,
+                RunStage.BUILDING_WORKBOOKS,
+                "Building exact staged workbook artifacts.",
+                readiness={"workbook": RunReadiness.RUNNING},
+            )
             staged_paths: list[Path] = []
             for location in config["locations"]:
                 location_records = [
@@ -9298,6 +10319,11 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             staged_paths = validate_staged_outputs(stage_dir, staged_paths)
             staged_master_digest = workbook_generated_content_sha256(staged_master)
 
+            record_run_stage(
+                args,
+                RunStage.PUBLISHING,
+                "Staged workbooks validated; rechecking inputs and publishing exact bytes.",
+            )
             verify_captured_active_inputs(active_captures, input_dir)
             assert_manifest_head(
                 archive_dir,
@@ -9371,6 +10397,11 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 previous_manifest,
                 previous_manifest_hash,
                 anchor_dir,
+            )
+            record_run_stage(
+                args,
+                RunStage.COMMITTING_MANIFEST,
+                "Published workbooks verified; committing the new integrity manifest.",
             )
             new_manifest_path = write_integrity_manifest(
                 archive_dir=archive_dir,
@@ -9451,6 +10482,463 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             raise
 
 
+def evidence_fingerprint_path(candidate_path: Path) -> Path:
+    return candidate_path.with_name(candidate_path.name + ".fingerprint.json")
+
+
+def evidence_approval_template_path(candidate_path: Path) -> Path:
+    return candidate_path.with_name(candidate_path.name + ".approval-template.json")
+
+
+def parse_json_cell(value: Any, *, label: str, expected_type: type) -> Any:
+    if value in (None, ""):
+        return expected_type()
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError as exc:
+        raise IntegrityError(f"{label} is not valid JSON: {exc.msg}.") from exc
+    if not isinstance(parsed, expected_type):
+        raise IntegrityError(f"{label} must contain a JSON {expected_type.__name__}.")
+    return parsed
+
+
+def verified_evidence_source(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], list[dict[str, Any]], Path]:
+    output_dir = Path(args.output_dir).resolve()
+    archive_dir = Path(args.archive_dir).resolve()
+    configured_anchor_dir = getattr(args, "integrity_anchor_dir", None)
+    anchor_dir = (
+        Path(configured_anchor_dir).expanduser().absolute()
+        if configured_anchor_dir
+        else default_integrity_anchor_dir()
+    )
+    latest_manifest = latest_integrity_manifest_path(archive_dir)
+    if latest_manifest is None:
+        raise IntegrityError(
+            "Management evidence cannot be exported without an integrity manifest."
+        )
+    anchored_manifest, anchored_sha256 = verify_integrity_anchor(
+        archive_dir, anchor_dir
+    )
+    if anchored_manifest != latest_manifest.resolve():
+        raise IntegrityError(
+            "Management evidence export requires the current trusted manifest head."
+        )
+    manifest_payload, manifest_sha256 = verify_integrity_state(
+        archive_dir, output_dir, latest_manifest
+    )
+    if not secrets.compare_digest(manifest_sha256, anchored_sha256):
+        raise IntegrityError(
+            "Management evidence export manifest differs from the trusted anchor."
+        )
+    workbook_path = managed_master_workbook_path(output_dir)
+    expected_digest = manifest_payload.get("master_generated_content_sha256")
+    if not isinstance(expected_digest, str):
+        raise IntegrityError(
+            "The current manifest does not record a management workbook digest."
+        )
+    validate_management_workbook(workbook_path, expected_digest)
+    wb = load_workbook(workbook_path, data_only=False)
+    try:
+        action_rows = validate_action_board_records(
+            records_from_sheet(wb["Action Board"], "Action ID")
+        )
+        evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
+    finally:
+        wb.close()
+    evidence_by_action = {
+        str(row.get("Action ID")): row
+        for row in evidence_rows
+        if row.get("Action ID")
+    }
+    export_rows: list[dict[str, Any]] = []
+    for action in action_rows:
+        status = str(action.get("Status") or "").strip().casefold()
+        if status in {"complete", "dismissed"}:
+            continue
+        action_id = str(action.get("Action ID") or "")
+        evidence = evidence_by_action.get(action_id)
+        if evidence is None:
+            raise IntegrityError(
+                f"Action {action_id!r} is missing its Evidence Detail record."
+            )
+        # Evidence Detail is generated and locked, while Status/Owner/Due Date on
+        # Action Board remain deliberately editable after the run. Let the live
+        # action row win on overlapping fields so approved exports reflect the
+        # manager's current decisions without weakening the evidence payload.
+        export_rows.append({**evidence, **action})
+    source = {
+        "manifest_path": latest_manifest.name,
+        "manifest_sha256": manifest_sha256,
+        "manifest_run_id": manifest_payload.get("run_id"),
+        "manifest_created_at_utc": manifest_payload.get("created_at_utc"),
+        "workbook_file": workbook_path.name,
+        "workbook_generated_content_sha256": expected_digest,
+        "generator_commit": (
+            manifest_payload.get("provenance", {}).get("git", {}).get("commit")
+        ),
+        "effective_config_sha256": (
+            manifest_payload.get("provenance", {}).get("effective_config_sha256")
+        ),
+        "methodology_version": MANAGEMENT_METHODOLOGY_VERSION,
+    }
+    return source, export_rows, workbook_path
+
+
+def build_management_evidence_package(
+    args: argparse.Namespace,
+) -> ManagementEvidencePackageV1:
+    source, rows, _ = verified_evidence_source(args)
+    created_text = str(source.get("manifest_created_at_utc") or "")
+    try:
+        created = datetime.fromisoformat(created_text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise IntegrityError(
+            "The trusted manifest has an invalid creation timestamp."
+        ) from exc
+    records: list[EvidenceRecord] = []
+    for row in rows:
+        due_date = as_date(row.get("Due Date"))
+        records.append(
+            EvidenceRecord(
+                action_id=str(row.get("Action ID") or ""),
+                evidence_id=str(row.get("Evidence ID") or ""),
+                action_code=str(row.get("Action Code") or ""),
+                reason_code=str(row.get("Reason Code") or ""),
+                location=str(row.get("Location") or ""),
+                person_or_area=str(row.get("Person / Area") or ""),
+                priority=str(row.get("Priority") or ""),
+                status=str(row.get("Status") or ""),
+                owner=str(row.get("Owner") or ""),
+                due_date=due_date.isoformat() if due_date else None,
+                recommended_next_step=str(row.get("Recommended Next Step") or ""),
+                why_it_matters=str(row.get("Why It Matters") or ""),
+                evidence_week_ends=str(row.get("Evidence Week Ends") or ""),
+                evidence_sources=tuple(
+                    parse_json_cell(
+                        row.get("Evidence Sources"),
+                        label=f"Evidence Sources for {row.get('Action ID')}",
+                        expected_type=list,
+                    )
+                ),
+                metric_evidence=parse_json_cell(
+                    row.get("Metric Evidence"),
+                    label=f"Metric Evidence for {row.get('Action ID')}",
+                    expected_type=dict,
+                ),
+                methodology_version=str(
+                    row.get("Methodology Version")
+                    or MANAGEMENT_METHODOLOGY_VERSION
+                ),
+            )
+        )
+    records.sort(key=lambda item: (item.priority, item.location, item.action_id))
+    return ManagementEvidencePackageV1(
+        source=source,
+        records=tuple(records),
+        retention_delete_after=(created + timedelta(days=365)).date().isoformat(),
+    )
+
+
+def stage_management_evidence(
+    args: argparse.Namespace, candidate_path: Path
+) -> list[Path]:
+    candidate_path = candidate_path.absolute()
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_path = managed_direct_child(
+        candidate_path.parent,
+        candidate_path,
+        purpose="management evidence candidate",
+        require_file=False,
+    )
+    package = build_management_evidence_package(args).to_dict()
+    write_json_atomic(candidate_path, package)
+    candidate_sha256 = sha256_file(candidate_path)
+    fingerprint_path = evidence_fingerprint_path(candidate_path)
+    fingerprint = {
+        "schema_version": 1,
+        "contract": "ManagementEvidenceCandidateFingerprintV1",
+        "candidate_file": candidate_path.name,
+        "candidate_sha256": candidate_sha256,
+        "candidate_size": candidate_path.stat().st_size,
+        "source": package["source"],
+        "record_count": len(package["records"]),
+        "retention_delete_after": package["retention"]["delete_after"],
+        "approval_required": True,
+        "automatic_upload": False,
+        "automatic_send": False,
+    }
+    write_json_atomic(fingerprint_path, fingerprint)
+    fingerprint_sha256 = sha256_file(fingerprint_path)
+    template_path = evidence_approval_template_path(candidate_path)
+    write_json_atomic(
+        template_path,
+        {
+            "schema_version": 1,
+            "decision": "APPROVE",
+            "candidate_sha256": candidate_sha256,
+            "fingerprint_sha256": fingerprint_sha256,
+            "approved_by": "",
+            "approved_at_utc": "",
+            "purpose": "",
+        },
+    )
+    return [candidate_path, fingerprint_path, template_path]
+
+
+def promote_approved_management_evidence(
+    args: argparse.Namespace,
+    candidate_path: Path,
+    approval_path: Path,
+) -> list[Path]:
+    candidate_path = regular_file_without_reparse_ancestors(
+        candidate_path, purpose="management evidence candidate"
+    )
+    fingerprint_path = regular_file_without_reparse_ancestors(
+        evidence_fingerprint_path(candidate_path),
+        purpose="management evidence fingerprint",
+    )
+    approval_path = regular_file_without_reparse_ancestors(
+        approval_path, purpose="management evidence approval"
+    )
+    candidate_sha256 = sha256_file(candidate_path)
+    fingerprint_sha256 = sha256_file(fingerprint_path)
+    approval_sha256 = sha256_file(approval_path)
+    fingerprint = read_json_manifest(fingerprint_path)
+    approval = read_json_manifest(approval_path)
+    if approval.get("schema_version") != 1 or approval.get("decision") != "APPROVE":
+        raise IntegrityError(
+            "Approval must use schema_version 1 and the exact decision APPROVE."
+        )
+    for field, actual in (
+        ("candidate_sha256", candidate_sha256),
+        ("fingerprint_sha256", fingerprint_sha256),
+    ):
+        if not secrets.compare_digest(str(approval.get(field) or ""), actual):
+            raise IntegrityError(
+                f"Approval {field} does not match the reviewed evidence artifact."
+            )
+    for field in ("approved_by", "approved_at_utc", "purpose"):
+        if not str(approval.get(field) or "").strip():
+            raise IntegrityError(f"Approval field {field} is required.")
+    try:
+        approved_at = datetime.fromisoformat(
+            str(approval["approved_at_utc"]).replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise IntegrityError("approved_at_utc must be an ISO-8601 timestamp.") from exc
+    if approved_at.tzinfo is None:
+        raise IntegrityError("approved_at_utc must include a timezone.")
+    if not secrets.compare_digest(
+        str(fingerprint.get("candidate_sha256") or ""), candidate_sha256
+    ):
+        raise IntegrityError("The fingerprint does not bind the candidate bytes.")
+    package = read_json_manifest(candidate_path)
+    if (
+        package.get("contract") != "ManagementEvidencePackageV1"
+        or package.get("schema_version") != 1
+        or package.get("retention", {}).get("days") != 365
+        or package.get("distribution", {}).get("automatic_upload") is not False
+        or package.get("distribution", {}).get("automatic_send") is not False
+    ):
+        raise IntegrityError("The candidate does not satisfy the approved evidence contract.")
+    current_source, _, _ = verified_evidence_source(args)
+    if canonical_json_sha256(package.get("source", {})) != canonical_json_sha256(
+        current_source
+    ):
+        raise IntegrityError(
+            "The reviewed evidence candidate is stale relative to the trusted current run."
+        )
+    archive_dir = Path(args.archive_dir).resolve()
+    approved_root = managed_subdirectory(
+        archive_dir,
+        "approved-management-evidence",
+        purpose="approved management evidence",
+        create=True,
+    )
+    destination = managed_direct_child(
+        approved_root,
+        approved_root / f"approved-{candidate_sha256[:16]}.json",
+        purpose="approved management evidence",
+        require_file=False,
+    )
+    content = candidate_path.read_bytes()
+    if destination.exists():
+        if sha256_file(destination) != candidate_sha256:
+            raise IntegrityError(
+                "An approved evidence file with the same identifier has different bytes."
+            )
+    else:
+        written_sha256 = verified_write_bytes(content, destination)
+        if written_sha256 != candidate_sha256:
+            raise IntegrityError("Approved evidence exact-byte verification failed.")
+    receipt_path = approved_root / (
+        f"approved-{candidate_sha256[:16]}-{approval_sha256[:16]}.receipt.json"
+    )
+    write_json_atomic(
+        receipt_path,
+        {
+            "schema_version": 1,
+            "contract": "ManagementEvidenceApprovalReceiptV1",
+            "candidate_sha256": candidate_sha256,
+            "fingerprint_sha256": fingerprint_sha256,
+            "approval_sha256": approval_sha256,
+            "approved_by": approval["approved_by"],
+            "approved_at_utc": approval["approved_at_utc"],
+            "purpose": approval["purpose"],
+            "approved_file": destination.name,
+            "retention_delete_after": package["retention"]["delete_after"],
+            "automatic_upload": False,
+            "automatic_send": False,
+        },
+    )
+    return [destination, receipt_path]
+
+
+def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
+    """Inspect runtime readiness without creating folders, locks, reports, or state."""
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    config_path = Path(args.config).resolve()
+    input_dir = Path(args.input_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    archive_dir = Path(args.archive_dir).resolve()
+    configured_anchor_dir = getattr(args, "integrity_anchor_dir", None)
+    anchor_dir = (
+        Path(configured_anchor_dir).expanduser().absolute()
+        if configured_anchor_dir
+        else default_integrity_anchor_dir()
+    )
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append(
+            {"name": name, "status": status, "detail": safe_message(detail)}
+        )
+
+    try:
+        config = load_config(config_path)
+        add(
+            "Configuration",
+            "Ready",
+            f"Valid schema with {len(config['locations'])} configured locations.",
+        )
+    except Exception as exc:
+        config = None
+        add("Configuration", "Attention", str(exc))
+
+    python_ready = sys.version_info >= (3, 10)
+    add(
+        "Python",
+        "Ready" if python_ready else "Attention",
+        f"{sys.version.split()[0]} (minimum supported: 3.10).",
+    )
+    for label, path in (
+        ("Input folder", input_dir),
+        ("Finished reports folder", output_dir),
+        ("Archive folder", archive_dir),
+    ):
+        add(
+            label,
+            "Ready" if path.is_dir() else "Attention",
+            str(path) if path.is_dir() else f"Missing directory: {path}",
+        )
+
+    try:
+        free = available_disk_bytes(output_dir)
+        minimum = 256 * 1024 * 1024
+        add(
+            "Disk capacity",
+            "Ready" if free >= minimum else "Attention",
+            f"{free / (1024 ** 3):.2f} GiB free; minimum {minimum / (1024 ** 2):.0f} MiB.",
+        )
+    except Exception as exc:
+        add("Disk capacity", "Attention", str(exc))
+
+    integrity_status = "Attention"
+    integrity_detail = "Archive and finished-report folders must exist."
+    latest_manifest: Path | None = None
+    if archive_dir.is_dir() and output_dir.is_dir() and config is not None:
+        try:
+            latest_manifest = latest_integrity_manifest_path(archive_dir)
+            if latest_manifest is None:
+                raise IntegrityError(
+                    "No integrity baseline exists; initialize it before a weekly run."
+                )
+            if not integrity_anchor_exists(archive_dir, anchor_dir):
+                raise IntegrityError(
+                    "The machine-local trusted-head anchor is missing."
+                )
+            anchored_manifest, anchored_sha256 = verify_integrity_anchor(
+                archive_dir, anchor_dir
+            )
+            if anchored_manifest != latest_manifest.resolve():
+                raise IntegrityError(
+                    "The latest manifest does not match the machine-local trusted head."
+                )
+            _, verified_sha256 = verify_integrity_state(
+                archive_dir, output_dir, latest_manifest
+            )
+            if not secrets.compare_digest(verified_sha256, anchored_sha256):
+                raise IntegrityError(
+                    "The verified manifest hash differs from the trusted anchor."
+                )
+            integrity_status = "Ready"
+            integrity_detail = (
+                f"Manifest chain and managed outputs verified at {latest_manifest.name}."
+            )
+        except Exception as exc:
+            integrity_detail = str(exc)
+    add("Integrity", integrity_status, integrity_detail)
+
+    overall = (
+        "Ready"
+        if checks and all(item["status"] == "Ready" for item in checks)
+        else "Attention"
+    )
+    return {
+        "schema_version": 1,
+        "checked_at_utc": checked_at,
+        "overall": overall,
+        "readiness": {
+            "release": (
+                RunReadiness.READY.value
+                if re.fullmatch(
+                    r"[0-9a-fA-F]{40}",
+                    os.environ.get("RED_ONION_VERIFIED_RELEASE_COMMIT", ""),
+                )
+                else RunReadiness.NOT_EVALUATED.value
+            ),
+            "integrity": (
+                RunReadiness.READY.value
+                if integrity_status == "Ready"
+                else RunReadiness.ATTENTION.value
+            ),
+            "workbook": (
+                RunReadiness.READY.value
+                if integrity_status == "Ready"
+                else RunReadiness.ATTENTION.value
+            ),
+            "distribution": RunReadiness.NOT_EVALUATED.value,
+            "recovery": RunReadiness.NOT_CHECKED.value,
+        },
+        "latest_manifest": latest_manifest.name if latest_manifest else None,
+        "checks": checks,
+        "note": (
+            "Independent Google Drive backup freshness is NotChecked by this local, "
+            "read-only command."
+        ),
+    }
+
+
+def print_health_check(payload: dict[str, Any]) -> None:
+    print(f"Red Onion health: {payload['overall']}")
+    for check in payload["checks"]:
+        print(f"  [{check['status']}] {check['name']}: {check['detail']}")
+    print(f"  [NotChecked] Recovery: {payload['note']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build Red Onion weekly metric workbooks.")
     parser.add_argument(
@@ -9502,11 +10990,120 @@ def build_parser() -> argparse.ArgumentParser:
             "generating workbooks or moving active reports."
         ),
     )
+    parser.add_argument(
+        "--rebind-restored-integrity-anchor",
+        metavar="SOURCE_ANCHOR_JSON",
+        help=(
+            "Verify a backed-up trusted anchor against a restored manifest chain "
+            "and managed outputs, then bind that exact head to this machine/path. "
+            "This is a recovery-only operation and never processes weekly reports."
+        ),
+    )
+    parser.add_argument(
+        "--validate-config",
+        action="store_true",
+        help="Validate configuration and exit without creating or changing runtime state.",
+    )
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Run a read-only local readiness check and exit.",
+    )
+    parser.add_argument(
+        "--health-check-json",
+        action="store_true",
+        help="Run the read-only readiness check and print versioned JSON.",
+    )
+    parser.add_argument(
+        "--export-management-evidence",
+        metavar="CANDIDATE_JSON",
+        help=(
+            "Stage a local ManagementEvidencePackageV1 candidate and exact fingerprint. "
+            "With --approval-file, promote the already-reviewed exact bytes into the "
+            "local approved-evidence archive."
+        ),
+    )
+    parser.add_argument(
+        "--approval-file",
+        help=(
+            "Explicit schema-v1 approval bound to the staged candidate and fingerprint. "
+            "This never uploads or sends the evidence."
+        ),
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.rebind_restored_integrity_anchor:
+        incompatible = (
+            args.validate_config
+            or args.health_check
+            or args.health_check_json
+            or args.initialize_integrity_baseline
+            or args.migrate_history_only
+            or bool(args.migrate_history_from)
+            or bool(args.export_management_evidence)
+            or bool(args.approval_file)
+        )
+        if incompatible:
+            raise SystemExit(
+                "ERROR: --rebind-restored-integrity-anchor must be run as a "
+                "standalone recovery operation."
+            )
+        try:
+            rebound, receipt = rebind_restored_integrity_anchor(
+                Path(args.archive_dir),
+                Path(args.output_dir),
+                Path(args.rebind_restored_integrity_anchor),
+                Path(args.integrity_anchor_dir),
+            )
+        except Exception as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
+        print("Restored integrity head verified and rebound:")
+        print(f"  Anchor: {rebound}")
+        print(f"  Audit receipt: {receipt}")
+        return
+    if args.validate_config:
+        try:
+            config = load_config(Path(args.config).resolve())
+        except Exception as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
+        print(
+            "Configuration valid: "
+            f"{len(config['locations'])} location(s), "
+            f"{len(config)} supported top-level fields."
+        )
+        return
+    if args.health_check or args.health_check_json:
+        payload = build_health_check(args)
+        if args.health_check_json:
+            print(json.dumps(payload, sort_keys=True, indent=2))
+        else:
+            print_health_check(payload)
+        if payload["overall"] != "Ready":
+            raise SystemExit(2)
+        return
+    if args.approval_file and not args.export_management_evidence:
+        raise SystemExit(
+            "ERROR: --approval-file requires --export-management-evidence CANDIDATE_JSON."
+        )
+    if args.export_management_evidence:
+        try:
+            candidate_path = Path(args.export_management_evidence).absolute()
+            if args.approval_file:
+                paths = promote_approved_management_evidence(
+                    args, candidate_path, Path(args.approval_file).absolute()
+                )
+                print("Approved evidence retained locally (no upload or send):")
+            else:
+                paths = stage_management_evidence(args, candidate_path)
+                print("Evidence candidate staged; review and complete the approval template:")
+            for path in paths:
+                print(f"  {path}")
+        except Exception as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
+        return
     try:
         generated = run(args)
     except Exception as exc:

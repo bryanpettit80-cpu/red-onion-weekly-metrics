@@ -761,7 +761,9 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     )
 
     wb = load_workbook(output_path)
-    assert wb.sheetnames[:9] == metrics.VISIBLE_MANAGEMENT_SHEETS
+    assert wb.sheetnames[: len(metrics.VISIBLE_MANAGEMENT_SHEETS)] == (
+        metrics.VISIBLE_MANAGEMENT_SHEETS
+    )
     assert wb["_Dashboard Chart Data"].sheet_state == "veryHidden"
     assert wb["Weekly Server Metrics"].sheet_state == "veryHidden"
     assert wb["Store Week Trends"].sheet_state == "veryHidden"

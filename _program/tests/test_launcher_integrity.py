@@ -33,9 +33,23 @@ def test_release_preflight_runs_before_any_runtime_mutation() -> None:
     assert preflight_call < launcher.index(
         "New-Item -ItemType Directory"
     )
-    assert preflight_call < launcher.index("-m pip install")
+    assert preflight_call < launcher.index("$InstallArguments = @(")
     assert "[switch]$InitializeIntegrityBaseline" in launcher
     assert '$ProgramArguments += "--initialize-integrity-baseline"' in launcher
+    assert "[switch]$RebuildEnvironment" in launcher
+    assert "[switch]$HealthCheck" in launcher
+    assert "[string]$RebindRestoredIntegrityAnchor" in launcher
+    assert "environment-state.json" in launcher
+    assert "red_onion_config.py" in launcher
+    config_preflight = launcher.index("$ValidationExitCode = Invoke-PythonLauncher")
+    assert config_preflight < launcher.index(
+        "foreach ($dir in @($InputDir, $OutputDir, $ArchiveDir))"
+    )
+    assert (
+        "if ($RebuildEnvironment -or (-not $HealthCheck "
+        "-and -not $EnvironmentMatches))" in compact_launcher
+    )
+    assert "--require-hashes" in launcher
 
 
 def test_production_dependency_pins_are_exact_and_consistent() -> None:
@@ -48,7 +62,19 @@ def test_production_dependency_pins_are_exact_and_consistent() -> None:
     assert requirements == expected
     for dependency in expected:
         assert f'"{dependency}"' in pyproject
-    assert 'py-modules = ["red_onion_integrity", "red_onion_weekly_metrics"]' in pyproject
+    for module in (
+        "red_onion_config",
+        "red_onion_integrity",
+        "red_onion_runtime",
+        "red_onion_weekly_metrics",
+    ):
+        assert f'"{module}"' in pyproject
+    assert 'requires-python = ">=3.10"' in pyproject
+    lock = (PROGRAM_DIR / "requirements.lock").read_text(encoding="utf-8")
+    assert "--hash=sha256:" in lock
+    assert "numpy==2.2.6" in lock
+    for dependency in expected:
+        assert dependency in lock
 
 
 def _write_minimal_runner(repository_root: Path) -> Path:
@@ -228,6 +254,76 @@ def test_initialize_integrity_baseline_argument_is_forwarded(
         / "integrity-anchors"
     )
     assert not list(launcher.parent.rglob("*.pyc"))
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+def test_health_check_does_not_create_operator_folders(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    repository_root = tmp_path / "standalone-health"
+    launcher = _write_minimal_runner(repository_root)
+    environment = launcher_environment.copy()
+    capture_path = tmp_path / "forwarded-arguments.txt"
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    initial = _run_launcher(launcher, environment)
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    for name in (
+        "01 Daily Reports - Drop Here",
+        "02 Finished Reports",
+        "03 Archive",
+    ):
+        shutil.rmtree(repository_root / name)
+
+    result = _run_launcher(launcher, environment, "-HealthCheck")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name in (
+        "01 Daily Reports - Drop Here",
+        "02 Finished Reports",
+        "03 Archive",
+    ):
+        assert not (repository_root / name).exists()
+
+    restored_anchor = tmp_path / "backed-up-anchor.json"
+    restored_anchor.write_text("{}", encoding="utf-8")
+    rebind_result = _run_launcher(
+        launcher,
+        environment,
+        "-RebindRestoredIntegrityAnchor",
+        str(restored_anchor),
+    )
+
+    assert rebind_result.returncode == 0, (
+        rebind_result.stdout + rebind_result.stderr
+    )
+    forwarded_arguments = capture_path.read_text(encoding="utf-8").splitlines()
+    rebind_index = forwarded_arguments.index(
+        "--rebind-restored-integrity-anchor"
+    )
+    assert forwarded_arguments[rebind_index + 1] == str(restored_anchor)
+    for name in (
+        "01 Daily Reports - Drop Here",
+        "02 Finished Reports",
+        "03 Archive",
+    ):
+        assert not (repository_root / name).exists()
+
+    rebuild_result = _run_launcher(
+        launcher,
+        environment,
+        "-RebuildEnvironment",
+        "-HealthCheck",
+    )
+
+    assert rebuild_result.returncode == 0, (
+        rebuild_result.stdout + rebuild_result.stderr
+    )
+    for name in (
+        "01 Daily Reports - Drop Here",
+        "02 Finished Reports",
+        "03 Archive",
+    ):
+        assert not (repository_root / name).exists()
 
 
 @pytest.mark.skipif(

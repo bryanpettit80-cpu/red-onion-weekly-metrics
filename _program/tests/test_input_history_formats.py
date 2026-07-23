@@ -75,6 +75,10 @@ def test_valid_xlsx_uses_internal_business_date(tmp_path: Path) -> None:
     assert metrics.daily_report_excel_engine(path) == "openpyxl"
     assert {record.report_date for record in records} == {date(2026, 7, 11)}
     assert records[0].gross_sales == 100.0
+    assert records[0].source_sha256 == metrics.sha256_file(path)
+    assert records[0].source_format == ".xlsx"
+    assert records[0].parser_engine == "openpyxl"
+    assert records[0].report_date_source == "Workbook Date(s) field"
 
 
 def test_archived_history_is_limited_to_canonical_processed_folder(tmp_path: Path) -> None:

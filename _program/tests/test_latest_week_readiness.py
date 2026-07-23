@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import json
 
 from openpyxl import Workbook
 
@@ -219,6 +220,13 @@ def test_incomplete_week_carries_manual_active_action_as_paused() -> None:
         "Weeks Open": 2,
         "Confidence": "High",
         "Signal State": "Current",
+        "Evidence ID": "STALE-EVIDENCE",
+        "Action Code": "COACH_NOW",
+        "Reason Code": "SERVER_FALLING_BELOW_BENCHMARK",
+        "Evidence Week Ends": "2026-06-28, 2026-07-05",
+        "Evidence Sources": "[]",
+        "Metric Evidence": '{"guest_count":42}',
+        "Methodology Version": metrics.MANAGEMENT_METHODOLOGY_VERSION,
     }
     stale_data_quality = {
         "Action ID": "D1E2F3A4B5C6",
@@ -258,6 +266,19 @@ def test_incomplete_week_carries_manual_active_action_as_paused() -> None:
     assert current[0]["Momentum"] == "Not Scored"
     assert current[0]["Confidence"] == "Paused"
     assert current[0]["Signal State"] == "Paused / Carryover"
+    assert current[0]["Action Code"] == "PAUSED_CARRYOVER"
+    assert (
+        current[0]["Reason Code"]
+        == "LATEST_WEEK_INCOMPLETE_PRIOR_ACTION_RETAINED"
+    )
+    assert current[0]["Evidence ID"] != "STALE-EVIDENCE"
+    assert "2026-07-12" in current[0]["Evidence Week Ends"]
+    paused_evidence = json.loads(current[0]["Metric Evidence"])[
+        "paused_carryover"
+    ]
+    assert paused_evidence["latest_week_end"] == "2026-07-12"
+    assert paused_evidence["missing_dates"] == ["2026-07-11"]
+    assert "Jul 11" in paused_evidence["missing_text"]
     assert current[0]["Last Seen"] == date(2026, 7, 12)
     assert current[0]["First Seen"] == date(2026, 6, 28)
     assert current[0]["Weeks Open"] == 3
@@ -268,6 +289,7 @@ def test_incomplete_week_carries_manual_active_action_as_paused() -> None:
     assert repeated[0]["Last Seen"] == date(2026, 7, 12)
     assert repeated[0]["First Seen"] == date(2026, 6, 28)
     assert repeated[0]["Weeks Open"] == 3
+    assert repeated[0]["Evidence ID"] == current[0]["Evidence ID"]
 
 
 def test_backdated_incomplete_week_does_not_rewind_paused_action_dates() -> None:
