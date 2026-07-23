@@ -797,6 +797,9 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Action Board"].row_dimensions[5].height == 60
     assert wb["Action Board"]["L5"].alignment.wrap_text is True
     assert wb["Action Board"]["N5"].alignment.wrap_text is True
+    assert wb["Action Board"]["F5"].number_format == "m/d/yyyy"
+    assert wb["Action Board"]["M5"].number_format == "m/d/yyyy"
+    assert wb["Action Board"]["Q5"].number_format == "m/d/yyyy"
     assert wb["Action History"].row_dimensions[4].height == 30
     assert wb["Dashboard"].row_dimensions[13].height == 66
     assert wb["Dashboard"].row_dimensions[14].height == 66
