@@ -64,6 +64,31 @@ function Get-TextSha256 {
     }
 }
 
+function Test-RedirectingReparsePoint {
+    param([Parameter(Mandatory = $true)]$Entry)
+
+    if (
+        ($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0
+    ) {
+        return $false
+    }
+    # Dropbox cloud placeholders report the generic ReparsePoint attribute to
+    # PowerShell even after their bytes are locally readable. They have neither
+    # a LinkType nor a Target. Junctions and symbolic links expose one or both,
+    # so reject redirectors while allowing normal Dropbox-backed files.
+    $LinkType = $Entry.PSObject.Properties["LinkType"]
+    $Target = $Entry.PSObject.Properties["Target"]
+    $HasLinkType = $null -ne $LinkType -and -not [string]::IsNullOrWhiteSpace(
+        [string]$LinkType.Value
+    )
+    $HasTarget = $null -ne $Target -and @($Target.Value).Count -gt 0 -and (
+        @($Target.Value) | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_)
+        }
+    ).Count -gt 0
+    return $HasLinkType -or $HasTarget
+}
+
 function Assert-NormalTree {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -74,12 +99,12 @@ function Assert-NormalTree {
         throw "$Label is missing: $Path"
     }
     $RootEntry = Get-Item -LiteralPath $Path -Force
-    if (($RootEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    if (Test-RedirectingReparsePoint -Entry $RootEntry) {
         throw "$Label is a link or reparse point: $Path"
     }
     $Entries = @(Get-ChildItem -LiteralPath $Path -Recurse -Force)
     foreach ($Entry in $Entries) {
-        if (($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        if (Test-RedirectingReparsePoint -Entry $Entry) {
             throw "$Label contains a link or reparse point: $($Entry.FullName)"
         }
     }
@@ -267,10 +292,7 @@ try {
             throw "The weekly workflow lock is missing: $WorkflowLockPath"
         }
         $WorkflowLockEntry = Get-Item -LiteralPath $WorkflowLockPath -Force
-        if (
-            ($WorkflowLockEntry.Attributes -band
-                [System.IO.FileAttributes]::ReparsePoint) -ne 0
-        ) {
+        if (Test-RedirectingReparsePoint -Entry $WorkflowLockEntry) {
             throw "The weekly workflow lock is a link or reparse point."
         }
         $OperationalLockStream = [System.IO.File]::Open(
