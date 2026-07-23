@@ -3,10 +3,16 @@ param(
     [string]$InputDir,
     [string]$OutputDir,
     [string]$ArchiveDir,
-    [switch]$InitializeIntegrityBaseline
+    [switch]$InitializeIntegrityBaseline,
+    [switch]$RebuildEnvironment,
+    [switch]$HealthCheck,
+    [string]$RebindRestoredIntegrityAnchor
 )
 
 $ErrorActionPreference = "Stop"
+if ($HealthCheck -and $RebindRestoredIntegrityAnchor) {
+    throw "-HealthCheck and -RebindRestoredIntegrityAnchor are separate maintenance operations."
+}
 
 $ProgramDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepositoryRoot = Split-Path -Parent $ProgramDir
@@ -119,6 +125,7 @@ function Assert-DeployedRelease {
         Stop-ReleasePreflight "HEAD ($Head) does not match local origin/main ($OriginMain)."
     }
 
+    $env:RED_ONION_VERIFIED_RELEASE_COMMIT = $Head
     Write-Host "Verified deployed release: main at $($Head.Substring(0, 12))."
 }
 
@@ -148,26 +155,194 @@ $OperationsRoot = [System.IO.Path]::GetFullPath($OperationsRoot)
 $DefaultInputDir = Join-Path $OperationsRoot "01 Daily Reports - Drop Here"
 $DefaultOutputDir = Join-Path $OperationsRoot "02 Finished Reports"
 $DefaultArchiveDir = Join-Path $OperationsRoot "03 Archive"
-$VenvDir = Join-Path $env:LOCALAPPDATA "RedOnionMetrics\.venv"
+$StateDir = Join-Path $env:LOCALAPPDATA "RedOnionMetrics"
+$VenvDir = Join-Path $StateDir ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+$EnvironmentStatePath = Join-Path $StateDir "environment-state.json"
 $IntegrityAnchorDir = Join-Path $env:LOCALAPPDATA "RedOnionMetrics\integrity-anchors"
+$ConfigPath = Join-Path $ProgramDir "red_onion_config.json"
+$ConfigValidatorPath = Join-Path $ProgramDir "red_onion_config.py"
+$ProgramPath = Join-Path $ProgramDir "red_onion_weekly_metrics.py"
+$DirectRequirementsPath = Join-Path $ProgramDir "requirements.txt"
+$LockedRequirementsPath = Join-Path $ProgramDir "requirements.lock"
+$InstallRequirementsPath = if (Test-Path -LiteralPath $LockedRequirementsPath) {
+    $LockedRequirementsPath
+} else {
+    $DirectRequirementsPath
+}
 
 function Get-PythonLauncher {
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" *> $null
+        & py -3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" *> $null
         if ($LASTEXITCODE -eq 0) {
             return @("py", "-3", "-B")
         }
     }
 
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        & python -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" *> $null
+        & python -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" *> $null
         if ($LASTEXITCODE -eq 0) {
             return @("python", "-B")
         }
     }
 
-    throw "Python 3.9 or newer was not found. Install Python from https://www.python.org/downloads/ and check 'Add python.exe to PATH', then rerun this script."
+    throw "Python 3.10 or newer was not found. Install Python from https://www.python.org/downloads/ and check 'Add python.exe to PATH', then rerun this script."
+}
+
+function Invoke-PythonLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Launcher,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $Executable = $Launcher[0]
+    $PrefixArguments = @($Launcher | Select-Object -Skip 1)
+    $CommandOutput = @(& $Executable @PrefixArguments @Arguments)
+    $ExitCode = $LASTEXITCODE
+    foreach ($OutputLine in $CommandOutput) {
+        Write-Host $OutputLine
+    }
+    return [int]$ExitCode
+}
+
+function Get-BasePythonIdentity {
+    param([Parameter(Mandatory = $true)][string[]]$Launcher)
+
+    $Executable = $Launcher[0]
+    $PrefixArguments = @($Launcher | Select-Object -Skip 1)
+    $IdentityJson = & $Executable @PrefixArguments -c (
+        "import json,sys; print(json.dumps({" +
+        "'executable':sys.executable,'version':sys.version.split()[0]," +
+        "'major_minor':f'{sys.version_info.major}.{sys.version_info.minor}'}))"
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not inspect the Python runtime (exit code $LASTEXITCODE)."
+    }
+    return ($IdentityJson | ConvertFrom-Json)
+}
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $Stream = [System.IO.File]::OpenRead($Path)
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $HashBytes = $Hasher.ComputeHash($Stream)
+        return (($HashBytes | ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $Hasher.Dispose()
+        $Stream.Dispose()
+    }
+}
+
+function Test-PythonEnvironment {
+    if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+        return $false
+    }
+    & $VenvPython -B -m pip check
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+    $VerifyScript = (
+        "import importlib.metadata as m,pathlib,re,sys;" +
+        "lines=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines();" +
+        "req=[x.strip() for x in lines if x.strip() and not x.lstrip().startswith('#')];" +
+        "bad=[];" +
+        "[(bad.append(x+': installed='+m.version(x.split('==',1)[0])) " +
+        "if '==' in x and m.version(x.split('==',1)[0])!=x.split('==',1)[1] else None) for x in req];" +
+        "print('\\n'.join(bad));raise SystemExit(1 if bad else 0)"
+    )
+    & $VenvPython -B -c $VerifyScript $DirectRequirementsPath
+    return $LASTEXITCODE -eq 0
+}
+
+function Write-EnvironmentState {
+    param(
+        [Parameter(Mandatory = $true)]$PythonIdentity,
+        [Parameter(Mandatory = $true)][string]$RequirementsSha256
+    )
+
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    $Payload = [ordered]@{
+        schema_version = 1
+        created_at_utc = [DateTime]::UtcNow.ToString("o")
+        python_executable = $PythonIdentity.executable
+        python_version = $PythonIdentity.version
+        python_major_minor = $PythonIdentity.major_minor
+        requirements_file = (Split-Path -Leaf $InstallRequirementsPath)
+        requirements_sha256 = $RequirementsSha256
+    }
+    $TemporaryStatePath = Join-Path (
+        Split-Path -Parent $EnvironmentStatePath
+    ) (".environment-state." + [guid]::NewGuid().ToString("N") + ".tmp")
+    try {
+        $Payload | ConvertTo-Json | Set-Content -LiteralPath $TemporaryStatePath -Encoding UTF8
+        Move-Item -LiteralPath $TemporaryStatePath -Destination $EnvironmentStatePath -Force
+    } finally {
+        if (Test-Path -LiteralPath $TemporaryStatePath) {
+            Remove-Item -LiteralPath $TemporaryStatePath -Force
+        }
+    }
+}
+
+function Rebuild-PythonEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$BasePython,
+        [Parameter(Mandatory = $true)]$PythonIdentity,
+        [Parameter(Mandatory = $true)][string]$RequirementsSha256
+    )
+
+    $ResolvedStateDir = [System.IO.Path]::GetFullPath($StateDir)
+    $ResolvedVenvDir = [System.IO.Path]::GetFullPath($VenvDir)
+    $StatePrefix = $ResolvedStateDir.TrimEnd("\") + "\"
+    if (-not $ResolvedVenvDir.StartsWith(
+        $StatePrefix, [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Refusing to rebuild a Python environment outside $ResolvedStateDir."
+    }
+
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    $BackupDir = Join-Path $StateDir (".venv-backup-" + [guid]::NewGuid().ToString("N"))
+    $HadExistingEnvironment = Test-Path -LiteralPath $VenvDir
+    if ($HadExistingEnvironment) {
+        Move-Item -LiteralPath $VenvDir -Destination $BackupDir
+    }
+    try {
+        $CreateExitCode = Invoke-PythonLauncher -Launcher $BasePython -Arguments @(
+            "-m", "venv", $VenvDir
+        )
+        if ($CreateExitCode -ne 0) {
+            throw "Could not create the Red Onion Python environment (exit code $CreateExitCode)."
+        }
+
+        $InstallArguments = @(
+            "-B", "-m", "pip", "install", "--disable-pip-version-check", "--quiet"
+        )
+        if ($InstallRequirementsPath -eq $LockedRequirementsPath) {
+            $InstallArguments += "--require-hashes"
+        }
+        $InstallArguments += @("-r", $InstallRequirementsPath)
+        & $VenvPython @InstallArguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not install the Red Onion program requirements (exit code $LASTEXITCODE)."
+        }
+        if (-not (Test-PythonEnvironment)) {
+            throw "The rebuilt Red Onion Python environment failed dependency verification."
+        }
+        Write-EnvironmentState -PythonIdentity $PythonIdentity `
+            -RequirementsSha256 $RequirementsSha256
+        if (Test-Path -LiteralPath $BackupDir) {
+            Remove-Item -LiteralPath $BackupDir -Recurse -Force
+        }
+    } catch {
+        if (Test-Path -LiteralPath $VenvDir) {
+            Remove-Item -LiteralPath $VenvDir -Recurse -Force
+        }
+        if (Test-Path -LiteralPath $BackupDir) {
+            Move-Item -LiteralPath $BackupDir -Destination $VenvDir
+        }
+        throw
+    }
 }
 
 if (-not $InputDir) {
@@ -180,37 +355,99 @@ if (-not $ArchiveDir) {
     $ArchiveDir = $DefaultArchiveDir
 }
 
-foreach ($dir in @($InputDir, $OutputDir, $ArchiveDir)) {
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$BasePython = Get-PythonLauncher
+$PythonIdentity = Get-BasePythonIdentity -Launcher $BasePython
+
+# Use the standard-library-only validator before creating operator folders,
+# workflow locks, the virtual environment, or package state. The fallback keeps
+# older standalone test/copy layouts operable; released copies include the
+# dedicated validator.
+$ValidationTarget = if (Test-Path -LiteralPath $ConfigValidatorPath) {
+    $ConfigValidatorPath
+} else {
+    $ProgramPath
+}
+$ValidationArguments = @($ValidationTarget, "--config", $ConfigPath)
+if ($ValidationTarget -eq $ProgramPath) {
+    $ValidationArguments += "--validate-config"
+}
+$ValidationExitCode = Invoke-PythonLauncher -Launcher $BasePython `
+    -Arguments $ValidationArguments
+if ($ValidationExitCode -ne 0) {
+    throw "Configuration validation failed (exit code $ValidationExitCode). No runtime folders or reports were changed."
 }
 
-if (-not (Test-Path $VenvPython)) {
-    $BasePython = Get-PythonLauncher
-    if ($BasePython.Count -gt 1) {
-        & $BasePython[0] $BasePython[1..($BasePython.Count - 1)] -m venv $VenvDir
-    } else {
-        & $BasePython[0] -m venv $VenvDir
-    }
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not create the Red Onion Python environment (exit code $LASTEXITCODE)."
+$RequirementsSha256 = Get-FileSha256 -Path $InstallRequirementsPath
+$EnvironmentMatches = $false
+if (
+    -not $RebuildEnvironment `
+    -and (Test-Path -LiteralPath $VenvPython -PathType Leaf) `
+    -and (Test-Path -LiteralPath $EnvironmentStatePath -PathType Leaf)
+) {
+    try {
+        $EnvironmentState = Get-Content -LiteralPath $EnvironmentStatePath -Raw |
+            ConvertFrom-Json
+        $EnvironmentMatches = (
+            $EnvironmentState.schema_version -eq 1 `
+            -and $EnvironmentState.python_version -eq $PythonIdentity.version `
+            -and $EnvironmentState.requirements_file -eq (
+                Split-Path -Leaf $InstallRequirementsPath
+            ) `
+            -and $EnvironmentState.requirements_sha256 -eq $RequirementsSha256
+        )
+    } catch {
+        $EnvironmentMatches = $false
     }
 }
 
-& $VenvPython -B -m pip install --disable-pip-version-check --quiet -r (Join-Path $ProgramDir "requirements.txt")
-if ($LASTEXITCODE -ne 0) {
-    throw "Could not install the Red Onion program requirements (exit code $LASTEXITCODE)."
+if ($HealthCheck -and -not $RebuildEnvironment -and -not $EnvironmentMatches) {
+    throw (
+        "Health check found that the local Python environment is missing or stale. " +
+        "A technical maintainer must run this launcher once with " +
+        "-RebuildEnvironment -HealthCheck. " +
+        "The health check did not create or install anything."
+    )
+}
+
+if ($RebuildEnvironment -or (-not $HealthCheck -and -not $EnvironmentMatches)) {
+    Write-Host "Building the verified Red Onion Python environment..."
+    Rebuild-PythonEnvironment -BasePython $BasePython `
+        -PythonIdentity $PythonIdentity -RequirementsSha256 $RequirementsSha256
+    $EnvironmentMatches = $true
+}
+if (-not (Test-PythonEnvironment)) {
+    throw (
+        "The Red Onion Python environment failed local dependency verification. " +
+        "A technical maintainer should rerun with -RebuildEnvironment."
+    )
+}
+
+$MaintenanceOnly = $HealthCheck -or [bool]$RebindRestoredIntegrityAnchor
+if (-not $MaintenanceOnly) {
+    foreach ($dir in @($InputDir, $OutputDir, $ArchiveDir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
 }
 
 $ProgramArguments = @(
-    (Join-Path $ProgramDir "red_onion_weekly_metrics.py"),
+    $ProgramPath,
     "--input-dir", $InputDir,
     "--output-dir", $OutputDir,
     "--archive-dir", $ArchiveDir,
-    "--config", (Join-Path $ProgramDir "red_onion_config.json"),
+    "--config", $ConfigPath,
     "--integrity-anchor-dir", $IntegrityAnchorDir
 )
 if ($InitializeIntegrityBaseline) {
     $ProgramArguments += "--initialize-integrity-baseline"
+}
+if ($HealthCheck) {
+    $ProgramArguments += "--health-check"
+}
+if ($RebindRestoredIntegrityAnchor) {
+    $ProgramArguments += @(
+        "--rebind-restored-integrity-anchor",
+        $RebindRestoredIntegrityAnchor
+    )
 }
 
 & $VenvPython -B @ProgramArguments

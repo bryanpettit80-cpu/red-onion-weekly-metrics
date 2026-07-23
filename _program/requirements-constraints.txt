@@ -1,0 +1,4 @@
+# Cross-matrix constraint: NumPy 2.2.6 supports every declared/CI-tested
+# Python runtime (3.10-3.12). Regenerate requirements.lock only after the
+# complete supported matrix passes.
+numpy==2.2.6

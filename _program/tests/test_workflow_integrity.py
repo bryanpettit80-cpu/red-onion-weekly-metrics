@@ -162,6 +162,64 @@ def test_explicit_baseline_succeeds_without_active_input_and_is_idempotent(
     assert integrity.read_json_manifest(anchor, root=anchor.parent) == anchor_payload
 
 
+def test_replacement_path_rebind_verifies_backed_up_head(
+    tmp_path: Path,
+) -> None:
+    original_root = tmp_path / "original-operator-root"
+    original_args = workflow_args(
+        original_root, initialize_baseline=True
+    )
+    [original_manifest] = metrics.run(original_args)
+    original_archive = Path(original_args.archive_dir)
+    source_anchor = metrics.integrity_anchor_path(original_archive)
+    source_payload = integrity.read_json_manifest(
+        source_anchor, root=source_anchor.parent
+    )
+
+    replacement_root = tmp_path / "replacement-operator-root"
+    shutil.copytree(original_root, replacement_root)
+    replacement_archive = replacement_root / "03 Archive"
+    replacement_output = replacement_root / "02 Finished Reports"
+    replacement_anchor_dir = tmp_path / "replacement-machine-anchors"
+
+    rebound, receipt = metrics.rebind_restored_integrity_anchor(
+        replacement_archive,
+        replacement_output,
+        source_anchor,
+        replacement_anchor_dir,
+    )
+
+    replacement_manifest = (
+        metrics.integrity_manifest_dir(replacement_archive)
+        / original_manifest.name
+    )
+    assert metrics.verify_integrity_anchor(
+        replacement_archive, replacement_anchor_dir
+    ) == (
+        replacement_manifest.resolve(),
+        source_payload["manifest_sha256"],
+    )
+    rebound_payload = integrity.read_json_manifest(
+        rebound, root=rebound.parent
+    )
+    assert (
+        rebound_payload["archive_identity_sha256"]
+        != source_payload["archive_identity_sha256"]
+    )
+    receipt_payload = integrity.read_json_manifest(
+        receipt, root=receipt.parent
+    )
+    assert receipt_payload["contract"] == (
+        "IntegrityAnchorRestoreRebindReceiptV1"
+    )
+    assert receipt_payload["source_anchor_sha256"] == metrics.sha256_file(
+        source_anchor
+    )
+    assert receipt_payload["manifest_sha256"] == source_payload[
+        "manifest_sha256"
+    ]
+
+
 def test_rewritten_manifest_head_and_raw_data_cannot_replace_trusted_history(
     tmp_path: Path,
 ) -> None:
