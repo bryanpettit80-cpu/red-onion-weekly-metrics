@@ -155,13 +155,16 @@ LEGACY_ACTION_HEADERS_V1 = [
     "Signal State",
 ]
 
-ACTION_STATUS_CHOICES: tuple[str, ...] = (
-    "Review Needed",
+LEGACY_ACTION_STATUS_CHOICES: tuple[str, ...] = (
     "Open",
     "In Progress",
     "Blocked",
     "Complete",
     "Dismissed",
+)
+ACTION_STATUS_CHOICES: tuple[str, ...] = (
+    "Review Needed",
+    *LEGACY_ACTION_STATUS_CHOICES,
 )
 REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
     "Pending Review",
@@ -6851,11 +6854,29 @@ def expected_management_list_validations(
             len(LEGACY_ACTION_HEADERS_V1),
         }:
             raise IntegrityError("The Action Board table has an unexpected shape.")
+        expected_action_headers = (
+            ACTION_HEADERS
+            if action_max_col == len(ACTION_HEADERS)
+            else LEGACY_ACTION_HEADERS_V1
+        )
+        actual_action_headers = [
+            action_board.cell(row=action_min_row, column=column).value
+            for column in range(1, action_max_col + 1)
+        ]
+        if actual_action_headers != expected_action_headers:
+            raise IntegrityError(
+                "The Action Board table headers do not match a supported schema."
+            )
+        action_status_choices = (
+            ACTION_STATUS_CHOICES
+            if action_max_col == len(ACTION_HEADERS)
+            else LEGACY_ACTION_STATUS_CHOICES
+        )
         expected.extend(
             [
                 (
                     "Action Board",
-                    f'"{",".join(ACTION_STATUS_CHOICES)}"',
+                    f'"{",".join(action_status_choices)}"',
                     False,
                     column_range("D", action_min_row + 1, action_max_row),
                     "Action Board status",
