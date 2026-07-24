@@ -196,6 +196,11 @@ REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
     "Monitor",
 )
 MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v3"
+PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v2"
+PREVIOUS_RATE_OF_SALE_GUIDANCE = (
+    "Rate of Sale currently assumes lower is better."
+)
+PREVIOUS_TICKET_TIME_GUIDANCE = "Ticket Time is guest-weighted"
 MANAGEMENT_SIGNAL_DISCLAIMER = (
     "Rule-based observational coaching signal—not a statistical, causal, or "
     "employment decision. Verify comparable work context and source accuracy."
@@ -7466,8 +7471,12 @@ def workbook_color_suffix(color: Any) -> str | None:
     return str(value)[-6:].upper() if value else None
 
 
-def require_current_workbook_usability_contract(wb: Workbook) -> None:
-    """Require the exact guide, navigation, and persistent top-bar contract."""
+def require_current_workbook_usability_contract(
+    wb: Workbook,
+    *,
+    previous_v2: bool = False,
+) -> None:
+    """Require the exact current or immediately preceding usability contract."""
 
     if not wb.sheetnames or wb.sheetnames[0] != "How to Use":
         raise IntegrityError("How to Use must be the first worksheet.")
@@ -7501,8 +7510,23 @@ def require_current_workbook_usability_contract(wb: Workbook) -> None:
             "How to Use is missing required section headings: "
             + ", ".join(missing_headings)
         )
+    methodology_version = (
+        PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION
+        if previous_v2
+        else MANAGEMENT_METHODOLOGY_VERSION
+    )
+    rate_guidance = (
+        PREVIOUS_RATE_OF_SALE_GUIDANCE
+        if previous_v2
+        else "Rate of Sale is opportunities divided by qualifying sales"
+    )
+    ticket_guidance = (
+        PREVIOUS_TICKET_TIME_GUIDANCE
+        if previous_v2
+        else "Ticket Time is weighted only by complete Check Count coverage"
+    )
     required_guide_phrases = (
-        MANAGEMENT_METHODOLOGY_VERSION,
+        methodology_version,
         "never be the sole or determinative basis",
         "Do not infer protected characteristics from names.",
         "ExternalCheckRequired",
@@ -7513,8 +7537,8 @@ def require_current_workbook_usability_contract(wb: Workbook) -> None:
         "U — Review Disposition",
         "V — Reviewed By",
         "W — Review Date",
-        "Rate of Sale is opportunities divided by qualifying sales",
-        "Ticket Time is weighted only by complete Check Count coverage",
+        rate_guidance,
+        ticket_guidance,
     )
     flattened_guide_text = "\n".join(sorted(guide_text))
     missing_phrases = [
@@ -7586,29 +7610,52 @@ def require_current_workbook_usability_contract(wb: Workbook) -> None:
                     f"Worksheet {ws.title!r} has an invalid navigation target."
                 )
             is_current = target == ws.title
+            expected_fill = (
+                "7A1E1E"
+                if previous_v2 and is_current
+                else "F2F2F2"
+            )
+            expected_font_color = (
+                "FFFFFF"
+                if previous_v2 and is_current
+                else "7A1E1E"
+            )
+            expected_underline = (
+                None
+                if previous_v2
+                else ("single" if is_current else None)
+            )
+            expected_side_style = "thin" if previous_v2 else None
             if (
                 workbook_color_suffix(cell.fill.fgColor)
-                != "F2F2F2"
+                != expected_fill
                 or workbook_color_suffix(cell.font.color)
-                != "7A1E1E"
+                != expected_font_color
                 or cell.font.bold is not True
                 or cell.font.size != 9
                 or cell.font.underline
-                != ("single" if is_current else None)
+                != expected_underline
                 or cell.alignment.horizontal != "center"
                 or cell.alignment.vertical != "center"
                 or cell.alignment.shrink_to_fit is not True
                 or cell.border.top.style != "thin"
                 or cell.border.bottom.style != "thin"
-                or getattr(cell.border.left, "style", None) is not None
-                or getattr(cell.border.right, "style", None) is not None
+                or getattr(cell.border.left, "style", None)
+                != expected_side_style
+                or getattr(cell.border.right, "style", None)
+                != expected_side_style
             ):
                 raise IntegrityError(
                     f"Worksheet {ws.title!r} navigation style does not match the contract."
                 )
 
 
-def validate_management_workbook(path: Path, expected_digest: str | None = None) -> str:
+def validate_management_workbook(
+    path: Path,
+    expected_digest: str | None = None,
+    *,
+    previous_v2_usability: bool = False,
+) -> str:
     """Validate protection, visibility, editable cells, tables, and digest."""
     reject_unapproved_workbook_drawings(path)
     wb = load_workbook(path, data_only=False)
@@ -7622,7 +7669,10 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
             wb, protect_objects_and_scenarios=True
         )
         if "How to Use" in VISIBLE_MANAGEMENT_SHEETS:
-            require_current_workbook_usability_contract(wb)
+            require_current_workbook_usability_contract(
+                wb,
+                previous_v2=previous_v2_usability,
+            )
         expected_validations = expected_management_list_validations(wb)
         require_exact_validation_count(
             wb, expected_validations, contract_label="strict protection-contract"
@@ -7838,6 +7888,34 @@ def pre_contract_management_workbook(path: Path) -> bool:
         wb.close()
 
 
+def workbook_uses_previous_v2_usability(wb: Workbook) -> bool:
+    if (
+        stamped_workbook_protection_contract(wb)
+        != WORKBOOK_PROTECTION_CONTRACT
+        or "How to Use" not in wb.sheetnames
+    ):
+        return False
+    guide_text = "\n".join(
+        str(cell.value)
+        for cell in wb["How to Use"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    return (
+        PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
+        and MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+    )
+
+
+def management_workbook_upgrade_pending(path: Path) -> bool:
+    if pre_contract_management_workbook(path):
+        return True
+    wb = load_workbook(path, data_only=False)
+    try:
+        return workbook_uses_previous_v2_usability(wb)
+    finally:
+        wb.close()
+
+
 def verify_existing_management_workbook_integrity(
     path: Path,
     *,
@@ -7860,6 +7938,7 @@ def verify_existing_management_workbook_integrity(
             name in wb.sheetnames for name in ("Action Focus", "Evidence Detail")
         )
         has_how_to_use_schema = "How to Use" in wb.sheetnames
+        has_previous_v2_usability = workbook_uses_previous_v2_usability(wb)
         action_headers = (
             {
                 str(cell.value)
@@ -7879,6 +7958,21 @@ def verify_existing_management_workbook_integrity(
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
         if has_v2_action_schema:
             if has_how_to_use_schema:
+                if has_previous_v2_usability:
+                    if (
+                        not allow_legacy_protection_upgrade
+                        or expected_digest is None
+                    ):
+                        raise IntegrityError(
+                            "The existing master workbook predates the current "
+                            "usability contract. It may be upgraded only when its "
+                            "exact digest is pinned by the verified integrity manifest."
+                        )
+                    return validate_management_workbook(
+                        path,
+                        expected_digest,
+                        previous_v2_usability=True,
+                    )
                 return validate_management_workbook(path, expected_digest or stamped)
             return validate_pre_guide_management_workbook(
                 path, expected_digest or stamped or ""
@@ -12181,7 +12275,7 @@ def verify_integrity_state(
         )
         payload["_legacy_master_upgrade_pending"] = (
             allow_legacy_master_upgrade
-            and pre_contract_management_workbook(master_path)
+            and management_workbook_upgrade_pending(master_path)
         )
     elif os.path.lexists(master_path):
         raise IntegrityError(
@@ -12846,8 +12940,8 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     if migration_only and legacy_master_upgrade_pending:
         raise IntegrityError(
             "History-only migration is blocked while the manifest-pinned master workbook "
-            "awaits its one-way protection-contract upgrade. Run the next ordinary weekly "
-            "snapshot first; no files were changed."
+            "awaits its one-way workbook-contract upgrade. Run the next ordinary weekly "
+            "snapshot or an approved combined history rebuild; no files were changed."
         )
 
     migration_plan = (

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from datetime import date
+from dataclasses import replace
+from datetime import date, timedelta
 from pathlib import Path
 import shutil
 
 from openpyxl import load_workbook
+from openpyxl.styles import Border, Font, PatternFill, Side
 import pytest
 
 import red_onion_integrity as integrity
@@ -125,6 +127,59 @@ def downgrade_master_to_pre_protection_contract(path: Path) -> str:
             validation.error = None
     workbook.save(path)
     workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
+def downgrade_master_to_v2_usability_contract(path: Path) -> str:
+    """Model the manifest-bound v0.3.2 workbook deployed before v3."""
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        guide = workbook["How to Use"]
+        for cell in guide._cells.values():
+            if not isinstance(cell.value, str):
+                continue
+            cell.value = cell.value.replace(
+                metrics.MANAGEMENT_METHODOLOGY_VERSION,
+                metrics.PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION,
+            )
+            if "Rate of Sale is opportunities divided by qualifying sales" in cell.value:
+                cell.value = (
+                    "Rate of Sale currently assumes lower is better. Ticket Time is "
+                    "guest-weighted because ticket/check count is unavailable. These "
+                    "are action-driving business assumptions pending source-owner "
+                    "confirmation."
+                )
+
+        navigation_border = Border(
+            left=Side(style="thin", color="B7B7B7"),
+            right=Side(style="thin", color="B7B7B7"),
+            top=Side(style="thin", color="B7B7B7"),
+            bottom=Side(style="thin", color="B7B7B7"),
+        )
+        for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
+            worksheet = workbook[sheet_name]
+            for column, (_, target) in zip(
+                metrics.management_navigation_columns(worksheet),
+                metrics.MANAGEMENT_NAVIGATION_LINKS,
+                strict=True,
+            ):
+                cell = worksheet.cell(row=2, column=column)
+                is_current = target == sheet_name
+                cell.fill = PatternFill(
+                    "solid",
+                    fgColor="7A1E1E" if is_current else "F2F2F2",
+                )
+                cell.font = Font(
+                    color="FFFFFF" if is_current else "7A1E1E",
+                    bold=True,
+                    underline=None,
+                    size=9,
+                )
+                cell.border = navigation_border
+        workbook.save(path)
+    finally:
+        workbook.close()
     return metrics.stamp_generated_content_digest(path)
 
 
@@ -570,6 +625,293 @@ def test_adopted_pre_contract_master_is_regenerated_with_strict_protection(
             == "Protection Contract"
             for row in range(1, upgraded["Run Notes"].max_row + 1)
         )
+        assert metrics.owner_roster_from_sheet(upgraded["Management Setup"])[0] == {
+            "Owner Name": "Avery Manager",
+            "Active": "Yes",
+        }
+    finally:
+        upgraded.close()
+
+
+def test_manifest_pinned_v2_usability_master_is_regenerated_as_v3(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook["Management Setup"]["A21"] = "Avery Manager"
+        workbook["Management Setup"]["B21"] = "Yes"
+        workbook.save(master)
+    finally:
+        workbook.close()
+    v2_digest = downgrade_master_to_v2_usability_contract(master)
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="v2-usability-contract",
+        previous_manifest=None,
+    )
+    assert integrity.read_json_manifest(existing)[
+        "master_generated_content_sha256"
+    ] == v2_digest
+    before_upgrade = master.read_bytes()
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="predates the current usability contract",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=v2_digest,
+        )
+
+    adopted, adopted_payload, adopted_sha256 = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+    assert adopted == existing
+    assert adopted_payload["_legacy_master_upgrade_pending"] is True
+    assert metrics.verify_integrity_anchor(archive_dir) == (
+        existing.resolve(),
+        adopted_sha256,
+    )
+    assert master.read_bytes() == before_upgrade
+
+    _, anchored_payload, _ = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+    )
+    assert anchored_payload["_legacy_master_upgrade_pending"] is True
+
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    (input_dir / "Daily Report - TM - 07-21-2026.xlsx").write_bytes(
+        b"captured active report"
+    )
+    install_synthetic_parser(monkeypatch)
+    generated = metrics.run(args)
+
+    assert master in generated
+    assert metrics.validate_management_workbook(master)
+    upgraded = load_workbook(master, data_only=False)
+    try:
+        guide_text = "\n".join(
+            str(cell.value)
+            for cell in upgraded["How to Use"]._cells.values()
+            if cell.value not in (None, "")
+        )
+        assert metrics.MANAGEMENT_METHODOLOGY_VERSION in guide_text
+        assert metrics.PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+        assert metrics.owner_roster_from_sheet(upgraded["Management Setup"])[0] == {
+            "Owner Name": "Avery Manager",
+            "Active": "Yes",
+        }
+    finally:
+        upgraded.close()
+
+
+def test_manifest_pinned_v2_usability_upgrade_rejects_navigation_tampering(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    downgrade_master_to_v2_usability_contract(master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        dashboard = workbook["Dashboard"]
+        current_column = next(
+            column
+            for column, (_, target) in zip(
+                metrics.management_navigation_columns(dashboard),
+                metrics.MANAGEMENT_NAVIGATION_LINKS,
+                strict=True,
+            )
+            if target == "Dashboard"
+        )
+        dashboard.cell(row=2, column=current_column).fill = PatternFill(
+            "solid",
+            fgColor="F2F2F2",
+        )
+        workbook.save(master)
+    finally:
+        workbook.close()
+    metrics.stamp_generated_content_digest(master)
+    metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="tampered-v2-usability-contract",
+        previous_manifest=None,
+    )
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="navigation style does not match the contract",
+    ):
+        metrics.ensure_integrity_preflight(
+            archive_dir,
+            output_dir,
+            config_path,
+            config,
+            allow_initialize=True,
+        )
+    assert not metrics.integrity_anchor_exists(archive_dir)
+
+
+def test_v2_usability_upgrade_combines_history_migration_and_rebuild_atomically(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook["Management Setup"]["A21"] = "Avery Manager"
+        workbook["Management Setup"]["B21"] = "Yes"
+        workbook.save(master)
+    finally:
+        workbook.close()
+    downgrade_master_to_v2_usability_contract(master)
+
+    canonical_week_end = date(2026, 7, 19)
+    canonical_week = (
+        archive_dir
+        / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
+        / f"week-ending-{canonical_week_end.isoformat()}"
+    )
+    canonical_week.mkdir(parents=True)
+    staged_week_end = date(2026, 7, 12)
+    migration_source = tmp_path / "approved-history"
+    migration_source.mkdir()
+    report_dates: dict[str, date] = {}
+    for week_end, destination in (
+        (canonical_week_end, canonical_week),
+        (staged_week_end, migration_source),
+    ):
+        for offset in range(metrics.OPERATING_WEEK_DAYS):
+            report_date = week_end - timedelta(
+                days=metrics.OPERATING_WEEK_DAYS - 1 - offset
+            )
+            filename = f"Daily Report - TM - {report_date.isoformat()}.xls"
+            (destination / filename).write_bytes(
+                f"protected-history-{report_date.isoformat()}".encode()
+            )
+            report_dates[filename] = report_date
+
+    def parse_complete_day(
+        path: Path,
+        _config: dict,
+    ) -> list[metrics.MetricRecord]:
+        report_date = report_dates[path.name]
+        richmond = minimal_records(report_date, path.name)
+        virginia_beach = [
+            replace(record, location="RC Virginia Beach")
+            for record in richmond
+        ]
+        return [*richmond, *virginia_beach]
+
+    monkeypatch.setattr(metrics, "parse_daily_report", parse_complete_day)
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="v2-before-combined-rebuild",
+        previous_manifest=None,
+    )
+    _, adopted_payload, _ = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+    assert adopted_payload["_legacy_master_upgrade_pending"] is True
+    before_master = master.read_bytes()
+    before_anchor = integrity.read_json_manifest(
+        metrics.integrity_anchor_path(archive_dir),
+        root=metrics.integrity_anchor_path(archive_dir).parent,
+    )
+
+    args.migrate_history_from = [str(migration_source)]
+    args.migrate_history_only = True
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="History-only migration is blocked",
+    ):
+        metrics.run(args)
+    assert master.read_bytes() == before_master
+    assert manifest_paths(archive_dir) == [existing]
+    assert integrity.read_json_manifest(
+        metrics.integrity_anchor_path(archive_dir),
+        root=metrics.integrity_anchor_path(archive_dir).parent,
+    ) == before_anchor
+
+    active_input = Path(args.input_dir) / "Daily Report active.xls"
+    active_input.parent.mkdir(parents=True)
+    active_input.write_bytes(b"must-not-be-read-or-moved")
+    args.migrate_history_only = False
+    args.rebuild_from_history = True
+    generated = metrics.run(args)
+
+    assert master in generated
+    assert active_input.read_bytes() == b"must-not-be-read-or-moved"
+    assert len(
+        list(
+            (
+                archive_dir / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
+            ).rglob("*.xls")
+        )
+    ) == 12
+    latest = metrics.latest_integrity_manifest_path(archive_dir)
+    assert latest is not None and latest != existing
+    latest_payload = integrity.read_json_manifest(latest)
+    assert latest_payload["kind"] == "history-rebuild"
+    assert latest_payload["details"]["rebuild_from_history"] is True
+    assert len(
+        integrity.verify_manifest_chain(
+            latest,
+            metrics.integrity_manifest_dir(archive_dir),
+        )
+    ) == 2
+    assert metrics.verify_integrity_anchor(archive_dir)[0] == latest.resolve()
+    assert metrics.validate_management_workbook(master)
+    upgraded = load_workbook(master, data_only=False)
+    try:
         assert metrics.owner_roster_from_sheet(upgraded["Management Setup"])[0] == {
             "Owner Name": "Avery Manager",
             "Active": "Yes",
