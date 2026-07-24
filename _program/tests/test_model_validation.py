@@ -15,8 +15,6 @@ def _all_metric_values(values: list[float]) -> dict[str, list[float]]:
     return {
         "check_average": list(values),
         "wine_pct": [value / 1000 for value in values],
-        "rate_of_sale_by_guest_count": [value / 1000 for value in values],
-        "average_ticket_time_seconds": [value * 60 for value in values],
     }
 
 
@@ -49,8 +47,8 @@ def test_calibration_freezes_separate_movement_and_peer_families() -> None:
         "lower_is_better": False,
     }
     metadata = fragment["management_threshold_calibration"]
-    assert metadata["movement_observation_count"] == 16
-    assert metadata["peer_observation_count"] == 16
+    assert metadata["movement_observation_count"] == 8
+    assert metadata["peer_observation_count"] == 8
     assert metadata["version"] == "test-v1"
     serialized = json.dumps(result)
     assert "raw_user_name" not in serialized

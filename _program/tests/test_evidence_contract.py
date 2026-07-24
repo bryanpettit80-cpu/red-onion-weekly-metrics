@@ -31,7 +31,7 @@ def sample_signal() -> dict:
         "Comparator Type": "Same-store prior-four-week median",
         "Peer Cohort Size": 8,
         "Peer Cohort Weeks": 4,
-        "Threshold Version": "2026.07-v2",
+        "Threshold Version": "2026.07-v3",
         "Recurring Drivers": "check_average",
         "Stability Result": "Stable under every active-day removal",
         "Last Seen": date(2026, 7, 19),
@@ -88,6 +88,52 @@ def test_management_signal_matches_reviewed_semantic_golden() -> None:
     expected = json.loads(fixture.read_text(encoding="utf-8"))
 
     assert {field: result[field] for field in expected} == expected
+
+
+def test_context_only_change_updates_audit_evidence_without_resetting_review() -> None:
+    def signal(ticket_seconds: float) -> dict:
+        raw = sample_signal()
+        raw["_metric_evidence"] = {
+            "decision_metric_fields": ["check_average", "wine_pct"],
+            "recent_metric_scores": {
+                "check_average": -2,
+                "wine_pct": -1,
+            },
+            "context_only_metrics": {
+                "average_ticket_time_seconds": ticket_seconds,
+                "ticket_time_available": True,
+                "ticket_time_weight_basis": "Check Count",
+            },
+        }
+        return metrics.enrich_management_signal(raw)
+
+    prior = signal(100.0)
+    prior.update(
+        {
+            "Action ID": "ABC123",
+            "Status": "In Progress",
+            "First Seen": date(2026, 7, 12),
+            "Weeks Open": 2,
+            "Context Notes": "Comparable shifts reviewed.",
+            "Review Disposition": "Coaching Accepted",
+            "Reviewed By": "Pat Manager",
+            "Review Date": date(2026, 7, 20),
+            "Signal State": "Current",
+        }
+    )
+    changed_context = signal(200.0)
+    assert changed_context["Evidence ID"] != prior["Evidence ID"]
+
+    current, _ = metrics.merge_management_actions(
+        [changed_context],
+        {"active_actions": [prior], "action_history": []},
+    )
+
+    assert current[0]["Evidence ID"] == changed_context["Evidence ID"]
+    assert current[0]["Status"] == "In Progress"
+    assert current[0]["Review Disposition"] == "Coaching Accepted"
+    assert current[0]["Reviewed By"] == "Pat Manager"
+    assert current[0]["Review Date"] == date(2026, 7, 20)
 
 
 def test_action_focus_links_to_editable_board_and_evidence_is_read_only() -> None:
@@ -252,7 +298,7 @@ def sample_package() -> metrics.ManagementEvidencePackageV2:
         comparator_type="Same-store prior-four-week median",
         peer_cohort_size=8,
         peer_cohort_weeks=4,
-        threshold_version="2026.07-v2",
+        threshold_version="2026.07-v3",
         evidence_status="Stable",
         recurring_drivers="check_average",
         stability_result="Stable under every active-day removal",

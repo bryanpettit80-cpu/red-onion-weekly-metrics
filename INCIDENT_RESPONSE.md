@@ -26,7 +26,7 @@ manifest/anchor, and affected artifact hashes.
 ## Incorrect or Missing Daily Report
 
 - Leave active files in intake.
-- Replace incomplete exports from the authoritative Toast source.
+- Replace incomplete exports from the authoritative Red Onion reporting source.
 - Re-run only after the business date, locations, and duplicate/conflict
   messages are reconciled.
 

@@ -96,9 +96,9 @@
     "strong_quantile": 0.9,
     "calibration_start": "2026-04-28",
     "calibration_end": "2026-07-19",
-    "movement_observation_count": 676,
-    "peer_observation_count": 612,
-    "version": "2026.07-v2"
+    "movement_observation_count": 338,
+    "peer_observation_count": 306,
+    "version": "2026.07-v3"
   },
   "management_min_entity_baseline_weeks": 2,
   "management_materiality": {

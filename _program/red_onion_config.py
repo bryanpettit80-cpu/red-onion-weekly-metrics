@@ -79,9 +79,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "strong_quantile": 0.9,
         "calibration_start": "2026-04-28",
         "calibration_end": "2026-07-19",
-        "movement_observation_count": 676,
-        "peer_observation_count": 612,
-        "version": "2026.07-v2",
+        "movement_observation_count": 338,
+        "peer_observation_count": 306,
+        "version": "2026.07-v3",
     },
     "management_min_entity_baseline_weeks": 2,
     "management_materiality": {
@@ -366,7 +366,7 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if effective_peer["leave_one_person_out"] is not True:
             raise ConfigError(
                 "management_peer_reference.leave_one_person_out must be true for "
-                "methodology 2026.07-v2."
+                "methodology 2026.07-v3."
             )
 
     if "management_signal_persistence" in payload:
@@ -388,7 +388,7 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if effective_persistence["qualified_weeks"] != 2:
             raise ConfigError(
                 "management_signal_persistence.qualified_weeks must be 2 for "
-                "methodology 2026.07-v2."
+                "methodology 2026.07-v3."
             )
         for field in (
             "require_recurring_driver",
@@ -401,7 +401,7 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if effective_persistence[field] is not True:
                 raise ConfigError(
                     f"management_signal_persistence.{field} must be true for "
-                    "methodology 2026.07-v2."
+                    "methodology 2026.07-v3."
                 )
 
     if "management_threshold_calibration" in payload:

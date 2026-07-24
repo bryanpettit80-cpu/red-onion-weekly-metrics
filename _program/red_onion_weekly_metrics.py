@@ -32,6 +32,7 @@ from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.workbook.protection import WorkbookProtection
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from red_onion_integrity import (
@@ -85,7 +86,19 @@ METRICS = [
 MANAGEMENT_METRICS: tuple[tuple[str, str, str], ...] = (
     ("gross_sales", "Gross Sales", "currency"),
     ("guest_count", "Guest Count", "count"),
-    ("check_average", "Check Average", "currency"),
+    ("check_average", "Sales / Guest", "currency"),
+    ("wine_pct", "Wine %", "percent"),
+    ("rate_of_sale_by_guest_count", "Rate of Sale", "rate"),
+    ("average_ticket_time_seconds", "Ticket Time", "duration"),
+)
+
+STORE_GROUP_DISPLAY_METRICS: tuple[tuple[str, str, str], ...] = (
+    ("gross_sales", "Gross Sales", "currency"),
+    ("guest_count", "Guests", "count"),
+    ("check_count", "Checks", "count"),
+    ("check_average", "Sales / Guest", "currency"),
+    ("sales_per_check", "Sales / Check", "currency"),
+    ("guests_per_check", "Guests / Check", "ratio"),
     ("wine_pct", "Wine %", "percent"),
     ("rate_of_sale_by_guest_count", "Rate of Sale", "rate"),
     ("average_ticket_time_seconds", "Ticket Time", "duration"),
@@ -100,12 +113,20 @@ TARGET_FIELDS: tuple[tuple[str, str], ...] = (
     ("average_ticket_time_seconds", "Ticket Time Target (Min)"),
 )
 
-SERVER_TREND_FIELDS: tuple[str, ...] = (
+SERVER_PERSON_ACTION_FIELDS: tuple[str, ...] = (
     "check_average",
     "wine_pct",
+)
+
+SERVER_CONTEXT_FIELDS: tuple[str, ...] = (
     "rate_of_sale_by_guest_count",
     "average_ticket_time_seconds",
 )
+
+# Retain the established name for compatibility with callers and tests while
+# making its decision scope explicit. Rate of Sale and Ticket Time remain
+# visible operational context but cannot create person-level signals.
+SERVER_TREND_FIELDS: tuple[str, ...] = SERVER_PERSON_ACTION_FIELDS
 
 ACTION_HEADERS = [
     "Action ID",
@@ -174,7 +195,7 @@ REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
     "Data Issue",
     "Monitor",
 )
-MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v2"
+MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v3"
 MANAGEMENT_SIGNAL_DISCLAIMER = (
     "Rule-based observational coaching signal—not a statistical, causal, or "
     "employment decision. Verify comparable work context and source accuracy."
@@ -278,6 +299,20 @@ MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Setup", "Management Setup"),
     ("Run", "Run Notes"),
 )
+MANAGEMENT_PRINT_WIDTHS: dict[str, int] = {
+    "How to Use": 1,
+    "Dashboard": 1,
+    "Action Focus": 2,
+    "Action Board": 3,
+    "Server Scorecard": 2,
+    "Store & Group Scorecards": 1,
+    "Recent Movement Signals": 2,
+    "Evidence Detail": 3,
+    "Action History": 3,
+    "Data Quality": 1,
+    "Management Setup": 2,
+    "Run Notes": 1,
+}
 HOW_TO_USE_SECTION_HEADINGS: tuple[str, ...] = (
     "SCOPE AND PROHIBITED USE",
     "SIX-STEP WEEKLY WORKFLOW",
@@ -354,6 +389,8 @@ class MetricRecord:
     report_date_source: str = "Unknown"
     rate_available: bool = True
     ticket_time_available: bool = True
+    check_count: float = 0.0
+    check_count_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -623,22 +660,48 @@ def optional_float(value: Any) -> tuple[float, bool]:
         return 0.0, False
 
 
+def optional_nonnegative_float(value: Any) -> tuple[float, bool]:
+    """Return an available finite value only when it is non-negative."""
+
+    number, available = optional_float(value)
+    return (number, True) if available and number >= 0 else (0.0, False)
+
+
+def optional_check_count(value: Any) -> tuple[float, bool]:
+    """Parse a non-negative whole-number Check Count."""
+
+    number, available = optional_nonnegative_float(value)
+    if not available or not float(number).is_integer():
+        return 0.0, False
+    return number, True
+
+
 def optional_ticket_time_seconds(value: Any) -> tuple[float, bool]:
     """Parse ticket time without turning malformed or non-finite input into a benefit."""
 
     if is_blank(value):
         return 0.0, False
-    if isinstance(value, (int, float)) and not math.isfinite(float(value)):
-        return 0.0, False
-    if isinstance(value, str) and not re.match(
-        r"^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$", value.strip()
-    ):
-        return 0.0, False
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)) or float(value) < 0:
+            return 0.0, False
+    if isinstance(value, str):
+        match = re.match(
+            r"^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$", value.strip()
+        )
+        if not match:
+            return 0.0, False
+        _, minutes, seconds, _ = match.groups()
+        if int(minutes) >= 60 or int(seconds) >= 60:
+            return 0.0, False
     try:
         seconds = ticket_time_to_seconds(value)
     except (TypeError, ValueError, OverflowError):
         return 0.0, False
-    return (seconds, True) if math.isfinite(seconds) else (0.0, False)
+    return (
+        (seconds, True)
+        if math.isfinite(seconds) and seconds >= 0
+        else (0.0, False)
+    )
 
 
 def parse_date_text(text: str) -> date:
@@ -731,19 +794,23 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
         if "Report(All)" not in workbook.sheet_names:
             if "No Data Available" in workbook.sheet_names:
                 raise ValueError(
-                    "the Toast export contains a 'No Data Available' worksheet instead of report "
+                    "the source export contains a 'No Data Available' worksheet instead of report "
                     "data. Replace it with a complete Daily Report export, then rerun. No "
                     "workbooks were created and no source files were moved."
                 )
             available_sheets = ", ".join(workbook.sheet_names) or "none"
             raise ValueError(
                 "the required 'Report(All)' worksheet is missing "
-                f"(worksheets found: {available_sheets}). Replace the file with a complete Toast "
+                f"(worksheets found: {available_sheets}). Replace the file with a complete Red Onion "
                 "Daily Report export, then rerun."
             )
         df = workbook.parse("Report(All)", header=None)
     report_date, report_date_source = parse_report_date_with_source(df, path)
     header_row, location_col, block_starts = find_header_row(df)
+    header_values = [
+        "" if is_blank(value) else str(value).strip()
+        for value in df.iloc[header_row].tolist()
+    ]
     location_names = set(config["locations"])
     records: list[MetricRecord] = []
 
@@ -762,18 +829,35 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
 
         for start_col in block_starts:
             values = [row.get(start_col + offset) for offset in range(len(METRICS))]
-            if all(is_blank(value) for value in values):
+            check_count_col = start_col + len(METRICS)
+            has_check_count = (
+                check_count_col < len(header_values)
+                and header_values[check_count_col] == "Check Count"
+            )
+            check_count_value = row.get(check_count_col) if has_check_count else None
+            if all(is_blank(value) for value in values) and is_blank(check_count_value):
                 continue
 
             gross_sales = to_float(values[0])
             guest_count = to_float(values[1])
             wine_sales = to_float(values[3])
-            rate, rate_available = optional_float(values[4])
+            rate, rate_available = optional_nonnegative_float(values[4])
             ticket_seconds, ticket_time_available = optional_ticket_time_seconds(
                 values[5]
             )
+            check_count, check_count_available = (
+                optional_check_count(check_count_value)
+                if has_check_count
+                else (0.0, False)
+            )
 
-            if raw_user_name and gross_sales == 0 and guest_count == 0 and wine_sales == 0:
+            if (
+                raw_user_name
+                and gross_sales == 0
+                and guest_count == 0
+                and wine_sales == 0
+                and not (check_count_available and check_count > 0)
+            ):
                 continue
 
             check_average = gross_sales / guest_count if guest_count else 0.0
@@ -797,10 +881,15 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
                     source_format=path.suffix.lower(),
                     parser_engine=parser_engine,
                     report_date_source=report_date_source,
-                    rate_available=(guest_count <= 0 or rate_available),
-                    ticket_time_available=(
-                        guest_count <= 0 or ticket_time_available
+                    rate_available=(
+                        guest_count <= 0 or (rate_available and rate > 0)
                     ),
+                    ticket_time_available=(
+                        (guest_count <= 0 and check_count <= 0)
+                        or ticket_time_available
+                    ),
+                    check_count=check_count,
+                    check_count_available=check_count_available,
                 )
             )
             break
@@ -1194,28 +1283,51 @@ def report_date_for_records(path: Path, records: list[MetricRecord]) -> date:
     return report_dates[0]
 
 
-def semantic_report_signature(records: list[MetricRecord]) -> tuple[tuple[Any, ...], ...]:
+def semantic_report_signature(
+    records: list[MetricRecord],
+    *,
+    include_check_count: bool = True,
+) -> tuple[tuple[Any, ...], ...]:
     def normalized_number(value: float) -> float:
         number = round(float(value), 6)
         return 0.0 if number == 0 else number
 
-    return tuple(
-        sorted(
-            (
-                record.location.strip(),
-                record.raw_user_name.strip(),
-                bool(record.is_location_total),
-                normalized_number(record.gross_sales),
-                normalized_number(record.guest_count),
-                normalized_number(record.wine_sales),
-                normalized_number(record.rate_of_sale_by_guest_count),
-                normalized_number(record.average_ticket_time_seconds),
-                bool(record.rate_available),
-                bool(record.ticket_time_available),
-            )
-            for record in records
+    def record_signature(record: MetricRecord) -> tuple[Any, ...]:
+        signature: tuple[Any, ...] = (
+            record.location.strip(),
+            record.raw_user_name.strip(),
+            bool(record.is_location_total),
+            normalized_number(record.gross_sales),
+            normalized_number(record.guest_count),
+            normalized_number(record.wine_sales),
+            normalized_number(record.rate_of_sale_by_guest_count),
+            normalized_number(record.average_ticket_time_seconds),
+            bool(record.rate_available),
+            bool(record.ticket_time_available),
         )
+        if include_check_count:
+            signature += (
+                normalized_number(record.check_count),
+                bool(record.check_count_available),
+            )
+        return signature
+
+    signature_records = (
+        records
+        if include_check_count
+        else [
+            record
+            for record in records
+            if not (
+                record.check_count_available
+                and record.check_count > 0
+                and record.gross_sales == 0
+                and record.guest_count == 0
+                and record.wine_sales == 0
+            )
+        ]
     )
+    return tuple(sorted(record_signature(record) for record in signature_records))
 
 
 def resolve_report_duplicates(
@@ -1229,13 +1341,44 @@ def resolve_report_duplicates(
     duplicates: list[Path] = []
     for report_date, reports in sorted(reports_by_date.items()):
         reports.sort(key=lambda item: str(item[0]).casefold())
-        selected_path, selected_records = reports[0]
-        selected_signature = semantic_report_signature(selected_records)
-        conflicting_paths = [
-            path
-            for path, records in reports[1:]
-            if semantic_report_signature(records) != selected_signature
-        ]
+        core_signatures = {
+            semantic_report_signature(records, include_check_count=False)
+            for _, records in reports
+        }
+        conflicting_paths: list[Path] = []
+        if len(core_signatures) == 1:
+            # A newer export can contain the same daily facts plus Check Count.
+            # Prefer the most complete copy instead of treating additive
+            # context as a conflict. Conflicting values at the same coverage
+            # level still fail closed.
+            richest_coverage = max(
+                sum(record.check_count_available for record in records)
+                for _, records in reports
+            )
+            richest_reports = [
+                (path, records)
+                for path, records in reports
+                if sum(record.check_count_available for record in records)
+                == richest_coverage
+            ]
+            selected_path, selected_records = richest_reports[0]
+            selected_signature = semantic_report_signature(selected_records)
+            conflicting_paths = [
+                path
+                for path, records in richest_reports[1:]
+                if semantic_report_signature(records) != selected_signature
+            ]
+        else:
+            selected_path, selected_records = reports[0]
+            selected_core_signature = semantic_report_signature(
+                selected_records, include_check_count=False
+            )
+            conflicting_paths = [
+                path
+                for path, records in reports[1:]
+                if semantic_report_signature(records, include_check_count=False)
+                != selected_core_signature
+            ]
         if conflicting_paths:
             paths = [selected_path, *conflicting_paths]
             path_lines = "\n".join(f"  - {path}" for path in paths)
@@ -1248,7 +1391,7 @@ def resolve_report_duplicates(
                 "source files were moved."
             )
         resolved[selected_path] = selected_records
-        duplicates.extend(path for path, _ in reports[1:])
+        duplicates.extend(path for path, _ in reports if path != selected_path)
 
     return ReportResolution(
         records_by_path=resolved,
@@ -1407,6 +1550,23 @@ def validate_daily_location_reconciliation(
             )
             continue
         total = totals[0]
+        if any(row.check_count_available for row in rows):
+            missing_check_rows = [
+                row.raw_user_name for row in rows if not row.check_count_available
+            ]
+            if missing_check_rows:
+                preview = ", ".join(missing_check_rows[:3])
+                failures.append(
+                    f"{report_date.isoformat()} {location}: Check Count is only "
+                    f"partially available (missing for {preview})"
+                )
+            else:
+                person_checks = sum(row.check_count for row in people)
+                if abs(person_checks - total.check_count) > 1e-6:
+                    failures.append(
+                        f"{report_date.isoformat()} {location}: check count person rows "
+                        f"{person_checks:.4f} != location total {total.check_count:.4f}"
+                    )
         comparisons = (
             (
                 "guest count",
@@ -2060,12 +2220,15 @@ def aggregate_records(
                     "gross_sales": 0.0,
                     "guest_count": 0.0,
                     "wine_sales": 0.0,
-                    "rate_weighted_sum": 0.0,
-                    "rate_weight": 0.0,
+                    "check_count": 0.0,
+                    "rate_qualifying_sales": 0.0,
+                    "rate_opportunities": 0.0,
                     "ticket_weighted_sum": 0.0,
                     "ticket_weight": 0.0,
                     "rate_available": True,
                     "ticket_time_available": True,
+                    "check_count_available": True,
+                    "has_active_rows": False,
                     "active_dates": set(),
                     "daily_records": [],
                     "source_files": set(),
@@ -2077,24 +2240,40 @@ def aggregate_records(
         group["gross_sales"] += record.gross_sales
         group["guest_count"] += record.guest_count
         group["wine_sales"] += record.wine_sales
-        if record.guest_count > 0 and record.rate_available:
-            group["rate_weighted_sum"] += (
-                record.rate_of_sale_by_guest_count * record.guest_count
+        group["check_count"] += (
+            record.check_count if record.check_count_available else 0.0
+        )
+        active_row = (
+            record.guest_count > 0
+            or record.gross_sales > 0
+            or (record.check_count_available and record.check_count > 0)
+        )
+        if active_row:
+            group["has_active_rows"] = True
+            group["check_count_available"] = (
+                group["check_count_available"] and record.check_count_available
             )
-            group["rate_weight"] += record.guest_count
-        if record.guest_count > 0 and record.ticket_time_available:
-            group["ticket_weighted_sum"] += (
-                record.average_ticket_time_seconds * record.guest_count
-            )
-            group["ticket_weight"] += record.guest_count
         if record.guest_count > 0:
-            group["rate_available"] = (
-                group["rate_available"] and record.rate_available
-            )
+            group["rate_available"] = group["rate_available"] and record.rate_available
+            if record.rate_available and record.rate_of_sale_by_guest_count > 0:
+                group["rate_qualifying_sales"] += (
+                    record.guest_count / record.rate_of_sale_by_guest_count
+                )
+                group["rate_opportunities"] += record.guest_count
+        if record.check_count > 0 and record.check_count_available:
             group["ticket_time_available"] = (
                 group["ticket_time_available"] and record.ticket_time_available
             )
-        if record.guest_count > 0 or record.gross_sales > 0:
+        if (
+            record.check_count > 0
+            and record.check_count_available
+            and record.ticket_time_available
+        ):
+            group["ticket_weighted_sum"] += (
+                record.average_ticket_time_seconds * record.check_count
+            )
+            group["ticket_weight"] += record.check_count
+        if active_row:
             group["active_dates"].add(record.report_date)
         group["daily_records"].append(
             {
@@ -2106,6 +2285,8 @@ def aggregate_records(
                 "average_ticket_time_seconds": record.average_ticket_time_seconds,
                 "rate_available": record.rate_available,
                 "ticket_time_available": record.ticket_time_available,
+                "check_count": record.check_count,
+                "check_count_available": record.check_count_available,
             }
         )
         group["source_files"].add(record.source_file)
@@ -2128,13 +2309,43 @@ def aggregate_records(
         rollup = dict(group)
         rollup["check_average"] = gross_sales / guest_count if guest_count else 0.0
         rollup["wine_pct"] = wine_sales / gross_sales if gross_sales else 0.0
+        rollup["check_count_available"] = bool(
+            group["has_active_rows"] and group["check_count_available"]
+        )
+        rollup["sales_per_check"] = (
+            gross_sales / group["check_count"]
+            if rollup["check_count_available"] and group["check_count"]
+            else 0.0
+        )
+        rollup["guests_per_check"] = (
+            guest_count / group["check_count"]
+            if rollup["check_count_available"] and group["check_count"]
+            else 0.0
+        )
+        rollup["rate_available"] = bool(
+            group["rate_available"]
+            and group["rate_opportunities"] > 0
+            and group["rate_qualifying_sales"] > 0
+        )
         rollup["rate_of_sale_by_guest_count"] = (
-            group["rate_weighted_sum"] / group["rate_weight"] if group["rate_weight"] else 0.0
+            group["rate_opportunities"] / group["rate_qualifying_sales"]
+            if rollup["rate_available"]
+            else 0.0
+        )
+        rollup["ticket_time_available"] = bool(
+            rollup["check_count_available"]
+            and group["ticket_time_available"]
+            and group["ticket_weight"] > 0
         )
         rollup["average_ticket_time_seconds"] = (
             group["ticket_weighted_sum"] / group["ticket_weight"]
-            if group["ticket_weight"]
+            if rollup["ticket_time_available"]
             else 0.0
+        )
+        rollup["ticket_time_weight_basis"] = (
+            "Check Count"
+            if rollup["ticket_time_available"]
+            else "Unavailable (Check Count missing or incomplete)"
         )
         rollup["active_days"] = len(group["active_dates"])
         rollup["source_days"] = len(group["active_dates"])
@@ -2154,10 +2365,11 @@ def aggregate_records(
             for item in sorted(group["source_evidence"])
         ]
         for helper in (
-            "rate_weighted_sum",
-            "rate_weight",
+            "rate_qualifying_sales",
+            "rate_opportunities",
             "ticket_weighted_sum",
             "ticket_weight",
+            "has_active_rows",
             "active_dates",
         ):
             rollup.pop(helper, None)
@@ -2220,7 +2432,9 @@ def format_date_range(start: date, end: date) -> str:
     return f"{start:%m/%d/%Y} - {end:%m/%d/%Y}"
 
 
-def duration_fraction(seconds: float) -> float:
+def duration_fraction(seconds: float | None) -> float | None:
+    if seconds is None:
+        return None
     return seconds / 86400 if seconds else 0.0
 
 
@@ -2525,11 +2739,17 @@ def assign_rank(
     *,
     higher_is_better: bool,
     min_guest_count: int,
+    availability_field: str | None = None,
 ) -> None:
     eligible = [
         row
         for row in rows
-        if row.get("guest_count", 0) >= min_guest_count and row.get(value_field) is not None
+        if row.get("guest_count", 0) >= min_guest_count
+        and row.get(value_field) is not None
+        and (
+            availability_field is None
+            or bool(row.get(availability_field, False))
+        )
     ]
     eligible.sort(
         key=lambda row: row[value_field],
@@ -2580,6 +2800,7 @@ def weekly_server_rank_rows(
             "rate_rank",
             higher_is_better=False,
             min_guest_count=min_guest_count,
+            availability_field="rate_available",
         )
         assign_rank(
             group_rows,
@@ -2587,6 +2808,7 @@ def weekly_server_rank_rows(
             "ticket_time_rank",
             higher_is_better=False,
             min_guest_count=min_guest_count,
+            availability_field="ticket_time_available",
         )
         ranked_rows.extend(group_rows)
 
@@ -2612,11 +2834,11 @@ def trend_note(
 
     improved = 0
     declined = 0
+    # Person-level trend labels are limited to the two validated action
+    # measures. Rate of Sale and Ticket Time remain adjacent context only.
     for value, higher_is_better in (
         (check_change, True),
         (wine_change, True),
-        (rate_change, False),
-        (ticket_change_minutes, False),
     ):
         if value is None or abs(value) < 0.000001:
             continue
@@ -2679,8 +2901,6 @@ def average_rank_movement(row: dict[str, Any]) -> float | None:
     movements = [
         row.get("check_average_rank_movement"),
         row.get("wine_pct_rank_movement"),
-        row.get("rate_rank_movement"),
-        row.get("ticket_time_rank_movement"),
     ]
     available = [movement for movement in movements if movement is not None]
     if not available:
@@ -2700,10 +2920,18 @@ def server_week_trend_rows(ranked_rows: list[dict[str, Any]]) -> list[dict[str, 
         for row in rows:
             check_change = metric_delta(row, previous, "check_average")
             wine_change = metric_delta(row, previous, "wine_pct")
-            rate_change = metric_delta(row, previous, "rate_of_sale_by_guest_count")
+            rate_change = (
+                metric_delta(row, previous, "rate_of_sale_by_guest_count")
+                if previous
+                and row.get("rate_available")
+                and previous.get("rate_available")
+                else None
+            )
             ticket_change_minutes = (
                 (row["average_ticket_time_seconds"] - previous["average_ticket_time_seconds"]) / 60
                 if previous
+                and row.get("ticket_time_available")
+                and previous.get("ticket_time_available")
                 else None
             )
             rank_fields = (
@@ -2791,13 +3019,13 @@ def server_star_rows(
 
         metric_components = [
             (
-                "Check average",
+                "Sales / Guest",
                 star_score_component(
                     row.get("check_average_change"),
                     lower_is_better=False,
                     strong_threshold=5.0,
                 ),
-                f"Check avg {format_change(row.get('check_average_change'), 'currency')}",
+                f"Sales / Guest {format_change(row.get('check_average_change'), 'currency')}",
                 "check",
             ),
             (
@@ -2810,47 +3038,10 @@ def server_star_rows(
                 f"Wine {format_change(row.get('wine_pct_change'), 'pct_points')}",
                 "wine",
             ),
-            (
-                "Rate",
-                star_score_component(
-                    row.get("rate_change"),
-                    lower_is_better=True,
-                    strong_threshold=0.25,
-                ),
-                f"Rate {format_change(row.get('rate_change'), 'number')}",
-                "rate",
-            ),
-            (
-                "Ticket time",
-                star_score_component(
-                    row.get("ticket_time_change_minutes"),
-                    lower_is_better=True,
-                    strong_threshold=5.0,
-                ),
-                f"Ticket {format_change(row.get('ticket_time_change_minutes'), 'minutes')}",
-                "ticket",
-            ),
         ]
         avg_rank_move = average_rank_movement(row)
-        rank_score = 0
-        if avg_rank_move is not None:
-            if avg_rank_move >= 5:
-                rank_score = 2
-            elif avg_rank_move >= 2:
-                rank_score = 1
-            elif avg_rank_move <= -5:
-                rank_score = -2
-            elif avg_rank_move <= -2:
-                rank_score = -1
-        score = sum(component[1] for component in metric_components) + rank_score
+        score = sum(component[1] for component in metric_components)
         components = [(label, component_score, sort_key) for _, component_score, label, sort_key in metric_components]
-        components.append(
-            (
-                f"Rank {format_change(avg_rank_move, 'rank')}",
-                rank_score,
-                "rank",
-            )
-        )
         star_rows.append(
             {
                 "category": star_classification(score),
@@ -2919,12 +3110,25 @@ def compact_minutes(value: float | None) -> str:
 
 def star_action(row: dict[str, Any]) -> tuple[str, str, str]:
     if row["category"] == "Falling Star":
-        priority = "High" if row["composite_score"] <= -5 else "Medium"
-        return priority, "Coach", "Review recent shifts and coach the drivers shown in Evidence."
+        priority = "High" if row["composite_score"] <= -4 else "Medium"
+        return (
+            priority,
+            "Coach",
+            "What comparable-shift context explains the Sales / Guest and Wine % "
+            "movement, and what one coaching step is supported?",
+        )
     if row["category"] == "Rising Star":
-        priority = "Recognize" if row["composite_score"] >= 5 else "Share"
-        return priority, "Recognize", "Recognize the improvement and ask what changed so the tactic can be shared."
-    return "Monitor", "Monitor", "Keep watching next week before acting."
+        priority = "Recognize" if row["composite_score"] >= 4 else "Share"
+        return (
+            priority,
+            "Recognize",
+            "What supported practice should be recognized and shared after context review?",
+        )
+    return (
+        "Monitor",
+        "Monitor",
+        "What should be watched in the next qualified week before acting?",
+    )
 
 
 def store_status(row: dict[str, Any]) -> tuple[str, str, str]:
@@ -2932,18 +3136,33 @@ def store_status(row: dict[str, Any]) -> tuple[str, str, str]:
     guests_down = (row.get("guest_count_change") or 0) < 0
     check_down = (row.get("check_average_change") or 0) < 0
     wine_down = (row.get("wine_pct_change") or 0) < 0
-    ticket_slower = (row.get("ticket_time_change_minutes") or 0) > 0
-    negative_count = sum([gross_down, guests_down, check_down, wine_down, ticket_slower])
+    negative_count = sum([gross_down, guests_down, check_down, wine_down])
 
     if gross_down and guests_down:
-        return "High", "Traffic Watch", "Sales and guest count both fell; review traffic, staffing, and event calendar."
+        return (
+            "High",
+            "Traffic Watch",
+            "What changed in reservations, events, operating hours, staffing, or local demand?",
+        )
     if check_down and wine_down:
-        return "Medium", "Upsell Watch", "Guests held better than spend; coach check average and wine attachment."
-    if ticket_slower and negative_count >= 2:
-        return "Medium", "Service Watch", "Ticket time worsened with other declines; review service flow."
+        return (
+            "Medium",
+            "Upsell Watch",
+            "Did guest mix, menu availability, training, or shift mix explain the "
+            "Sales / Guest and Wine % change?",
+        )
     if negative_count >= 2:
-        return "Medium", "Mixed Watch", "Multiple metrics moved the wrong way; review manager notes."
-    return "Monitor", "Stable / Mixed", "No urgent store action; monitor next run."
+        return (
+            "Medium",
+            "Mixed Watch",
+            "Which validated movement changed, what context explains it, and what "
+            "one follow-up should be assigned?",
+        )
+    return (
+        "Monitor",
+        "Stable / Mixed",
+        "What, if anything, needs follow-up before the next weekly review?",
+    )
 
 
 def trend_evidence(row: dict[str, Any]) -> str:
@@ -3092,10 +3311,18 @@ def weekly_metric_trend_rows(
         for row in rows:
             check_change = metric_delta(row, previous, "check_average")
             wine_change = metric_delta(row, previous, "wine_pct")
-            rate_change = metric_delta(row, previous, "rate_of_sale_by_guest_count")
+            rate_change = (
+                metric_delta(row, previous, "rate_of_sale_by_guest_count")
+                if previous
+                and row.get("rate_available")
+                and previous.get("rate_available")
+                else None
+            )
             ticket_change_minutes = (
                 (row["average_ticket_time_seconds"] - previous["average_ticket_time_seconds"]) / 60
                 if previous
+                and row.get("ticket_time_available")
+                and previous.get("ticket_time_available")
                 else None
             )
             trend_rows.append(
@@ -3154,10 +3381,23 @@ def weekly_metric_summary_rows(
         total_gross = sum(row["gross_sales"] for row in rows)
         total_guests = sum(row["guest_count"] for row in rows)
         total_wine = sum(row["wine_sales"] for row in rows)
-        rate_weighted = sum(row["rate_of_sale_by_guest_count"] * row["guest_count"] for row in rows)
-        ticket_weighted = sum(row["average_ticket_time_seconds"] * row["guest_count"] for row in rows)
+        operational_context = aggregate_weekly_rows(rows) or {}
         latest = rows[-1]
         prior = rows[-2] if len(rows) > 1 else None
+        overall_rate_available = bool(
+            operational_context.get("rate_available", False)
+        )
+        overall_ticket_available = bool(
+            operational_context.get("ticket_time_available", False)
+        )
+        latest_rate_available = bool(latest.get("rate_available", False))
+        prior_rate_available = bool(prior and prior.get("rate_available", False))
+        latest_ticket_available = bool(
+            latest.get("ticket_time_available", False)
+        )
+        prior_ticket_available = bool(
+            prior and prior.get("ticket_time_available", False)
+        )
         row = {field: value for field, value in zip(identity_fields, key)}
         row.update(
             {
@@ -3169,8 +3409,22 @@ def weekly_metric_summary_rows(
                 "weighted_check_average": total_gross / total_guests if total_guests else 0.0,
                 "total_wine_sales": total_wine,
                 "overall_wine_pct": total_wine / total_gross if total_gross else 0.0,
-                "weighted_rate": rate_weighted / total_guests if total_guests else 0.0,
-                "weighted_ticket_time_seconds": ticket_weighted / total_guests if total_guests else 0.0,
+                "weighted_rate": (
+                    operational_context.get("rate_of_sale_by_guest_count")
+                    if overall_rate_available
+                    else None
+                ),
+                "weighted_ticket_time_seconds": (
+                    operational_context.get("average_ticket_time_seconds")
+                    if overall_ticket_available
+                    else None
+                ),
+                "rate_available": overall_rate_available,
+                "ticket_time_available": overall_ticket_available,
+                "ticket_time_weight_basis": operational_context.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                ),
                 "first_week_end": rows[0]["week_end"],
                 "latest_week_end": latest["week_end"],
                 "prior_week_end": prior["week_end"] if prior else None,
@@ -3186,16 +3440,34 @@ def weekly_metric_summary_rows(
                 "latest_wine_pct": latest["wine_pct"],
                 "prior_wine_pct": prior["wine_pct"] if prior else None,
                 "wine_pct_change": metric_delta(latest, prior, "wine_pct"),
-                "latest_rate": latest["rate_of_sale_by_guest_count"],
-                "prior_rate": prior["rate_of_sale_by_guest_count"] if prior else None,
-                "rate_change": metric_delta(latest, prior, "rate_of_sale_by_guest_count"),
-                "latest_ticket_time_seconds": latest["average_ticket_time_seconds"],
+                "latest_rate": (
+                    latest["rate_of_sale_by_guest_count"]
+                    if latest_rate_available
+                    else None
+                ),
+                "prior_rate": (
+                    prior["rate_of_sale_by_guest_count"]
+                    if prior_rate_available
+                    else None
+                ),
+                "rate_change": (
+                    metric_delta(latest, prior, "rate_of_sale_by_guest_count")
+                    if latest_rate_available and prior_rate_available
+                    else None
+                ),
+                "latest_ticket_time_seconds": (
+                    latest["average_ticket_time_seconds"]
+                    if latest_ticket_available
+                    else None
+                ),
                 "prior_ticket_time_seconds": (
-                    prior["average_ticket_time_seconds"] if prior else None
+                    prior["average_ticket_time_seconds"]
+                    if prior_ticket_available
+                    else None
                 ),
                 "ticket_time_change_minutes": (
                     (latest["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
-                    if prior
+                    if latest_ticket_available and prior_ticket_available
                     else None
                 ),
             }
@@ -3217,10 +3489,23 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
         total_gross = sum(row["gross_sales"] for row in rows)
         total_guests = sum(row["guest_count"] for row in rows)
         total_wine = sum(row["wine_sales"] for row in rows)
-        rate_weighted = sum(row["rate_of_sale_by_guest_count"] * row["guest_count"] for row in rows)
-        ticket_weighted = sum(row["average_ticket_time_seconds"] * row["guest_count"] for row in rows)
+        operational_context = aggregate_weekly_rows(rows) or {}
         latest = rows[-1]
         prior = rows[-2] if len(rows) > 1 else None
+        overall_rate_available = bool(
+            operational_context.get("rate_available", False)
+        )
+        overall_ticket_available = bool(
+            operational_context.get("ticket_time_available", False)
+        )
+        latest_rate_available = bool(latest.get("rate_available", False))
+        prior_rate_available = bool(prior and prior.get("rate_available", False))
+        latest_ticket_available = bool(
+            latest.get("ticket_time_available", False)
+        )
+        prior_ticket_available = bool(
+            prior and prior.get("ticket_time_available", False)
+        )
         summary.append(
             {
                 "location": location,
@@ -3233,8 +3518,22 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
                 "weighted_check_average": total_gross / total_guests if total_guests else 0.0,
                 "total_wine_sales": total_wine,
                 "overall_wine_pct": total_wine / total_gross if total_gross else 0.0,
-                "weighted_rate": rate_weighted / total_guests if total_guests else 0.0,
-                "weighted_ticket_time_seconds": ticket_weighted / total_guests if total_guests else 0.0,
+                "weighted_rate": (
+                    operational_context.get("rate_of_sale_by_guest_count")
+                    if overall_rate_available
+                    else None
+                ),
+                "weighted_ticket_time_seconds": (
+                    operational_context.get("average_ticket_time_seconds")
+                    if overall_ticket_available
+                    else None
+                ),
+                "rate_available": overall_rate_available,
+                "ticket_time_available": overall_ticket_available,
+                "ticket_time_weight_basis": operational_context.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                ),
                 "first_week_end": rows[0]["week_end"],
                 "latest_week_end": latest["week_end"],
                 "prior_week_end": prior["week_end"] if prior else None,
@@ -3246,20 +3545,34 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
                 "latest_wine_pct": latest["wine_pct"],
                 "prior_wine_pct": prior["wine_pct"] if prior else None,
                 "wine_pct_change": latest["wine_pct"] - prior["wine_pct"] if prior else None,
-                "latest_rate": latest["rate_of_sale_by_guest_count"],
-                "prior_rate": prior["rate_of_sale_by_guest_count"] if prior else None,
-                "rate_change": (
-                    latest["rate_of_sale_by_guest_count"] - prior["rate_of_sale_by_guest_count"]
-                    if prior
+                "latest_rate": (
+                    latest["rate_of_sale_by_guest_count"]
+                    if latest_rate_available
                     else None
                 ),
-                "latest_ticket_time_seconds": latest["average_ticket_time_seconds"],
+                "prior_rate": (
+                    prior["rate_of_sale_by_guest_count"]
+                    if prior_rate_available
+                    else None
+                ),
+                "rate_change": (
+                    latest["rate_of_sale_by_guest_count"] - prior["rate_of_sale_by_guest_count"]
+                    if latest_rate_available and prior_rate_available
+                    else None
+                ),
+                "latest_ticket_time_seconds": (
+                    latest["average_ticket_time_seconds"]
+                    if latest_ticket_available
+                    else None
+                ),
                 "prior_ticket_time_seconds": (
-                    prior["average_ticket_time_seconds"] if prior else None
+                    prior["average_ticket_time_seconds"]
+                    if prior_ticket_available
+                    else None
                 ),
                 "ticket_time_change_minutes": (
                     (latest["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
-                    if prior
+                    if latest_ticket_available and prior_ticket_available
                     else None
                 ),
             }
@@ -4600,14 +4913,14 @@ def _write_master_workbook_base(
         ),
         (
             "Rising/Falling Stars",
-            "Composite score balances check average, wine percent, rate of sale, ticket time, and rank movement.",
+            "Person trend labels use Sales / Guest and Wine % only. Rate of Sale and Ticket Time remain context only.",
         ),
         (
             "Trend Tabs",
             "Server, store, and group trend tabs show week-over-week changes plus latest/prior/total-period summaries.",
         ),
-        ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
-        ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
+        ("Metric Rule", "Sales / Guest and Wine % are recalculated from rolled-up sales, guests, and wine sales."),
+        ("Metric Rule", "Rate of Sale uses opportunities divided by inferred qualifying sales. Ticket Time is Check Count-weighted only when Check Count coverage is complete."),
     ]
     for row_index, (label, value) in enumerate(note_rows, start=3):
         notes.cell(row=row_index, column=1, value=label).font = Font(bold=True)
@@ -4676,57 +4989,116 @@ def directional_variance(current: float, benchmark: float, threshold: dict[str, 
     return -variance if threshold.get("lower_is_better") else variance
 
 
-def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, float] | None:
+def operational_context_rollup(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    selected = list(rows)
+    active_rows = [
+        row
+        for row in selected
+        if (
+            float(row.get("guest_count", 0) or 0) > 0
+            or float(row.get("gross_sales", 0) or 0) > 0
+            or (
+                bool(row.get("check_count_available", False))
+                and float(row.get("check_count", 0) or 0) > 0
+            )
+        )
+    ]
+    check_count_available = bool(active_rows) and all(
+        bool(row.get("check_count_available", False)) for row in active_rows
+    )
+    check_count = sum(
+        float(row.get("check_count", 0) or 0)
+        for row in selected
+        if bool(row.get("check_count_available", False))
+    )
+
+    rate_rows = [
+        row
+        for row in selected
+        if float(row.get("guest_count", 0) or 0) > 0
+    ]
+    rate_available = bool(rate_rows) and all(
+        bool(row.get("rate_available", True))
+        and float(row.get("rate_of_sale_by_guest_count", 0) or 0) > 0
+        for row in rate_rows
+    )
+    rate_opportunities = sum(
+        float(row.get("guest_count", 0) or 0) for row in rate_rows
+    )
+    rate_qualifying_sales = sum(
+        float(row.get("guest_count", 0) or 0)
+        / float(row.get("rate_of_sale_by_guest_count", 0) or 0)
+        for row in rate_rows
+        if bool(row.get("rate_available", True))
+        and float(row.get("rate_of_sale_by_guest_count", 0) or 0) > 0
+    )
+    rate_available = bool(
+        rate_available and rate_opportunities > 0 and rate_qualifying_sales > 0
+    )
+
+    ticket_rows = [
+        row
+        for row in selected
+        if (
+            bool(row.get("check_count_available", False))
+            and float(row.get("check_count", 0) or 0) > 0
+        )
+    ]
+    ticket_time_available = bool(
+        check_count_available
+        and ticket_rows
+        and all(bool(row.get("ticket_time_available", True)) for row in ticket_rows)
+    )
+    ticket_weight = sum(
+        float(row.get("check_count", 0) or 0) for row in ticket_rows
+    )
+    ticket_weighted = sum(
+        float(row.get("average_ticket_time_seconds", 0) or 0)
+        * float(row.get("check_count", 0) or 0)
+        for row in ticket_rows
+        if bool(row.get("ticket_time_available", True))
+    )
+    return {
+        "check_count": check_count,
+        "check_count_available": check_count_available,
+        "sales_per_check": 0.0,
+        "guests_per_check": 0.0,
+        "rate_of_sale_by_guest_count": (
+            rate_opportunities / rate_qualifying_sales if rate_available else 0.0
+        ),
+        "rate_available": rate_available,
+        "average_ticket_time_seconds": (
+            ticket_weighted / ticket_weight
+            if ticket_time_available and ticket_weight
+            else 0.0
+        ),
+        "ticket_time_available": ticket_time_available,
+        "ticket_time_weight_basis": (
+            "Check Count"
+            if ticket_time_available
+            else "Unavailable (Check Count missing or incomplete)"
+        ),
+    }
+
+
+def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
     selected = list(rows)
     if not selected:
         return None
     gross_sales = sum(float(row.get("gross_sales", 0) or 0) for row in selected)
     guest_count = sum(float(row.get("guest_count", 0) or 0) for row in selected)
     wine_sales = sum(float(row.get("wine_sales", 0) or 0) for row in selected)
-    rate_available = all(
-        bool(row.get("rate_available", True))
-        for row in selected
-        if float(row.get("guest_count", 0) or 0) > 0
-    )
-    ticket_time_available = all(
-        bool(row.get("ticket_time_available", True))
-        for row in selected
-        if float(row.get("guest_count", 0) or 0) > 0
-    )
-    rate_weight = sum(
-        float(row.get("guest_count", 0) or 0)
-        for row in selected
-        if bool(row.get("rate_available", True))
-    )
-    ticket_weight = sum(
-        float(row.get("guest_count", 0) or 0)
-        for row in selected
-        if bool(row.get("ticket_time_available", True))
-    )
-    rate_weighted = sum(
-        float(row.get("rate_of_sale_by_guest_count", 0) or 0)
-        * float(row.get("guest_count", 0) or 0)
-        for row in selected
-        if bool(row.get("rate_available", True))
-    )
-    ticket_weighted = sum(
-        float(row.get("average_ticket_time_seconds", 0) or 0)
-        * float(row.get("guest_count", 0) or 0)
-        for row in selected
-        if bool(row.get("ticket_time_available", True))
-    )
+    context = operational_context_rollup(selected)
+    if context["check_count_available"] and context["check_count"]:
+        context["sales_per_check"] = gross_sales / context["check_count"]
+        context["guests_per_check"] = guest_count / context["check_count"]
     return {
         "gross_sales": gross_sales,
         "guest_count": guest_count,
         "check_average": gross_sales / guest_count if guest_count else 0.0,
         "wine_sales": wine_sales,
         "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
-        "rate_of_sale_by_guest_count": rate_weighted / rate_weight if rate_weight else 0.0,
-        "average_ticket_time_seconds": (
-            ticket_weighted / ticket_weight if ticket_weight else 0.0
-        ),
-        "rate_available": rate_available,
-        "ticket_time_available": ticket_time_available,
+        **context,
     }
 
 
@@ -4756,8 +5128,6 @@ def management_rank_block_movement(
     for rank_field in (
         "check_average_rank",
         "wine_pct_rank",
-        "rate_rank",
-        "ticket_time_rank",
     ):
         recent_ranks = [
             rank_lookup[(row["week_end"], row["location"], row["raw_user_name"])].get(rank_field)
@@ -4862,24 +5232,28 @@ def recommended_server_follow_up(row: dict[str, Any]) -> str:
         for field in recurring
     )
     context_prompt = (
-        "Review whether shift mix, section load, guest mix, staffing, or service "
-        "conditions explain the signal; verify the source data before acting."
+        "What changed in shift mix, section load, guest mix, check volume, staffing, "
+        "or service conditions, and do manager observations corroborate the validated "
+        "Sales / Guest and Wine % signal?"
     )
     if action == "Coaching Prompt":
         suffix = f" Recurring drivers: {driver_text}." if driver_text else ""
         return (
-            "Complete the documented context review, then agree on one measurable "
-            f"coaching step if the signal remains actionable.{suffix}"
+            "After reviewing comparable work context, what one measurable coaching "
+            f"step is supported by the Sales / Guest and Wine % evidence?{suffix}"
         )
     if action == "Recognition Prompt":
         suffix = f" Recurring drivers: {driver_text}." if driver_text else ""
         return (
-            "Complete the documented context review, then recognize the result and ask "
-            f"what practice can be shared if the signal remains supported.{suffix}"
+            "After reviewing comparable work context, what supported practice should "
+            f"be recognized and shared?{suffix}"
         )
     if action == "Context Review":
         return context_prompt
-    return "Monitor another complete, qualified week before opening a coaching prompt."
+    return (
+        "What should be watched during the next complete, qualified week before "
+        "opening any coaching or recognition prompt?"
+    )
 
 
 def management_metric_available(row: dict[str, Any], field: str) -> bool:
@@ -4951,60 +5325,25 @@ def weekly_row_from_daily_records(
         if (
             float(row.get("guest_count", 0) or 0) > 0
             or float(row.get("gross_sales", 0) or 0) > 0
+            or (
+                bool(row.get("check_count_available", False))
+                and float(row.get("check_count", 0) or 0) > 0
+            )
         )
     }
-    rate_available = all(
-        bool(row.get("rate_available", True))
-        for row in rows
-        if float(row.get("guest_count", 0) or 0) > 0
-    )
-    ticket_available = all(
-        bool(row.get("ticket_time_available", True))
-        for row in rows
-        if float(row.get("guest_count", 0) or 0) > 0
-    )
-    rate_weight = sum(
-        float(row.get("guest_count", 0) or 0)
-        for row in rows
-        if bool(row.get("rate_available", True))
-    )
-    ticket_weight = sum(
-        float(row.get("guest_count", 0) or 0)
-        for row in rows
-        if bool(row.get("ticket_time_available", True))
-    )
+    context = operational_context_rollup(rows)
+    if context["check_count_available"] and context["check_count"]:
+        context["sales_per_check"] = gross_sales / context["check_count"]
+        context["guests_per_check"] = guest_count / context["check_count"]
     return {
         "gross_sales": gross_sales,
         "guest_count": guest_count,
         "check_average": gross_sales / guest_count if guest_count else 0.0,
         "wine_sales": wine_sales,
         "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
-        "rate_of_sale_by_guest_count": (
-            sum(
-                float(row.get("rate_of_sale_by_guest_count", 0) or 0)
-                * float(row.get("guest_count", 0) or 0)
-                for row in rows
-                if bool(row.get("rate_available", True))
-            )
-            / rate_weight
-            if rate_weight
-            else 0.0
-        ),
-        "average_ticket_time_seconds": (
-            sum(
-                float(row.get("average_ticket_time_seconds", 0) or 0)
-                * float(row.get("guest_count", 0) or 0)
-                for row in rows
-                if bool(row.get("ticket_time_available", True))
-            )
-            / ticket_weight
-            if ticket_weight
-            else 0.0
-        ),
+        **context,
         "active_days": len({value for value in active_dates if value is not None}),
         "source_days": len({value for value in active_dates if value is not None}),
-        "rate_available": rate_available,
-        "ticket_time_available": ticket_available,
         "daily_records": rows,
     }
 
@@ -5222,6 +5561,10 @@ def evaluate_server_week_signal(
                 if (
                     float(item.get("guest_count", 0) or 0) > 0
                     or float(item.get("gross_sales", 0) or 0) > 0
+                    or (
+                        bool(item.get("check_count_available", False))
+                        and float(item.get("check_count", 0) or 0) > 0
+                    )
                 )
                 and as_date(item.get("report_date")) is not None
             }
@@ -5649,6 +5992,28 @@ def management_server_rows(
                 field: targets.get(location, {}).get(field)
                 for field in SERVER_TREND_FIELDS
             },
+            "context_metrics": {
+                "check_count": current.get("check_count", 0.0),
+                "check_count_available": current.get(
+                    "check_count_available", False
+                ),
+                "sales_per_check": current.get("sales_per_check", 0.0),
+                "guests_per_check": current.get("guests_per_check", 0.0),
+                "rate_of_sale_by_guest_count": current.get(
+                    "rate_of_sale_by_guest_count", 0.0
+                ),
+                "rate_available": current.get("rate_available", False),
+                "average_ticket_time_seconds": current.get(
+                    "average_ticket_time_seconds", 0.0
+                ),
+                "ticket_time_available": current.get(
+                    "ticket_time_available", False
+                ),
+                "ticket_time_weight_basis": current.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                ),
+            },
             "positive_drivers": positive_drivers,
             "negative_drivers": negative_drivers,
             "priority": priority,
@@ -5745,21 +6110,48 @@ def management_entity_rows(
         benchmark_sources: dict[str, str] = {}
         for field, _, _ in MANAGEMENT_METRICS:
             target_value = targets.get(entity, {}).get(field)
-            benchmark_values[field] = target_value if target_value is not None else (
-                baseline.get(field) if baseline else None
+            baseline_value = (
+                baseline.get(field)
+                if baseline
+                and (
+                    field not in SERVER_CONTEXT_FIELDS
+                    or management_metric_available(baseline, field)
+                )
+                else None
+            )
+            benchmark_values[field] = (
+                target_value if target_value is not None else baseline_value
             )
             benchmark_sources[field] = (
-                "Target" if target_value is not None else f"{len(baseline_rows)}-week baseline"
+                "Target"
+                if target_value is not None
+                else f"{len(baseline_rows)}-week baseline"
+                if baseline_value is not None
+                else "Reference unavailable"
             )
 
         prior_changes = {
-            field: latest[field] - prior[field] if prior else None
+            field: (
+                latest[field] - prior[field]
+                if prior
+                and management_metric_available(latest, field)
+                and management_metric_available(prior, field)
+                else None
+            )
             for field, _, _ in MANAGEMENT_METRICS
         }
         benchmark_changes = {
-            field: latest[field] - benchmark_values[field]
-            if benchmark_values[field] is not None
-            else None
+            field: (
+                latest[field] - benchmark_values[field]
+                if benchmark_values[field] is not None
+                and management_metric_available(latest, field)
+                and (
+                    field not in SERVER_CONTEXT_FIELDS
+                    or (baseline is not None and management_metric_available(baseline, field))
+                    or targets.get(entity, {}).get(field) is not None
+                )
+                else None
+            )
             for field, _, _ in MANAGEMENT_METRICS
         }
         materiality = config.get("management_materiality", DEFAULT_CONFIG["management_materiality"])
@@ -5767,21 +6159,12 @@ def management_entity_rows(
         guest_pct = safe_pct_delta(latest["guest_count"], benchmark_values["guest_count"])
         check_change = benchmark_changes["check_average"]
         wine_change = benchmark_changes["wine_pct"]
-        rate_change = benchmark_changes["rate_of_sale_by_guest_count"]
-        ticket_change_minutes = (
-            benchmark_changes["average_ticket_time_seconds"] / 60
-            if benchmark_changes["average_ticket_time_seconds"] is not None
-            else None
-        )
         negative_count = sum(
             [
                 sales_pct is not None and sales_pct <= -float(materiality["sales_pct"]),
                 guest_pct is not None and guest_pct <= -float(materiality["guest_pct"]),
                 check_change is not None and check_change <= -float(materiality["check_average"]),
                 wine_change is not None and wine_change <= -float(materiality["wine_pct"]),
-                rate_change is not None and rate_change >= float(materiality["rate"]),
-                ticket_change_minutes is not None
-                and ticket_change_minutes >= float(materiality["ticket_minutes"]),
             ]
         )
         if len(baseline_rows) < minimum_baseline_weeks:
@@ -5794,23 +6177,28 @@ def management_entity_rows(
         elif sales_pct is not None and guest_pct is not None and sales_pct <= -float(materiality["sales_pct"]) and guest_pct <= -float(materiality["guest_pct"]):
             priority = "High"
             status = "Traffic Watch"
-            focus = "Review traffic drivers, staffing, holidays, and the event calendar."
+            focus = (
+                "What changed in reservations, events, operating hours, staffing, "
+                "or local demand?"
+            )
         elif check_change is not None and wine_change is not None and check_change <= -float(materiality["check_average"]) and wine_change <= -float(materiality["wine_pct"]):
             priority = "Medium"
             status = "Upsell Watch"
-            focus = "Coach check-building and wine attachment opportunities."
-        elif ticket_change_minutes is not None and ticket_change_minutes >= float(materiality["ticket_minutes"]) and negative_count >= 2:
-            priority = "Medium"
-            status = "Service Watch"
-            focus = "Review service flow, table pacing, and section load."
+            focus = (
+                "Did guest mix, menu availability, training, or shift mix explain "
+                "the Sales / Guest and Wine % change?"
+            )
         elif negative_count >= 2:
             priority = "Medium"
             status = "Mixed Watch"
-            focus = "Review the material declines and agree on one management response."
+            focus = (
+                "Which validated movement changed, what operating context explains it, "
+                "and what one follow-up should be assigned?"
+            )
         else:
             priority = "Monitor"
             status = "On Track / Mixed"
-            focus = "No material alert; continue monitoring."
+            focus = "What, if anything, needs follow-up before the next weekly review?"
         output.append(
             {
                 "entity": entity,
@@ -7125,8 +7513,8 @@ def require_current_workbook_usability_contract(wb: Workbook) -> None:
         "U — Review Disposition",
         "V — Reviewed By",
         "W — Review Date",
-        "Rate of Sale currently assumes lower is better.",
-        "Ticket Time is guest-weighted",
+        "Rate of Sale is opportunities divided by qualifying sales",
+        "Ticket Time is weighted only by complete Check Count coverage",
     )
     flattened_guide_text = "\n".join(sorted(guide_text))
     missing_phrases = [
@@ -7200,19 +7588,20 @@ def require_current_workbook_usability_contract(wb: Workbook) -> None:
             is_current = target == ws.title
             if (
                 workbook_color_suffix(cell.fill.fgColor)
-                != ("7A1E1E" if is_current else "F2F2F2")
+                != "F2F2F2"
                 or workbook_color_suffix(cell.font.color)
-                != ("FFFFFF" if is_current else "7A1E1E")
+                != "7A1E1E"
                 or cell.font.bold is not True
                 or cell.font.size != 9
-                or cell.font.underline is not None
+                or cell.font.underline
+                != ("single" if is_current else None)
                 or cell.alignment.horizontal != "center"
                 or cell.alignment.vertical != "center"
                 or cell.alignment.shrink_to_fit is not True
                 or cell.border.top.style != "thin"
                 or cell.border.bottom.style != "thin"
-                or cell.border.left.style != "thin"
-                or cell.border.right.style != "thin"
+                or getattr(cell.border.left, "style", None) is not None
+                or getattr(cell.border.right, "style", None) is not None
             ):
                 raise IntegrityError(
                     f"Worksheet {ws.title!r} navigation style does not match the contract."
@@ -7656,6 +8045,77 @@ def enrich_management_signal(signal: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+CONTEXT_ONLY_EVIDENCE_KEYS = frozenset(
+    {
+        *SERVER_CONTEXT_FIELDS,
+        "check_count",
+        "check_count_available",
+        "sales_per_check",
+        "guests_per_check",
+        "rate_available",
+        "ticket_time_available",
+        "ticket_time_weight_basis",
+        "context_only_metrics",
+        "target_values_context_only",
+    }
+)
+
+
+def decision_only_evidence(value: Any) -> Any:
+    """Remove operational context that must not reopen a people-review decision."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): decision_only_evidence(item)
+            for key, item in value.items()
+            if str(key) not in CONTEXT_ONLY_EVIDENCE_KEYS
+        }
+    if isinstance(value, list):
+        return [decision_only_evidence(item) for item in value]
+    return value
+
+
+def review_reset_fingerprint(action: dict[str, Any]) -> str:
+    """Hash only evidence allowed to reset a saved review disposition."""
+
+    raw_metric_evidence = action.get(
+        "Metric Evidence", action.get("_metric_evidence", {})
+    )
+    if isinstance(raw_metric_evidence, str):
+        try:
+            metric_evidence = json.loads(raw_metric_evidence)
+        except json.JSONDecodeError:
+            metric_evidence = {"unparsed_metric_evidence": raw_metric_evidence}
+    elif isinstance(raw_metric_evidence, dict):
+        metric_evidence = raw_metric_evidence
+    else:
+        metric_evidence = {}
+    last_seen = action.get("Last Seen")
+    if isinstance(last_seen, (date, datetime)):
+        last_seen = last_seen.isoformat()
+    payload = {
+        "entity_key": action.get("Entity Key"),
+        "last_seen": last_seen,
+        "action_code": action.get("Action Code")
+        or stable_action_code(action.get("Action")),
+        "reason_code": action.get("Reason Code") or stable_reason_code(action),
+        "evidence_week_ends": action.get("Evidence Week Ends")
+        or action.get("_evidence_week_ends", []),
+        "metric_evidence": decision_only_evidence(metric_evidence),
+        "comparator_type": action.get("Comparator Type"),
+        "peer_cohort_size": action.get("Peer Cohort Size"),
+        "peer_cohort_weeks": action.get("Peer Cohort Weeks"),
+        "threshold_version": action.get("Threshold Version"),
+        "evidence_status": action.get("Evidence Status"),
+        "recurring_drivers": action.get("Recurring Drivers"),
+        "stability_result": action.get("Stability Result"),
+        "methodology_version": action.get(
+            "Methodology Version", MANAGEMENT_METHODOLOGY_VERSION
+        ),
+    }
+    return canonical_json_sha256(payload)
+
+
 def refresh_management_evidence(
     signal: dict[str, Any],
     *,
@@ -7786,8 +8246,13 @@ def build_management_action_signals(
                 "_evidence_week_ends": row.get("evidence_week_ends", []),
                 "_source_evidence": row.get("source_evidence", []),
                 "_metric_evidence": {
+                    "decision_metric_fields": list(SERVER_PERSON_ACTION_FIELDS),
                     "current_sample": {
                         "guest_count": row.get("guest_count"),
+                        "check_count": row.get("check_count"),
+                        "check_count_available": row.get(
+                            "check_count_available", False
+                        ),
                         "active_days": row.get("active_days"),
                     },
                     "recent_changes": row.get("changes"),
@@ -7806,6 +8271,7 @@ def build_management_action_signals(
                     "persistence_reason": row.get("persistence_reason"),
                     "stability_result": row.get("stability_result"),
                     "history_used": row.get("history_used"),
+                    "context_only_metrics": row.get("context_metrics"),
                 },
             }
         )
@@ -7848,9 +8314,26 @@ def build_management_action_signals(
                     "_evidence_week_ends": row.get("evidence_week_ends", []),
                     "_source_evidence": row.get("source_evidence", []),
                     "_metric_evidence": {
-                        "latest": {
+                        "decision_metrics": {
                             field: latest.get(field)
-                            for field, _, _ in MANAGEMENT_METRICS
+                            for field in (
+                                "gross_sales",
+                                "guest_count",
+                                *SERVER_PERSON_ACTION_FIELDS,
+                            )
+                        },
+                        "context_only_metrics": {
+                            field: latest.get(field)
+                            for field in (
+                                "check_count",
+                                "check_count_available",
+                                "sales_per_check",
+                                "guests_per_check",
+                                *SERVER_CONTEXT_FIELDS,
+                                "rate_available",
+                                "ticket_time_available",
+                                "ticket_time_weight_basis",
+                            )
                         },
                         "benchmark_values": row.get("benchmark_values"),
                         "benchmark_sources": row.get("benchmark_sources"),
@@ -7882,7 +8365,10 @@ def build_management_action_signals(
                     "Action": "Data Quality",
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": detail,
-                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
+                    "Recommended Next Step": (
+                        "Which source reports are missing or incomplete, and who will "
+                        "confirm them before any people review?"
+                    ),
                     "Peer Comparison": "Preliminary",
                     "Recent Movement": "Not Evaluated",
                     "Evidence Status": "Incomplete Week",
@@ -7910,7 +8396,10 @@ def build_management_action_signals(
                     "Action": "Data Quality",
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": f"Missing {readiness.missing_text}",
-                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
+                    "Recommended Next Step": (
+                        "Which source reports are missing or incomplete, and who will "
+                        "confirm them before any people review?"
+                    ),
                     "Peer Comparison": "Preliminary",
                     "Recent Movement": "Not Evaluated",
                     "Evidence Status": "Incomplete Week",
@@ -7944,7 +8433,10 @@ def build_management_action_signals(
                     "Action": "Data Quality",
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": f"{row['source_days']} of {OPERATING_WEEK_DAYS} source days",
-                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
+                    "Recommended Next Step": (
+                        "Which source reports are missing or incomplete, and who will "
+                        "confirm them before any people review?"
+                    ),
                     "Peer Comparison": "Preliminary",
                     "Recent Movement": "Not Evaluated",
                     "Evidence Status": "Incomplete Week",
@@ -7971,7 +8463,11 @@ def merge_management_actions(
         enriched_prior = dict(row)
         evidence = evidence_by_action_id.get(str(row.get("Action ID")), {})
         enriched_prior.update(
-            {field: evidence.get(field) for field in ACTION_EVIDENCE_FIELDS}
+            {
+                field: evidence[field]
+                for field in ACTION_EVIDENCE_FIELDS
+                if field in evidence
+            }
         )
         prior_rows.append(enriched_prior)
     prior_active = {
@@ -7984,7 +8480,11 @@ def merge_management_actions(
         enriched_history = dict(row)
         evidence = evidence_by_action_id.get(str(row.get("Action ID")), {})
         enriched_history.update(
-            {field: evidence.get(field) for field in ACTION_EVIDENCE_FIELDS}
+            {
+                field: evidence[field]
+                for field in ACTION_EVIDENCE_FIELDS
+                if field in evidence
+            }
         )
         history.append(enriched_history)
     current: list[dict[str, Any]] = []
@@ -8011,6 +8511,8 @@ def merge_management_actions(
             same_evidence = (
                 str(prior.get("Evidence ID") or "")
                 == str(signal.get("Evidence ID") or "")
+                or review_reset_fingerprint(prior)
+                == review_reset_fingerprint(signal)
             )
             if not same_evidence:
                 status = "Review Needed"
@@ -8244,14 +8746,15 @@ def management_navigation_columns(ws) -> tuple[int, ...]:
 
 def add_management_navigation(ws) -> None:
     neutral_fill = PatternFill("solid", fgColor="F2F2F2")
-    active_fill = PatternFill("solid", fgColor="7A1E1E")
     navigation_border = Border(
-        left=Side(style="thin", color="B7B7B7"),
-        right=Side(style="thin", color="B7B7B7"),
         top=Side(style="thin", color="B7B7B7"),
         bottom=Side(style="thin", color="B7B7B7"),
     )
     navigation_columns = management_navigation_columns(ws)
+    for column in navigation_columns:
+        dimension = ws.column_dimensions[get_column_letter(column)]
+        if dimension.width is None or dimension.width < 10:
+            dimension.width = 10
     content_end_column = max(ws.max_column, navigation_columns[-1])
     for col, (label, target) in zip(
         navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
@@ -8259,11 +8762,11 @@ def add_management_navigation(ws) -> None:
         cell = ws.cell(row=2, column=col, value=label)
         cell.hyperlink = f"#'{target}'!A1"
         is_current = target == ws.title
-        cell.fill = active_fill if is_current else neutral_fill
+        cell.fill = neutral_fill
         cell.font = Font(
-            color="FFFFFF" if is_current else "7A1E1E",
+            color="7A1E1E",
             bold=True,
-            underline=None,
+            underline="single" if is_current else None,
             size=9,
         )
         cell.alignment = Alignment(
@@ -8280,11 +8783,32 @@ def add_management_navigation(ws) -> None:
             continue
         cell = ws.cell(row=2, column=col)
         cell.fill = neutral_fill
-        cell.border = Border(
-            top=Side(style="thin", color="B7B7B7"),
-            bottom=Side(style="thin", color="B7B7B7"),
-        )
+        cell.border = navigation_border
     ws.row_dimensions[2].height = 24
+
+
+def configure_management_print_layout(ws) -> None:
+    """Use a readable, sheet-specific printable width."""
+
+    last_column = max(ws.max_column, len(MANAGEMENT_NAVIGATION_LINKS))
+    last_row = max(ws.max_row, 2)
+    if not ws.print_area:
+        ws.print_area = (
+            f"A1:{get_column_letter(last_column)}{last_row}"
+        )
+    if not ws.print_title_rows:
+        ws.print_title_rows = "1:2"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = MANAGEMENT_PRINT_WIDTHS.get(ws.title, 1)
+    if ws.title == "Data Quality":
+        # The compact quality summary retains wide source-provenance columns
+        # below its print area. Tabloid landscape keeps the complete navigation
+        # and summary legible without splitting them across horizontal pages.
+        ws.page_setup.paperSize = ws.PAPERSIZE_TABLOID
+    if ws.page_setup.fitToHeight is None:
+        ws.page_setup.fitToHeight = 0
+    ws.print_options.horizontalCentered = True
 
 
 def style_management_title(ws, title: str, end_col: int) -> None:
@@ -8294,12 +8818,12 @@ def style_management_title(ws, title: str, end_col: int) -> None:
     cell = ws.cell(
         row=1,
         column=1,
-        value=f"{title} — {MANAGEMENT_SIGNAL_DISCLAIMER}",
+        value=title,
     )
     cell.fill = PatternFill("solid", fgColor="7A1E1E")
     cell.font = Font(color="FFFFFF", bold=True, size=16)
-    cell.alignment = Alignment(vertical="center", wrap_text=True)
-    ws.row_dimensions[1].height = 42
+    cell.alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 32
 
 
 def write_guide_text_row(
@@ -8335,7 +8859,6 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
     remove_sheet_if_present(wb, "How to Use")
     ws = wb.create_sheet("How to Use")
     style_management_title(ws, "How to Use This Workbook", 12)
-    ws.row_dimensions[1].height = 54
     for column in range(1, 13):
         ws.column_dimensions[get_column_letter(column)].width = 13
     ws.freeze_panes = "A3"
@@ -8383,15 +8906,17 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             "reconciled, and free of unresolved source or identity problems."
         ),
         (
-            "3. Read Dashboard for aggregate context only. Do not make a person-level "
-            "decision from a dashboard card."
+            "3. Use Dashboard and Store & Group Scorecards for the operations layer: "
+            "sales, guests, checks, Sales / Guest, Sales / Check, Guests / Check, Rate "
+            "of Sale, and Ticket Time. Do not make a person-level decision from a card."
         ),
         (
             "4. Use Action Focus to triage current items, then click Open in Action Board."
         ),
         (
-            "5. Review Evidence Detail, Server Scorecard, Recent Movement Signals, and "
-            "store context before choosing a disposition."
+            "5. For the people-review layer, use only Sales / Guest and Wine % as "
+            "action inputs. Review Check Count, Rate of Sale, Ticket Time, Evidence "
+            "Detail, and store context before choosing a disposition."
         ),
         (
             "6. Complete the blue Action Board fields. Track follow-up; completed or "
@@ -8626,9 +9151,11 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
     write_guide_section_header(ws, 58, HOW_TO_USE_SECTION_HEADINGS[7])
     limit_rows = (
         (
-            "Rate of Sale currently assumes lower is better. Ticket Time is guest-weighted "
-            "because ticket/check count is unavailable. These are action-driving business "
-            "assumptions pending source-owner confirmation."
+            "Rate of Sale is opportunities divided by qualifying sales, so lower is "
+            "better; multi-row totals use opportunities divided by inferred qualifying "
+            "sales. Ticket Time is weighted only by complete Check Count coverage. "
+            "Legacy weeks without Check Count show Ticket Time as unavailable. Both "
+            "metrics are context only and cannot create person-level prompts."
         ),
         (
             "The source does not observe assignment and equal-opportunity context. Correct "
@@ -8652,7 +9179,7 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             ws,
             row,
             text,
-            height=42 if row in {59, 60} else 36,
+            height=72 if row == 59 else 42 if row == 60 else 36,
             fill_color="FFF2CC" if row == 59 else "FFFFFF",
         )
 
@@ -8935,6 +9462,7 @@ def write_action_tracking_sheet(
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "G5"
     ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = "1:4"
     if rows:
         first, last = header_row + 1, header_row + len(rows)
         red_fill = PatternFill("solid", fgColor="F4CCCC")
@@ -9031,7 +9559,7 @@ def write_action_focus_sheet(
         "Action",
         "Evidence Status",
         "Review Disposition",
-        "Recommended Next Step",
+        "Manager Question",
         "Why It Matters",
         "Weeks Open",
         "Open Action",
@@ -9042,13 +9570,17 @@ def write_action_focus_sheet(
         row=3,
         column=1,
         value=(
-            "Rule-based observational coaching signal—not a statistical, causal, or "
-            "employment decision. Verify comparable work context and source accuracy."
+            "Start with the highest-priority row. Use the Manager Question to review "
+            "context, then open Action Board to document the owner, due date, and "
+            "review disposition."
         ),
     )
     ws.cell(row=3, column=1).fill = PatternFill("solid", fgColor="FFF2CC")
     ws.cell(row=3, column=1).font = Font(bold=True)
-    ws.cell(row=3, column=1).alignment = Alignment(wrap_text=True)
+    ws.cell(row=3, column=1).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[3].height = 48
     actionable = [
         row
         for row in current_actions
@@ -9128,6 +9660,7 @@ def write_action_focus_sheet(
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "E6"
     ws.sheet_view.zoomScale = 85
+    ws.print_title_rows = "1:5"
 
 
 def action_with_evidence_fallback(action: dict[str, Any]) -> dict[str, Any]:
@@ -9158,6 +9691,8 @@ def write_evidence_detail_sheet(
         row=3,
         column=1,
         value=(
+            "Person-level actions use Sales / Guest and Wine % only; Check Count, "
+            "Rate of Sale, and Ticket Time are context only. "
             "Operator view: exact raw Evidence Sources and Metric Evidence columns are "
             "hidden. Their protected values remain unchanged for carry-forward, approved "
             "evidence export, and audit."
@@ -9168,7 +9703,7 @@ def write_evidence_detail_sheet(
     ws.cell(row=3, column=1).alignment = Alignment(
         wrap_text=True, vertical="center"
     )
-    ws.row_dimensions[3].height = 36
+    ws.row_dimensions[3].height = 54
     evidence_by_action: dict[str, dict[str, Any]] = {}
     for action in [*action_history, *current_actions]:
         action_id = str(action.get("Action ID") or "")
@@ -9290,6 +9825,19 @@ def write_evidence_detail_sheet(
         ].width = width
     ws.freeze_panes = "E5"
     ws.sheet_view.zoomScale = 70
+    ws.print_title_rows = "1:4"
+
+
+def operational_sample_text(row: dict[str, Any]) -> str:
+    check_text = (
+        f"{float(row.get('check_count', 0) or 0):,.0f} checks"
+        if row.get("check_count_available")
+        else "checks unavailable"
+    )
+    return (
+        f"{float(row.get('guest_count', 0) or 0):,.0f} guests / "
+        f"{check_text} / {int(row.get('active_days', 0) or 0)} days"
+    )
 
 
 def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
@@ -9306,7 +9854,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
         "History Used",
         "Positive Drivers",
         "Watch Drivers",
-        "Recommended Next Step",
+        "Manager Question",
     ]
     data = []
     for row in rows:
@@ -9315,7 +9863,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
                 row["action"],
                 row["location"],
                 excel_safe_text(row["display_name"]),
-                f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
+                operational_sample_text(row),
                 row["confidence"],
                 row["performance_level"],
                 row["momentum"],
@@ -9336,6 +9884,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
     style_management_title(ws, "Server Scorecard", len(headers))
     ws.freeze_panes = "D4"
     ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = "1:3"
     ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
         for col in (1, 5, 6, 7, 8):
@@ -9344,7 +9893,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
                 ws.cell(row=row, column=col).fill = fill
         for col in (4, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 48
+        ws.row_dimensions[row].height = 66
 
 
 def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
@@ -9369,7 +9918,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
         "History Used",
         "Positive Drivers",
         "Watch Drivers",
-        "Recommended Next Step",
+        "Manager Question",
     ]
     data = [
         [
@@ -9377,7 +9926,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
             row["action"],
             row["location"],
             excel_safe_text(row["display_name"]),
-            f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
+            operational_sample_text(row),
             row["performance_level"],
             row["momentum"],
             row["long_term_direction"],
@@ -9402,6 +9951,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
     style_management_title(ws, "Recent Movement Signals", len(headers))
     ws.freeze_panes = "E4"
     ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = "1:3"
     ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
         for col in (1, 2, 6, 7, 8):
@@ -9410,7 +9960,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
                 ws.cell(row=row, column=col).fill = fill
         for col in (5, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 48
+        ws.row_dimensions[row].height = 66
 
 
 def format_management_value(field: str, value: float | None) -> tuple[Any, str]:
@@ -9418,19 +9968,29 @@ def format_management_value(field: str, value: float | None) -> tuple[Any, str]:
         return None, "General"
     if field == "gross_sales":
         return value, "$#,##0"
-    if field == "guest_count":
+    if field in {"guest_count", "check_count"}:
         return value, "#,##0"
-    if field == "check_average":
+    if field in {"check_average", "sales_per_check"}:
         return value, "$0.00"
+    if field == "guests_per_check":
+        return value, "0.00"
     if field == "wine_pct":
         return value, "0.0%"
     if field == "rate_of_sale_by_guest_count":
         return value, "0.000"
-    return duration_fraction(value), "[h]:mm"
+    if field == "average_ticket_time_seconds":
+        return duration_fraction(value), "[h]:mm"
+    return value, "0.00"
 
 
 def management_metric_status(field: str, item: dict[str, Any], config: dict[str, Any] | None = None) -> str:
     config = config or DEFAULT_CONFIG
+    if field in SERVER_CONTEXT_FIELDS:
+        return (
+            "Context Only"
+            if management_metric_available(item["latest"], field)
+            else "Unavailable"
+        )
     current = item["latest"][field]
     benchmark = item["benchmark_values"].get(field)
     if benchmark is None:
@@ -9459,6 +10019,9 @@ def write_store_group_scorecards_sheet(
     style_management_title(ws, "Store & Group Scorecards", 7)
     ws.freeze_panes = "A4"
     current_row = 4
+    scorecard_start_rows: list[int] = []
+    print_section_start_rows: list[int] = []
+    guest_chart_row: int | None = None
     display_items: list[tuple[str, dict[str, Any] | None, str]] = []
     if readiness is None:
         display_items = [(item["entity"], item, "current") for item in rows]
@@ -9481,6 +10044,8 @@ def write_store_group_scorecards_sheet(
                 display_items.append((location, item, state))
 
     for entity, item, readiness_state in display_items:
+        scorecard_start_rows.append(current_row)
+        print_section_start_rows.append(current_row)
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
         if readiness_state == "missing":
             title_text = f"{entity} | Missing | No current-week data; comparisons are paused."
@@ -9495,13 +10060,19 @@ def write_store_group_scorecards_sheet(
         title = ws.cell(row=current_row, column=1, value=title_text)
         title.fill = priority_fill(title_priority) or PatternFill("solid", fgColor="E7E6E6")
         title.font = Font(bold=True)
-        title.alignment = Alignment(wrap_text=True)
+        title.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[current_row].height = 54
         for col, header in enumerate(["Metric", "Current", "vs Prior", "vs Benchmark", "Benchmark", "Source", "Status"], start=1):
             cell = ws.cell(row=current_row + 1, column=col, value=header)
             cell.fill = PatternFill("solid", fgColor="D9E1F2")
             cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center")
-        for offset, (field, label, _) in enumerate(MANAGEMENT_METRICS, start=2):
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True
+            )
+        ws.row_dimensions[current_row + 1].height = 30
+        for offset, (field, label, _) in enumerate(
+            STORE_GROUP_DISPLAY_METRICS, start=2
+        ):
             row = current_row + offset
             ws.cell(row=row, column=1, value=label)
             if readiness_state == "missing":
@@ -9512,15 +10083,53 @@ def write_store_group_scorecards_sheet(
                     ws.cell(row=row, column=7).fill = fill
                 continue
 
-            current_value, number_format = format_management_value(field, item["latest"][field])
-            prior_change = item["prior_changes"][field]
-            benchmark_change = item["benchmark_changes"][field]
-            benchmark_value, benchmark_format = format_management_value(field, item["benchmark_values"][field])
+            is_workload_context = field in {
+                "check_count",
+                "sales_per_check",
+                "guests_per_check",
+            }
+            context_available = (
+                bool(item["latest"].get("check_count_available", False))
+                if is_workload_context
+                else management_metric_available(item["latest"], field)
+            )
+            current_raw = item["latest"].get(field) if context_available else None
+            current_value, number_format = format_management_value(
+                field, current_raw
+            )
+            if is_workload_context:
+                prior_context_available = bool(
+                    item.get("prior")
+                    and item["prior"].get("check_count_available", False)
+                )
+                prior_change = (
+                    float(item["latest"].get(field, 0) or 0)
+                    - float(item["prior"].get(field, 0) or 0)
+                    if context_available and prior_context_available
+                    else None
+                )
+                benchmark_change = None
+                benchmark_value, benchmark_format = None, "General"
+            else:
+                prior_change = item["prior_changes"][field]
+                benchmark_change = item["benchmark_changes"][field]
+                benchmark_value, benchmark_format = format_management_value(
+                    field, item["benchmark_values"][field]
+                )
             ws.cell(row=row, column=2, value=current_value).number_format = number_format
             if readiness_state == "preliminary":
                 ws.cell(row=row, column=5, value=benchmark_value).number_format = benchmark_format
-                ws.cell(row=row, column=6, value=f"Preliminary; {item['benchmark_sources'][field]}")
+                source = (
+                    "Preliminary workload context"
+                    if is_workload_context
+                    else f"Preliminary; {item['benchmark_sources'][field]}"
+                )
+                ws.cell(row=row, column=6, value=source)
                 status = "Preliminary"
+            elif is_workload_context:
+                ws.cell(row=row, column=3, value=prior_change).number_format = number_format
+                ws.cell(row=row, column=6, value="Current workload context")
+                status = "Context Only" if context_available else "Unavailable"
             elif field in {"gross_sales", "guest_count"}:
                 prior_value = safe_pct_delta(item["latest"][field], item["prior"][field] if item["prior"] else None)
                 benchmark_delta = safe_pct_delta(item["latest"][field], item["benchmark_values"][field])
@@ -9532,24 +10141,86 @@ def write_store_group_scorecards_sheet(
             else:
                 ws.cell(row=row, column=3, value=prior_change).number_format = number_format
                 ws.cell(row=row, column=4, value=benchmark_change).number_format = number_format
-            if readiness_state == "current":
+            if readiness_state == "current" and not is_workload_context:
                 ws.cell(row=row, column=5, value=benchmark_value).number_format = benchmark_format
                 ws.cell(row=row, column=6, value=item["benchmark_sources"][field])
                 status = management_metric_status(field, item, config)
             ws.cell(row=row, column=7, value=status)
             fill = priority_fill(
                 "Review" if status == "Preliminary" else
+                "Review" if status == "Unavailable" else
                 "Medium" if status == "Watch" else
                 "Recognize" if status == "Above" else "Monitor"
             )
             if fill:
                 ws.cell(row=row, column=7).fill = fill
-        current_row += 10
+            for col in range(1, 8):
+                ws.cell(row=row, column=col).alignment = Alignment(
+                    wrap_text=col in {1, 6, 7},
+                    vertical="center",
+                )
+            ws.row_dimensions[row].height = 30
+        current_row += len(STORE_GROUP_DISPLAY_METRICS) + 4
+        if entity == "All Stores" and weekly_group_rows:
+            guest_chart_row = current_row
+            print_section_start_rows.append(current_row)
+            ws.merge_cells(
+                start_row=current_row,
+                start_column=1,
+                end_row=current_row,
+                end_column=7,
+            )
+            ws.cell(
+                row=current_row,
+                column=1,
+                value="All Stores | Complete-Week Guest Trend",
+            )
+            ws.cell(row=current_row, column=1).fill = PatternFill(
+                "solid", fgColor="D9EAF7"
+            )
+            ws.cell(row=current_row, column=1).font = Font(bold=True)
+            ws.cell(row=current_row, column=1).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
+            ws.row_dimensions[current_row].height = 54
+            ws.merge_cells(
+                start_row=current_row + 1,
+                start_column=1,
+                end_row=current_row + 6,
+                end_column=7,
+            )
+            ws.cell(
+                row=current_row + 1,
+                column=1,
+                value=(
+                    "Group-level operational context only. Use this trend to ask "
+                    "what changed in demand, events, hours, or capacity; do not "
+                    "attribute the movement to an individual."
+                ),
+            )
+            ws.cell(row=current_row + 1, column=1).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
+            for row_index in range(current_row + 1, current_row + 13):
+                ws.row_dimensions[row_index].height = 25
+            current_row += len(STORE_GROUP_DISPLAY_METRICS) + 4
     for column, width in {"A": 24, "B": 16, "C": 16, "D": 18, "E": 16, "F": 20, "G": 14}.items():
         ws.column_dimensions[column].width = width
     ws.column_dimensions["H"].width = 3
     ws.sheet_view.zoomScale = 80
-    add_management_scorecard_charts(wb, ws, weekly_location_rows, weekly_group_rows)
+    for section_start in print_section_start_rows[1:]:
+        ws.row_breaks.append(Break(id=section_start - 1))
+    sales_chart_row = scorecard_start_rows[0] if scorecard_start_rows else 4
+    if guest_chart_row is None:
+        guest_chart_row = sales_chart_row + len(STORE_GROUP_DISPLAY_METRICS) + 4
+    add_management_scorecard_charts(
+        wb,
+        ws,
+        weekly_location_rows,
+        weekly_group_rows,
+        sales_anchor=f"I{sales_chart_row}",
+        guest_anchor=f"I{guest_chart_row}",
+    )
 
 
 def latest_location_completeness(
@@ -9584,7 +10255,7 @@ def write_management_data_quality_sheet(
 ) -> None:
     remove_sheet_if_present(wb, "Data Quality")
     ws = wb.create_sheet("Data Quality")
-    style_management_title(ws, "Data Quality", 6)
+    style_management_title(ws, "Data Quality", 8)
     if readiness is None:
         latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
         latest_rows, configured_locations, _location_gaps, latest_complete = latest_location_completeness(
@@ -9596,7 +10267,7 @@ def write_management_data_quality_sheet(
         configured_locations = list(readiness.configured_locations)
         latest_complete = readiness.ready
     latest_by_location = {row["location"]: row for row in latest_rows}
-    ws.merge_cells("A3:F3")
+    ws.merge_cells("A3:L3")
     ws["A3"] = (
         f"Latest week ending {latest_week_end:%m/%d/%Y} is complete and suitable for management trends."
         if latest_complete and latest_week_end
@@ -9613,8 +10284,20 @@ def write_management_data_quality_sheet(
     ws["A3"].fill = PatternFill("solid", fgColor="D9EAD3" if latest_complete else "F4CCCC")
     ws["A3"].font = Font(bold=True)
     ws["A3"].alignment = Alignment(wrap_text=True)
-    ws.row_dimensions[3].height = 36
-    for col, header in enumerate(["Latest Week", "Location", "Active Days", "Source Days", "Status", "Management Use"], start=1):
+    ws.row_dimensions[3].height = 48
+    for col, header in enumerate(
+        [
+            "Latest Week",
+            "Location",
+            "Active Days",
+            "Source Days",
+            "Check Count",
+            "Ticket Time Basis",
+            "Status",
+            "Management Use",
+        ],
+        start=1,
+    ):
         cell = ws.cell(row=5, column=col, value=header)
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
@@ -9630,15 +10313,53 @@ def write_management_data_quality_sheet(
             location,
             row.get("active_days", 0) if row else 0,
             row.get("source_days", 0) if row else 0,
+            (
+                row.get("check_count", 0)
+                if row and row.get("check_count_available")
+                else "Unavailable"
+            ),
+            (
+                row.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                )
+                if row
+                else "Unavailable"
+            ),
             status,
-            "Use" if status == "Complete" else "Preliminary only",
+            (
+                "People review eligible; operational context complete"
+                if status == "Complete"
+                and row
+                and row.get("check_count_available")
+                and row.get("ticket_time_available")
+                and row.get("rate_available")
+                else "People review eligible; Rate of Sale unavailable"
+                if status == "Complete"
+                and row
+                and row.get("check_count_available")
+                and row.get("ticket_time_available")
+                else "People review eligible; Ticket Time unavailable"
+                if status == "Complete"
+                and row
+                and row.get("check_count_available")
+                else "People review eligible; check-based context unavailable"
+                if status == "Complete"
+                else "Preliminary only"
+            ),
         ]
         for col, value in enumerate(values, start=1):
             ws.cell(row=row_index, column=col, value=value)
+            ws.cell(row=row_index, column=col).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
         ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
+        if row and row.get("check_count_available"):
+            ws.cell(row=row_index, column=5).number_format = "#,##0"
         fill = priority_fill("Recognize" if status == "Complete" else "High")
         if fill:
-            ws.cell(row=row_index, column=5).fill = fill
+            ws.cell(row=row_index, column=7).fill = fill
+        ws.row_dimensions[row_index].height = 72
 
     ws["A10"] = "Historical Exceptions"
     ws["A10"].font = Font(bold=True)
@@ -9698,6 +10419,28 @@ def write_management_data_quality_sheet(
             )
 
     source_start = warning_start + max(4, len(warnings) + 3)
+    print_note_row = source_start - 1
+    ws.merge_cells(
+        start_row=print_note_row,
+        start_column=1,
+        end_row=print_note_row,
+        end_column=12,
+    )
+    ws.cell(
+        row=print_note_row,
+        column=1,
+        value=(
+            "Compact print view ends here. Source-by-source parsing and provenance "
+            "remain available below in the protected workbook."
+        ),
+    )
+    ws.cell(row=print_note_row, column=1).fill = PatternFill(
+        "solid", fgColor="D9EAF7"
+    )
+    ws.cell(row=print_note_row, column=1).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[print_note_row].height = 30
     ws.merge_cells(
         start_row=source_start,
         start_column=1,
@@ -9745,10 +10488,19 @@ def write_management_data_quality_sheet(
             {
                 metric
                 for record in source_records
-                if record.guest_count > 0
+                if (
+                    record.guest_count > 0
+                    or record.gross_sales > 0
+                    or (record.check_count_available and record.check_count > 0)
+                )
                 for metric, available in (
                     ("Rate of Sale", record.rate_available),
-                    ("Ticket Time", record.ticket_time_available),
+                    ("Check Count", record.check_count_available),
+                    (
+                        "Ticket Time",
+                        record.ticket_time_available
+                        and record.check_count_available,
+                    ),
                 )
                 if not available
             }
@@ -9778,24 +10530,30 @@ def write_management_data_quality_sheet(
         ]
         for col, value in enumerate(values, start=1):
             ws.cell(row=row_index, column=col, value=value)
+            ws.cell(row=row_index, column=col).alignment = Alignment(
+                wrap_text=col in {1, 3, 5, 7, 8},
+                vertical="center",
+            )
         ws.cell(row=row_index, column=2).number_format = "m/d/yyyy"
         if status != "Verified":
             ws.cell(row=row_index, column=8).fill = PatternFill(
                 "solid", fgColor="FFF2CC"
             )
+        ws.row_dimensions[row_index].height = 42
 
     for column, width in {
         "A": 44,
         "B": 16,
         "C": 34,
         "D": 13,
-        "E": 16,
+        "E": 18,
         "F": 69,
-        "G": 30,
-        "H": 14,
+        "G": 22,
+        "H": 42,
     }.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
+    ws.print_area = f"A1:L{print_note_row}"
 
 
 def write_management_chart_data(
@@ -9836,6 +10594,9 @@ def add_management_scorecard_charts(
     ws,
     weekly_location_rows: list[dict[str, Any]],
     weekly_group_rows: list[dict[str, Any]],
+    *,
+    sales_anchor: str = "I4",
+    guest_anchor: str = "I20",
 ) -> None:
     location_points, group_points = write_management_chart_data(
         wb, weekly_location_rows, weekly_group_rows
@@ -9869,8 +10630,10 @@ def add_management_scorecard_charts(
             series.tx = SeriesLabel(v=location.replace("RC ", ""))
             series.graphicalProperties.line.solidFill = color
             series.graphicalProperties.line.width = 28575
-        chart.legend.position = "r"
-        ws.add_chart(chart, "I4")
+        # Bottom placement keeps both store names inside the chart frame when
+        # the scorecard is exported or printed at one page wide.
+        chart.legend.position = "b"
+        ws.add_chart(chart, sales_anchor)
     if group_points:
         chart = LineChart()
         chart.title = "Complete-Week All-Stores Guest Trend"
@@ -9890,7 +10653,7 @@ def add_management_scorecard_charts(
             chart.series[0].graphicalProperties.line.solidFill = "7A1E1E"
             chart.series[0].graphicalProperties.line.width = 28575
         chart.legend = None
-        ws.add_chart(chart, "I20")
+        ws.add_chart(chart, guest_anchor)
 
 
 def signed_management_delta(field: str, value: float | None) -> str:
@@ -9965,12 +10728,16 @@ def deduplicated_dashboard_actions(
     candidates.sort(
         key=lambda row: (
             priority_order.get(str(row.get("Priority") or ""), 9),
+            1
+            if str(row.get("Entity Key") or "").casefold().startswith("group|")
+            else 0,
             str(row.get("Location") or ""),
             str(row.get("Person / Area") or ""),
         )
     )
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
+    seen_operational_topics: set[str] = set()
     for row in candidates:
         identity = str(row.get("Entity Key") or "").strip().casefold()
         if not identity:
@@ -9980,6 +10747,14 @@ def deduplicated_dashboard_actions(
             )
         if identity in seen:
             continue
+        if not identity.startswith("server|"):
+            topic = "|".join(
+                str(row.get(field) or "").strip().casefold()
+                for field in ("Action", "Signal")
+            )
+            if topic in seen_operational_topics:
+                continue
+            seen_operational_topics.add(topic)
         seen.add(identity)
         selected.append(row)
         if limit is not None and len(selected) >= limit:
@@ -9988,13 +10763,12 @@ def deduplicated_dashboard_actions(
 
 
 def dashboard_management_move(item: dict[str, Any]) -> str:
-    signal = str(item.get("Signal") or "").strip().rstrip(".:")
-    evidence = str(item.get("Why It Matters") or "").split(" | ")[0].strip().rstrip(".")
-    next_step = str(item.get("Recommended Next Step") or "").strip().rstrip(".")
-    context = ". ".join(part for part in (signal, evidence) if part)
+    next_step = (
+        str(item.get("Recommended Next Step") or "").strip().rstrip(".?")
+    )
     if next_step:
-        return f"{context}. Next: {next_step}." if context else f"Next: {next_step}."
-    return f"{context}." if context else "Review and assign the next management step."
+        return f"{next_step}?"
+    return "What evidence and operating context need review, and who owns the follow-up?"
 
 
 def write_dashboard_card(
@@ -10012,7 +10786,9 @@ def write_dashboard_card(
     title_cell = ws.cell(row=6, column=start_col, value=title)
     title_cell.fill = PatternFill("solid", fgColor=accent_color)
     title_cell.font = Font(bold=True, color="FFFFFF", size=10)
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    title_cell.alignment = Alignment(
+        horizontal="center", vertical="center", shrink_to_fit=True
+    )
     value_cell = ws.cell(row=7, column=start_col, value=value)
     value_cell.fill = PatternFill("solid", fgColor="F7F7F7")
     value_cell.font = Font(bold=True, color="7A1E1E", size=20)
@@ -10021,6 +10797,9 @@ def write_dashboard_card(
     note_cell.fill = PatternFill("solid", fgColor="F7F7F7")
     note_cell.font = Font(color="595959", size=9)
     note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_index, minimum_height in ((6, 20), (7, 24), (8, 24), (9, 32)):
+        current_height = ws.row_dimensions[row_index].height or 0
+        ws.row_dimensions[row_index].height = max(current_height, minimum_height)
 
 
 def write_management_dashboard_sheet(
@@ -10088,15 +10867,40 @@ def write_management_dashboard_sheet(
         action_rows, {"High", "Medium", "Review"}
     )
     selected_actions = all_action_items[:3]
-    reports_value = f"{len(received_dates)} of {len(expected_dates)}" if expected_dates else "0 of 0"
-    reports_note = (
-        "All Tuesday-Sunday reports received"
-        if latest_complete
-        else f"Missing {missing_text or 'daily reports'}"
-    )
+    sales_delta = None
+    sales_source = "benchmark"
+    if group:
+        sales_delta = safe_pct_delta(
+            group["latest"]["gross_sales"],
+            group["benchmark_values"].get("gross_sales"),
+        )
+        sales_source = str(
+            group.get("benchmark_sources", {}).get("gross_sales") or "benchmark"
+        )
+    if not latest_complete:
+        sales_value, sales_note, sales_color = (
+            "PAUSED",
+            f"Missing {missing_text or 'daily reports'}",
+            "7F7F7F",
+        )
+    elif sales_delta is None:
+        sales_value, sales_note, sales_color = (
+            "NO BASELINE",
+            "Sales benchmark is not available",
+            "7F7F7F",
+        )
+    else:
+        sales_value = f"{sales_delta:+.1%}"
+        sales_note = f"Gross sales vs {sales_source.lower()}"
+        sales_color = (
+            "548235"
+            if sales_delta >= 0
+            else "C00000"
+            if sales_delta <= -0.05
+            else "BF9000"
+        )
     write_dashboard_card(
-        ws, 1, "Reports Received", reports_value, reports_note,
-        "548235" if latest_complete else "C00000",
+        ws, 1, "Sales vs Benchmark", sales_value, sales_note, sales_color
     )
 
     traffic_delta = None
@@ -10114,7 +10918,9 @@ def write_management_dashboard_sheet(
         traffic_value = f"{traffic_delta:+.1%}"
         traffic_note = f"Guest traffic vs {traffic_source.lower()}"
         traffic_color = "548235" if traffic_delta >= 0 else "C00000" if traffic_delta <= -0.05 else "BF9000"
-    write_dashboard_card(ws, 5, "Traffic vs Benchmark", traffic_value, traffic_note, traffic_color)
+    write_dashboard_card(
+        ws, 5, "Guests vs Benchmark", traffic_value, traffic_note, traffic_color
+    )
 
     if latest_complete:
         action_value: str | int = len(all_action_items)
@@ -10131,7 +10937,7 @@ def write_management_dashboard_sheet(
     ws["A11"].fill = PatternFill("solid", fgColor="E7E6E6")
     ws["A11"].font = Font(bold=True, color="7A1E1E")
     action_headers = [
-        (1, 2, "Priority"), (3, 5, "Person / Location"), (6, 10, "Management Move"),
+        (1, 2, "Priority"), (3, 5, "Person / Location"), (6, 10, "Manager Question"),
         (11, 11, "Owner"), (12, 12, "Due"),
     ]
     for start_col, end_col, header in action_headers:
@@ -10198,7 +11004,8 @@ def write_management_dashboard_sheet(
     ws["A17"].font = Font(bold=True, color="7A1E1E")
     store_headers = [
         (1, 2, "Location"), (3, 4, "Status"), (5, 5, "Sales"), (6, 6, "Guests"),
-        (7, 7, "Check Avg"), (8, 9, "Service Pace"), (10, 12, "Management Focus"),
+        (7, 7, "Checks"), (8, 8, "Sales / Guest"), (9, 9, "Sales / Check"),
+        (10, 10, "Guests / Check"), (11, 12, "Manager Question"),
     ]
     for start_col, end_col, header in store_headers:
         if end_col > start_col:
@@ -10217,8 +11024,7 @@ def write_management_dashboard_sheet(
         item = current_store_rows.get(location) if location else None
         ws.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=2)
         ws.merge_cells(start_row=row_index, start_column=3, end_row=row_index, end_column=4)
-        ws.merge_cells(start_row=row_index, start_column=8, end_row=row_index, end_column=9)
-        ws.merge_cells(start_row=row_index, start_column=10, end_row=row_index, end_column=12)
+        ws.merge_cells(start_row=row_index, start_column=11, end_row=row_index, end_column=12)
         if item:
             latest = item["latest"]
             status = item["status"] if latest_complete else "Preliminary"
@@ -10229,24 +11035,50 @@ def write_management_dashboard_sheet(
             ws.cell(row=row_index, column=3, value=status)
             ws.cell(row=row_index, column=5, value=latest["gross_sales"]).number_format = "$#,##0"
             ws.cell(row=row_index, column=6, value=latest["guest_count"]).number_format = "#,##0"
-            ws.cell(row=row_index, column=7, value=latest["check_average"]).number_format = "$0.00"
-            ws.cell(row=row_index, column=8, value=latest["average_ticket_time_seconds"] / 60).number_format = '0.0 "min"'
-            ws.cell(row=row_index, column=10, value=focus)
+            if latest.get("check_count_available"):
+                ws.cell(
+                    row=row_index, column=7, value=latest.get("check_count", 0)
+                ).number_format = "#,##0"
+                ws.cell(
+                    row=row_index, column=9, value=latest.get("sales_per_check", 0)
+                ).number_format = "$0.00"
+                ws.cell(
+                    row=row_index,
+                    column=10,
+                    value=latest.get("guests_per_check", 0),
+                ).number_format = "0.00"
+            else:
+                for col in (7, 9, 10):
+                    ws.cell(row=row_index, column=col, value="n/a")
+            ws.cell(
+                row=row_index, column=8, value=latest["check_average"]
+            ).number_format = "$0.00"
+            ws.cell(row=row_index, column=11, value=focus)
             fill = priority_fill(item["priority"] if latest_complete else "Review")
             if fill:
                 ws.cell(row=row_index, column=3).fill = fill
         else:
             ws.cell(row=row_index, column=1, value=location or "No store data")
             ws.cell(row=row_index, column=3, value="Missing")
-            ws.cell(row=row_index, column=10, value="No current-week data; comparisons are paused.")
+            ws.cell(
+                row=row_index,
+                column=11,
+                value="What source data is missing, and who will confirm it?",
+            )
             fill = priority_fill("Review")
             if fill:
                 ws.cell(row=row_index, column=3).fill = fill
-        for col in (1, 3, 5, 6, 7, 8, 10):
+        for col in (1, 3, 5, 6, 7, 8, 9, 10, 11):
             ws.cell(row=row_index, column=col).alignment = Alignment(
-                wrap_text=True, vertical="center"
+                wrap_text=True,
+                vertical="center",
+                horizontal="center" if col in {5, 6, 7, 8, 9, 10} else None,
             )
-        ws.row_dimensions[row_index].height = 36
+        for col in range(5, 11):
+            ws.cell(row=row_index, column=col).border = Border(
+                right=Side(style="thin", color="D9E1F2")
+            )
+        ws.row_dimensions[row_index].height = 54
 
     ws.merge_cells("A22:L22")
     ws["A22"] = "RECOGNITION REVIEW"
@@ -10279,9 +11111,14 @@ def write_management_dashboard_sheet(
     ws.row_dimensions[23].height = 34
 
     ws.merge_cells("A24:L24")
+    check_covered_locations = sum(
+        bool(row.get("check_count_available")) for row in latest_location_rows
+    )
     ws["A24"] = (
         f"Data quality: {len(received_dates)} of {len(expected_dates)} reports received; "
-        f"{len(global_full)} complete all-store weeks available; incomplete weeks are excluded from comparisons."
+        f"Check Count complete for {check_covered_locations} of "
+        f"{len(latest_location_rows)} current store rows; {len(global_full)} complete "
+        "all-store weeks available."
         if latest_complete
         else f"Data quality: {len(received_dates)} of {len(expected_dates)} reports received; missing {missing_text or 'daily reports'}."
     )
@@ -10319,6 +11156,12 @@ def write_management_run_notes(
     git_provenance = provenance.get("git", {})
     config_provenance = provenance.get("config", {})
     requirements_provenance = provenance.get("requirements", {})
+    business_dates = {record.report_date for record in records}
+    check_count_dates = {
+        record.report_date
+        for record in records
+        if record.check_count_available
+    }
     note_rows = [
         ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Run ID", integrity.get("run_id", "Standalone workbook generation")),
@@ -10332,7 +11175,15 @@ def write_management_run_notes(
         ("Source Folder", str(source_dir)),
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed."),
         ("Raw Reports Read", len({record.source_file for record in records})),
-        ("Unique Business Days Used", report_audit.get("unique_business_days", len({record.report_date for record in records}))),
+        ("Unique Business Days Used", report_audit.get("unique_business_days", len(business_dates))),
+        (
+            "Check Count Coverage",
+            (
+                f"{len(check_count_dates)} of {len(business_dates)} business days. "
+                "Ticket Time totals are available only where every active row in the "
+                "rollup has Check Count."
+            ),
+        ),
         ("Semantic Duplicates Ignored", report_audit.get("duplicate_files_ignored", 0)),
         ("Canonical History Folder", report_audit.get("canonical_archive", "Not recorded")),
         ("Report Conflicts", "None; conflicting same-date reports stop the run before output or archiving."),
@@ -10343,7 +11194,7 @@ def write_management_run_notes(
         ("8-Week Direction", f"Compares the most recent {config.get('dashboard_long_term_block_weeks', 4)} complete weeks with the preceding {config.get('dashboard_long_term_block_weeks', 4)}. Full uses eight server weeks with at least {config.get('dashboard_long_term_full_min_recent_guests', 100)} recent / {config.get('dashboard_long_term_full_min_earlier_guests', 100)} earlier guests; Developing requires at least {config.get('dashboard_long_term_developing_min_total_weeks', 6)} usable weeks, {config.get('dashboard_long_term_developing_min_recent_weeks', 3)} recent / {config.get('dashboard_long_term_developing_min_earlier_weeks', 2)} earlier weeks, and {config.get('dashboard_long_term_developing_min_recent_guests', 75)} recent / {config.get('dashboard_long_term_developing_min_earlier_guests', 50)} earlier guests."),
         ("Peer Comparison", "Person-level comparison uses a leave-one-person-out same-store median pooled across the prior four complete weeks. It fails closed when cohort sufficiency gates are not met. Store totals are never a person fallback."),
         ("Targets", "Management Setup targets apply only to store/group operational context. They do not create person-level coaching prompts."),
-        ("Signal Scoring", "Movement and peer comparison use separately calibrated four-metric bands. Rank is display-only and contributes no points. A prompt requires aligned movement and peer context, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
+        ("Signal Scoring", "Person-level movement and peer comparison use separately calibrated Sales / Guest and Wine % bands only. Check Count, Rate of Sale, and Ticket Time are context only. Rank is display-only and contributes no points. A prompt requires aligned movement and peer context, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
         ("Review Gate", "Generated rows start at Review Needed. A later workflow state requires Review Disposition, Reviewed By, and Review Date; the signal cannot be the sole basis for an adverse employment decision."),
         ("Technical Trend Detail", "Server Week-over-Week Detail is descriptive audit context. Generated coaching prompts use Recent Movement, peer comparison, evidence stability, and two-week persistence."),
         ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward between weekly runs. Cleared signals move to Action History."),
@@ -10352,15 +11203,23 @@ def write_management_run_notes(
             "Action and reason codes, exact evidence weeks, source hashes/parser "
             f"provenance, comparator/cohort metadata, review disposition, and metric inputs use methodology {MANAGEMENT_METHODOLOGY_VERSION}.",
         ),
-        ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
-        ("Metric Caveat", "Rate of sale direction and guest-weighted ticket-time aggregation remain source-owner assumptions. Treat them as descriptive coaching context until Toast confirms definitions and denominators."),
+        ("Metric Rule", "Sales / Guest and Wine % are recalculated from rolled-up sales, guests, and wine sales. Sales / Check and Guests / Check are shown only with complete Check Count coverage."),
+        ("Metric Caveat", "Red Onion defines Rate of Sale as opportunities divided by qualifying sales, where lower is better; totals use opportunities divided by inferred qualifying sales. Ticket Time is Check Count-weighted only and is unavailable for legacy periods without Check Count. Both are descriptive context and cannot create person-level prompts."),
     ]
     for row, (label, value) in enumerate(note_rows, start=4):
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value).alignment = Alignment(wrap_text=True, vertical="top")
         ws.row_dimensions[row].height = (
-            45
-            if label in {"8-Week Direction", "Peer Comparison", "Signal Scoring"}
+            54
+            if label
+            in {
+                "8-Week Direction",
+                "Peer Comparison",
+                "Signal Scoring",
+                "Metric Caveat",
+            }
+            else 42
+            if label in {"Check Count Coverage", "Metric Rule"}
             else 30
         )
 
@@ -10387,6 +11246,7 @@ def finalize_management_workbook(wb: Workbook) -> None:
         if sheet.title in VISIBLE_MANAGEMENT_SHEETS:
             sheet.sheet_state = "visible"
             add_management_navigation(sheet)
+            configure_management_print_layout(sheet)
         else:
             sheet.sheet_state = "veryHidden"
         protect_worksheet(sheet, protection_password)
@@ -11970,7 +12830,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         if not active_paths:
             raise FileNotFoundError(
                 f"No active daily reports ({DAILY_REPORT_FORMAT_LABEL}) found in {input_dir}. "
-                "Drop current Toast reports into 01 Daily Reports - Drop Here and rerun."
+                "Drop current Red Onion daily reports into 01 Daily Reports - Drop Here and rerun."
             )
 
     previous_manifest, previous_payload, previous_manifest_hash = ensure_integrity_preflight(

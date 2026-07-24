@@ -100,9 +100,49 @@ When the repository folder is named exactly `Red Onion Weekly Metrics Automation
 
 The launcher disables bytecode writes and redirects bytecode lookup to a fresh unused cache path for every run. It does not fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root, but the same source-bytecode safety check applies.
 
+## Operational Context And Person-Action Scope
+
+Methodology `2026.07-v3` maintains two calculation scopes:
+
+- `SERVER_PERSON_ACTION_FIELDS` contains only `check_average` (displayed as
+  Sales/Guest) and `wine_pct`. Only these two fields may affect person-level
+  Recent Movement, Peer Comparison, composite direction, persistence, or
+  action classification.
+- `SERVER_CONTEXT_FIELDS` contains `rate_of_sale_by_guest_count` and
+  `average_ticket_time_seconds`. These fields, Check Count, Sales/Check, and
+  Guests/Check remain visible descriptive context and must not affect a
+  person-level action.
+
+Red Onion defines Rate of Sale as
+`opportunities / qualifying sales`; lower is better. For positive available
+row-level values, the correct combined rate is the opportunity-weighted
+harmonic result. The current `rate_of_sale_by_guest_count` field uses Guests as
+the opportunity count:
+
+```text
+combined ROS = sum(opportunities) / sum(opportunities / row ROS)
+```
+
+Do not substitute an opportunity-weighted arithmetic mean. A nonpositive,
+malformed, or missing ROS cannot be safely reconstructed from the ratio alone
+and makes the combined context value unavailable.
+
+Average Ticket Time is combined only when Check Count is valid for every
+contributing row and total Check Count is positive:
+
+```text
+combined Ticket Time = sum(row Ticket Time * row Check Count)
+                       / sum(row Check Count)
+Sales/Check            = sum(sales) / sum(Check Count)
+Guests/Check           = sum(guests) / sum(Check Count)
+```
+
+Incomplete Check Count coverage makes the combined Ticket Time and derived
+per-check context unavailable; guest weighting is not a fallback.
+
 ## Coaching-Signal Interpretation
 
-The v0.3.0 methodology is a deterministic, rule-based screening aid. It does
+Methodology `2026.07-v3` is a deterministic, rule-based screening aid. It does
 not estimate statistical confidence, predict future performance, establish
 causality, or adjust for unobserved shift conditions. Its outputs are limited
 to human-reviewed coaching and recognition prompts.
@@ -125,6 +165,12 @@ recognition prompt. Management targets remain visible as business context but
 do not drive person-level prompts. Rank is descriptive only and cannot change
 an action classification.
 
+Because the people-review composite contains only Sales/Guest and Wine
+Percentage, both metric families must agree and meet the configured materiality
+rules before a person-level candidate exists. Operational context may suggest
+questions for the manager, but it cannot supply the second agreeing metric or
+become a recurring action driver.
+
 Incomplete or low-volume weeks, unavailable peer references, gaps, changed
 signal direction, common store-wide movement, and day-sensitive results prevent
 escalation. The management signal sheets visibly state:
@@ -146,6 +192,11 @@ stability result, evidence weeks, and source lineage.
 `Action Board`. `Evidence Detail` is protected/read-only and records stable
 codes, exact evidence weeks, source SHA-256/format/parser/date-source,
 methodology version, and metric evidence.
+
+Before recording a disposition, the manager should ask whether the source and
+identity are correct, whether the work was reasonably comparable, whether
+check volume or a common store condition explains the movement, and what
+independent evidence supports the coaching or recognition conclusion.
 
 `Management Setup` targets, owner names, and manual `Action Board` fields are read from the existing master before regeneration. The new workbook is written to a temporary file and atomically replaces the prior master only after validation succeeds.
 
@@ -215,7 +266,7 @@ evidence are verified separately.
 
 - Keep dependencies small and listed in `pyproject.toml` and `requirements.txt`.
 - Do not add external services or credentials for the weekly run.
-- Do not commit customer-facing workbooks, Toast source files, or archive contents unless explicitly requested.
+- Do not commit customer-facing workbooks, Red Onion source files, or archive contents unless explicitly requested.
 - Keep the deployed Dropbox checkout clean, on `main`, and aligned with its local `origin/main`; never add a launcher bypass for the release preflight.
 - On personal Dropbox plans, reserve edit access to the automation, archive, and manifests for the stable owner/technical maintainer. Give weekly submitters only the intake access they require and report consumers view-only access to finished reports.
 - Require two-factor authentication and preserve Dropbox version history, while maintaining a separate independently retained backup and a documented restore test outside this repository.
