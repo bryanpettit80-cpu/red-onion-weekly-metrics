@@ -304,6 +304,8 @@ MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Setup", "Management Setup"),
     ("Run", "Run Notes"),
 )
+MANAGEMENT_MENU_LABEL = "Workbook Menu - click to choose a sheet on How to Use"
+MANAGEMENT_MENU_TARGET = "#'How to Use'!A44"
 MANAGEMENT_PRINT_WIDTHS: dict[str, int] = {
     "How to Use": 1,
     "Dashboard": 1,
@@ -7475,6 +7477,7 @@ def require_current_workbook_usability_contract(
     wb: Workbook,
     *,
     previous_v2: bool = False,
+    previous_tab_navigation: bool = False,
 ) -> None:
     """Require the exact current or immediately preceding usability contract."""
 
@@ -7559,95 +7562,10 @@ def require_current_workbook_usability_contract(
             "How to Use contains obsolete readiness terminology."
         )
 
-    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
-    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
-        navigation_columns = management_navigation_columns(ws)
-        actual_labels = [
-            ws.cell(row=2, column=column).value
-            for column in navigation_columns
-        ]
-        if actual_labels != expected_labels:
-            raise IntegrityError(
-                f"Worksheet {ws.title!r} does not contain the approved navigation labels."
-            )
-        if any(
-            ws.column_dimensions[get_column_letter(column)].hidden is True
-            for column in navigation_columns
-        ):
-            raise IntegrityError(
-                f"Worksheet {ws.title!r} navigation must remain fully visible."
-            )
-        if ws.row_dimensions[2].height != 24:
-            raise IntegrityError(
-                f"Worksheet {ws.title!r} does not use the approved navigation height."
-            )
-        title_merges = [
-            merged
-            for merged in ws.merged_cells.ranges
-            if merged.min_row == merged.max_row == 1
-            and merged.min_col == 1
-            and merged.max_col >= 12
-        ]
-        if len(title_merges) != 1:
-            raise IntegrityError(
-                f"Worksheet {ws.title!r} title band must extend through column L."
-            )
-        frozen_at = ws.freeze_panes
-        if hasattr(frozen_at, "coordinate"):
-            frozen_at = frozen_at.coordinate
-        frozen_row_match = re.search(r"\d+", str(frozen_at or ""))
-        if not frozen_row_match or int(frozen_row_match.group()) < 3:
-            raise IntegrityError(
-                f"Worksheet {ws.title!r} must retain the title and navigation rows."
-            )
-        for column, (_, target) in zip(
-            navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
-        ):
-            cell = ws.cell(row=2, column=column)
-            expected_target = f"#'{target}'!A1"
-            if cell.hyperlink is None or cell.hyperlink.target != expected_target:
-                raise IntegrityError(
-                    f"Worksheet {ws.title!r} has an invalid navigation target."
-                )
-            is_current = target == ws.title
-            expected_fill = (
-                "7A1E1E"
-                if previous_v2 and is_current
-                else "F2F2F2"
-            )
-            expected_font_color = (
-                "FFFFFF"
-                if previous_v2 and is_current
-                else "7A1E1E"
-            )
-            expected_underline = (
-                None
-                if previous_v2
-                else ("single" if is_current else None)
-            )
-            expected_side_style = "thin" if previous_v2 else None
-            if (
-                workbook_color_suffix(cell.fill.fgColor)
-                != expected_fill
-                or workbook_color_suffix(cell.font.color)
-                != expected_font_color
-                or cell.font.bold is not True
-                or cell.font.size != 9
-                or cell.font.underline
-                != expected_underline
-                or cell.alignment.horizontal != "center"
-                or cell.alignment.vertical != "center"
-                or cell.alignment.shrink_to_fit is not True
-                or cell.border.top.style != "thin"
-                or cell.border.bottom.style != "thin"
-                or getattr(cell.border.left, "style", None)
-                != expected_side_style
-                or getattr(cell.border.right, "style", None)
-                != expected_side_style
-            ):
-                raise IntegrityError(
-                    f"Worksheet {ws.title!r} navigation style does not match the contract."
-                )
+    if previous_v2 or previous_tab_navigation:
+        require_legacy_tab_navigation_contract(wb, previous_v2=previous_v2)
+    else:
+        require_management_menu_contract(wb)
 
 
 def validate_management_workbook(
@@ -7655,6 +7573,7 @@ def validate_management_workbook(
     expected_digest: str | None = None,
     *,
     previous_v2_usability: bool = False,
+    previous_tab_navigation: bool = False,
 ) -> str:
     """Validate protection, visibility, editable cells, tables, and digest."""
     reject_unapproved_workbook_drawings(path)
@@ -7672,6 +7591,7 @@ def validate_management_workbook(
             require_current_workbook_usability_contract(
                 wb,
                 previous_v2=previous_v2_usability,
+                previous_tab_navigation=previous_tab_navigation,
             )
         expected_validations = expected_management_list_validations(wb)
         require_exact_validation_count(
@@ -7906,12 +7826,49 @@ def workbook_uses_previous_v2_usability(wb: Workbook) -> bool:
     )
 
 
+def workbook_uses_legacy_multi_link_navigation(wb: Workbook) -> bool:
+    """Identify the exact manifest-bound v3 layout emitted before the menu bar."""
+
+    if (
+        stamped_workbook_protection_contract(wb)
+        != WORKBOOK_PROTECTION_CONTRACT
+        or "How to Use" not in wb.sheetnames
+        or any(
+            name not in wb.sheetnames
+            for name in VISIBLE_MANAGEMENT_SHEETS
+        )
+    ):
+        return False
+    guide_text = "\n".join(
+        str(cell.value)
+        for cell in wb["How to Use"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    if (
+        MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+        or PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
+    ):
+        return False
+    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
+    return all(
+        [
+            ws.cell(row=2, column=column).value
+            for column in management_navigation_columns(ws)
+        ]
+        == expected_labels
+        for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS)
+    )
+
+
 def management_workbook_upgrade_pending(path: Path) -> bool:
     if pre_contract_management_workbook(path):
         return True
     wb = load_workbook(path, data_only=False)
     try:
-        return workbook_uses_previous_v2_usability(wb)
+        return (
+            workbook_uses_previous_v2_usability(wb)
+            or workbook_uses_legacy_multi_link_navigation(wb)
+        )
     finally:
         wb.close()
 
@@ -7939,6 +7896,9 @@ def verify_existing_management_workbook_integrity(
         )
         has_how_to_use_schema = "How to Use" in wb.sheetnames
         has_previous_v2_usability = workbook_uses_previous_v2_usability(wb)
+        has_legacy_multi_link_navigation = (
+            workbook_uses_legacy_multi_link_navigation(wb)
+        )
         action_headers = (
             {
                 str(cell.value)
@@ -7972,6 +7932,21 @@ def verify_existing_management_workbook_integrity(
                         path,
                         expected_digest,
                         previous_v2_usability=True,
+                    )
+                if has_legacy_multi_link_navigation:
+                    if (
+                        not allow_legacy_protection_upgrade
+                        or expected_digest is None
+                    ):
+                        raise IntegrityError(
+                            "The existing master workbook predates the current "
+                            "navigation contract. It may be upgraded only when its "
+                            "exact digest is pinned by the verified integrity manifest."
+                        )
+                    return validate_management_workbook(
+                        path,
+                        expected_digest,
+                        previous_tab_navigation=True,
                     )
                 return validate_management_workbook(path, expected_digest or stamped)
             return validate_pre_guide_management_workbook(
@@ -8822,7 +8797,7 @@ def remove_sheet_if_present(wb: Workbook, name: str) -> None:
 
 
 def management_navigation_columns(ws) -> tuple[int, ...]:
-    """Return the first 12 operator-visible columns for the persistent top bar."""
+    """Return the legacy 12-link columns and current menu-bar bounds."""
 
     columns: list[int] = []
     column = 1
@@ -8838,46 +8813,244 @@ def management_navigation_columns(ws) -> tuple[int, ...]:
     return tuple(columns)
 
 
+def management_menu_bounds(ws) -> tuple[int, int]:
+    """Return the visible start and end columns for the uniform workbook menu."""
+
+    navigation_columns = management_navigation_columns(ws)
+    return navigation_columns[0], navigation_columns[-1]
+
+
+def require_management_title_and_freeze_contract(ws) -> None:
+    title_merges = [
+        merged
+        for merged in ws.merged_cells.ranges
+        if merged.min_row == merged.max_row == 1
+        and merged.min_col == 1
+        and merged.max_col >= 12
+    ]
+    if len(title_merges) != 1:
+        raise IntegrityError(
+            f"Worksheet {ws.title!r} title band must extend through column L."
+        )
+    frozen_at = ws.freeze_panes
+    if hasattr(frozen_at, "coordinate"):
+        frozen_at = frozen_at.coordinate
+    frozen_row_match = re.search(r"\d+", str(frozen_at or ""))
+    if not frozen_row_match or int(frozen_row_match.group()) < 3:
+        raise IntegrityError(
+            f"Worksheet {ws.title!r} must retain the title and navigation rows."
+        )
+
+
+def require_legacy_tab_navigation_contract(
+    wb: Workbook,
+    *,
+    previous_v2: bool,
+) -> None:
+    """Validate the exact protected multi-link layout used before v0.4.0."""
+
+    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
+    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
+        navigation_columns = management_navigation_columns(ws)
+        actual_labels = [
+            ws.cell(row=2, column=column).value
+            for column in navigation_columns
+        ]
+        if actual_labels != expected_labels:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not contain the approved legacy "
+                "navigation labels."
+            )
+        if any(
+            ws.column_dimensions[get_column_letter(column)].hidden is True
+            for column in navigation_columns
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} legacy navigation must remain fully visible."
+            )
+        if ws.row_dimensions[2].height != 24:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the approved navigation height."
+            )
+        require_management_title_and_freeze_contract(ws)
+        for column, (_, target) in zip(
+            navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
+        ):
+            cell = ws.cell(row=2, column=column)
+            expected_target = f"#'{target}'!A1"
+            if cell.hyperlink is None or cell.hyperlink.target != expected_target:
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} has an invalid legacy navigation target."
+                )
+            is_current = target == ws.title
+            expected_fill = "7A1E1E" if previous_v2 and is_current else "F2F2F2"
+            expected_font_color = (
+                "FFFFFF" if previous_v2 and is_current else "7A1E1E"
+            )
+            expected_underline = (
+                None if previous_v2 else ("single" if is_current else None)
+            )
+            expected_side_style = "thin" if previous_v2 else None
+            if (
+                workbook_color_suffix(cell.fill.fgColor) != expected_fill
+                or workbook_color_suffix(cell.font.color) != expected_font_color
+                or cell.font.bold is not True
+                or cell.font.size != 9
+                or cell.font.underline != expected_underline
+                or cell.alignment.horizontal != "center"
+                or cell.alignment.vertical != "center"
+                or cell.alignment.shrink_to_fit is not True
+                or cell.border.top.style != "thin"
+                or cell.border.bottom.style != "thin"
+                or getattr(cell.border.left, "style", None) != expected_side_style
+                or getattr(cell.border.right, "style", None) != expected_side_style
+            ):
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} navigation style does not match the "
+                    "contract for the legacy layout."
+                )
+
+
+def require_management_menu_contract(wb: Workbook) -> None:
+    """Validate the locked, width-independent current workbook menu."""
+
+    guide = wb["How to Use"]
+    if guide["A44"].value != HOW_TO_USE_SECTION_HEADINGS[6]:
+        raise IntegrityError(
+            "How to Use does not place the workbook map at the approved menu target."
+        )
+    if {
+        str(merged)
+        for merged in guide.merged_cells.ranges
+        if merged.min_row <= 45 <= merged.max_row
+    } != {"A45:B45", "C45:J45", "K45:L45"}:
+        raise IntegrityError(
+            "How to Use contains an invalid workbook-map heading layout."
+        )
+    if guide["A45"].value != "Sheet - click to open":
+        raise IntegrityError(
+            "How to Use is missing the approved workbook-map heading."
+        )
+    for row, (_, target) in enumerate(MANAGEMENT_NAVIGATION_LINKS, start=46):
+        cell = guide.cell(row=row, column=1)
+        if (
+            cell.value != target
+            or cell.hyperlink is None
+            or cell.hyperlink.target != f"#'{target}'!A1"
+            or cell.font.underline != "single"
+            or cell.protection.locked is not True
+        ):
+            raise IntegrityError(
+                "How to Use contains an invalid workbook-map navigation link."
+            )
+        expected_merges = {
+            f"A{row}:B{row}",
+            f"C{row}:J{row}",
+            f"K{row}:L{row}",
+        }
+        actual_merges = {
+            str(merged)
+            for merged in guide.merged_cells.ranges
+            if merged.min_row <= row <= merged.max_row
+        }
+        if actual_merges != expected_merges:
+            raise IntegrityError(
+                "How to Use contains an invalid workbook-map row layout."
+            )
+
+    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
+        start_column, end_column = management_menu_bounds(ws)
+        expected_range = (
+            f"{get_column_letter(start_column)}2:"
+            f"{get_column_letter(end_column)}2"
+        )
+        menu_merges = {
+            str(merged)
+            for merged in ws.merged_cells.ranges
+            if merged.min_row <= 2 <= merged.max_row
+        }
+        if menu_merges != {expected_range}:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the approved workbook-menu merge."
+            )
+        if (
+            ws.column_dimensions[get_column_letter(start_column)].hidden is True
+            or ws.column_dimensions[get_column_letter(end_column)].hidden is True
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} workbook menu must start and end visibly."
+            )
+        if ws.row_dimensions[2].height != 24:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the approved menu height."
+            )
+        require_management_title_and_freeze_contract(ws)
+        cell = ws.cell(row=2, column=start_column)
+        if (
+            cell.value != MANAGEMENT_MENU_LABEL
+            or cell.hyperlink is None
+            or cell.hyperlink.target != MANAGEMENT_MENU_TARGET
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} has an invalid navigation target."
+            )
+        if (
+            workbook_color_suffix(cell.fill.fgColor) != "F2F2F2"
+            or workbook_color_suffix(cell.font.color) != "7A1E1E"
+            or cell.font.bold is not True
+            or cell.font.size != 9
+            or cell.font.underline != "single"
+            or cell.protection.locked is not True
+            or cell.alignment.horizontal != "left"
+            or cell.alignment.vertical != "center"
+            or cell.alignment.shrink_to_fit is not True
+            or cell.alignment.indent != 1
+            or cell.border.top.style != "thin"
+            or cell.border.bottom.style != "thin"
+            or getattr(cell.border.left, "style", None) is not None
+            or getattr(cell.border.right, "style", None) is not None
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} navigation style does not match the contract."
+            )
+
+
 def add_management_navigation(ws) -> None:
+    """Add one consistent menu link without changing data-column widths."""
+
     neutral_fill = PatternFill("solid", fgColor="F2F2F2")
     navigation_border = Border(
         top=Side(style="thin", color="B7B7B7"),
         bottom=Side(style="thin", color="B7B7B7"),
     )
-    navigation_columns = management_navigation_columns(ws)
-    for column in navigation_columns:
-        dimension = ws.column_dimensions[get_column_letter(column)]
-        if dimension.width is None or dimension.width < 10:
-            dimension.width = 10
-    content_end_column = max(ws.max_column, navigation_columns[-1])
-    for col, (label, target) in zip(
-        navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
-    ):
-        cell = ws.cell(row=2, column=col, value=label)
-        cell.hyperlink = f"#'{target}'!A1"
-        is_current = target == ws.title
-        cell.fill = neutral_fill
-        cell.font = Font(
-            color="7A1E1E",
-            bold=True,
-            underline="single" if is_current else None,
-            size=9,
-        )
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center",
-            shrink_to_fit=True,
-        )
-        cell.border = navigation_border
-    navigation_column_set = set(navigation_columns)
-    for col in range(1, content_end_column + 1):
-        if col in navigation_column_set or ws.column_dimensions[
-            get_column_letter(col)
-        ].hidden is True:
-            continue
-        cell = ws.cell(row=2, column=col)
-        cell.fill = neutral_fill
-        cell.border = navigation_border
+    start_column, end_column = management_menu_bounds(ws)
+    # Set the anchor border before merging so openpyxl materializes the same
+    # top/bottom edge cells on the first save and every subsequent reload.
+    # Assigning it only after merge makes the protected semantic digest drift
+    # when openpyxl later formats the merged range.
+    ws.cell(row=2, column=start_column).border = navigation_border
+    ws.merge_cells(
+        start_row=2,
+        start_column=start_column,
+        end_row=2,
+        end_column=end_column,
+    )
+    cell = ws.cell(row=2, column=start_column, value=MANAGEMENT_MENU_LABEL)
+    cell.hyperlink = MANAGEMENT_MENU_TARGET
+    cell.fill = neutral_fill
+    cell.font = Font(
+        color="7A1E1E",
+        bold=True,
+        underline="single",
+        size=9,
+    )
+    cell.alignment = Alignment(
+        horizontal="left",
+        vertical="center",
+        shrink_to_fit=True,
+        indent=1,
+    )
+    cell.border = navigation_border
     ws.row_dimensions[2].height = 24
 
 
@@ -9145,7 +9318,7 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
 
     write_guide_section_header(ws, 44, HOW_TO_USE_SECTION_HEADINGS[6])
     for start_col, end_col, value in (
-        (1, 2, "Sheet"),
+        (1, 2, "Sheet - click to open"),
         (3, 10, "Purpose"),
         (11, 12, "Editable?"),
     ):
@@ -9223,7 +9396,11 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ws.merge_cells(start_row=row, start_column=11, end_row=row, end_column=12)
         sheet_cell = ws.cell(row=row, column=1, value=sheet_name)
         sheet_cell.hyperlink = f"#'{sheet_name}'!A1"
-        sheet_cell.font = Font(bold=True, color="7A1E1E", underline=None)
+        sheet_cell.font = Font(
+            bold=True,
+            color="7A1E1E",
+            underline="single",
+        )
         ws.cell(row=row, column=3, value=purpose)
         ws.cell(row=row, column=11, value=editable)
         for col in (1, 3, 11):
@@ -9325,6 +9502,7 @@ def write_management_setup_sheet(
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    ws.row_dimensions[5].height = 30
     entities = ["All Stores", *config.get("locations", {}).keys()]
     for row_index, entity in enumerate(entities, start=6):
         ws.cell(row=row_index, column=1, value=entity).font = Font(bold=True)
@@ -9883,7 +10061,7 @@ def write_evidence_detail_sheet(
         "A": 20,
         "B": 16,
         "C": 25,
-        "D": 38,
+        "D": 46,
         "E": 12,
         "F": 14,
         "G": 18,
@@ -10296,7 +10474,7 @@ def write_store_group_scorecards_sheet(
                 wrap_text=True, vertical="center"
             )
             for row_index in range(current_row + 1, current_row + 13):
-                ws.row_dimensions[row_index].height = 25
+                ws.row_dimensions[row_index].height = 30
             current_row += len(STORE_GROUP_DISPLAY_METRICS) + 4
     for column, width in {"A": 24, "B": 16, "C": 16, "D": 18, "E": 16, "F": 20, "G": 14}.items():
         ws.column_dimensions[column].width = width
@@ -11172,7 +11350,7 @@ def write_management_dashboard_sheet(
             ws.cell(row=row_index, column=col).border = Border(
                 right=Side(style="thin", color="D9E1F2")
             )
-        ws.row_dimensions[row_index].height = 54
+        ws.row_dimensions[row_index].height = 60
 
     ws.merge_cells("A22:L22")
     ws["A22"] = "RECOGNITION REVIEW"
@@ -11304,7 +11482,7 @@ def write_management_run_notes(
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value).alignment = Alignment(wrap_text=True, vertical="top")
         ws.row_dimensions[row].height = (
-            54
+            60
             if label
             in {
                 "8-Week Direction",

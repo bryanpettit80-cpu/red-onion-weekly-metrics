@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 
 from openpyxl import load_workbook
-from openpyxl.styles import Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pytest
 
 import red_onion_integrity as integrity
@@ -130,6 +130,74 @@ def downgrade_master_to_pre_protection_contract(path: Path) -> str:
     return metrics.stamp_generated_content_digest(path)
 
 
+def replace_menu_with_legacy_tabs(
+    workbook,
+    *,
+    previous_v2: bool,
+) -> None:
+    """Replace the current merged menu with the exact prior multi-link bar."""
+
+    for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
+        worksheet = workbook[sheet_name]
+        row_two_merges = [
+            str(merged)
+            for merged in worksheet.merged_cells.ranges
+            if merged.min_row <= 2 <= merged.max_row
+        ]
+        for merged_range in row_two_merges:
+            worksheet.unmerge_cells(merged_range)
+        navigation_columns = metrics.management_navigation_columns(worksheet)
+        for column, (label, target) in zip(
+            navigation_columns,
+            metrics.MANAGEMENT_NAVIGATION_LINKS,
+            strict=True,
+        ):
+            cell = worksheet.cell(row=2, column=column, value=label)
+            cell.hyperlink = f"#'{target}'!A1"
+            is_current = target == sheet_name
+            cell.fill = PatternFill(
+                "solid",
+                fgColor=(
+                    "7A1E1E"
+                    if previous_v2 and is_current
+                    else "F2F2F2"
+                ),
+            )
+            cell.font = Font(
+                color=(
+                    "FFFFFF"
+                    if previous_v2 and is_current
+                    else "7A1E1E"
+                ),
+                bold=True,
+                underline=(
+                    None
+                    if previous_v2
+                    else ("single" if is_current else None)
+                ),
+                size=9,
+            )
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                shrink_to_fit=True,
+            )
+            cell.border = Border(
+                left=(
+                    Side(style="thin", color="B7B7B7")
+                    if previous_v2
+                    else Side()
+                ),
+                right=(
+                    Side(style="thin", color="B7B7B7")
+                    if previous_v2
+                    else Side()
+                ),
+                top=Side(style="thin", color="B7B7B7"),
+                bottom=Side(style="thin", color="B7B7B7"),
+            )
+
+
 def downgrade_master_to_v2_usability_contract(path: Path) -> str:
     """Model the manifest-bound v0.3.2 workbook deployed before v3."""
 
@@ -150,33 +218,19 @@ def downgrade_master_to_v2_usability_contract(path: Path) -> str:
                     "are action-driving business assumptions pending source-owner "
                     "confirmation."
                 )
+        replace_menu_with_legacy_tabs(workbook, previous_v2=True)
+        workbook.save(path)
+    finally:
+        workbook.close()
+    return metrics.stamp_generated_content_digest(path)
 
-        navigation_border = Border(
-            left=Side(style="thin", color="B7B7B7"),
-            right=Side(style="thin", color="B7B7B7"),
-            top=Side(style="thin", color="B7B7B7"),
-            bottom=Side(style="thin", color="B7B7B7"),
-        )
-        for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
-            worksheet = workbook[sheet_name]
-            for column, (_, target) in zip(
-                metrics.management_navigation_columns(worksheet),
-                metrics.MANAGEMENT_NAVIGATION_LINKS,
-                strict=True,
-            ):
-                cell = worksheet.cell(row=2, column=column)
-                is_current = target == sheet_name
-                cell.fill = PatternFill(
-                    "solid",
-                    fgColor="7A1E1E" if is_current else "F2F2F2",
-                )
-                cell.font = Font(
-                    color="FFFFFF" if is_current else "7A1E1E",
-                    bold=True,
-                    underline=None,
-                    size=9,
-                )
-                cell.border = navigation_border
+
+def downgrade_master_to_legacy_v3_navigation(path: Path) -> str:
+    """Model the manifest-bound v3 workbook emitted before the single menu."""
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        replace_menu_with_legacy_tabs(workbook, previous_v2=False)
         workbook.save(path)
     finally:
         workbook.close()
@@ -727,6 +781,239 @@ def test_manifest_pinned_v2_usability_master_is_regenerated_as_v3(
         upgraded.close()
 
 
+def test_manifest_pinned_legacy_v3_navigation_is_regenerated_with_menu(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook["Management Setup"]["A21"] = "Avery Manager"
+        workbook["Management Setup"]["B21"] = "Yes"
+        seeded_action = {
+            "Action ID": "NAV-UPGRADE-STATE",
+            "Entity Key": "server|rc richmond|alex server",
+            "Priority": "Medium",
+            "Status": "Open",
+            "Owner": "Avery Manager",
+            "Due Date": None,
+            "Location": "RC Richmond",
+            "Person / Area": "Alex Server",
+            "Action": "Review operating context",
+            "Signal": "Context Review",
+            "Why It Matters": "Test protected editable-state carry-forward.",
+            "Recommended Next Step": "Review with the manager",
+            "Last Seen": ACTIVE_DAY,
+            "Context Notes": "Preserve this protected manager note.",
+            "Peer Comparison": "Reference Unavailable",
+            "Recent Movement": "Not Evaluated",
+            "First Seen": ACTIVE_DAY,
+            "Weeks Open": 1,
+            "Evidence Status": "Developing",
+            "Signal State": "Current",
+            "Review Disposition": "Pending Review",
+            "Reviewed By": "",
+            "Review Date": None,
+        }
+        metrics.write_action_tracking_sheet(
+            workbook,
+            "Action Board",
+            [seeded_action],
+            editable=True,
+        )
+        action_board = workbook["Action Board"]
+        metrics.add_management_navigation(action_board)
+        metrics.configure_management_print_layout(action_board)
+        metrics.protect_worksheet(action_board, "test-pass")
+        workbook._sheets = [
+            *[
+                workbook[name]
+                for name in metrics.VISIBLE_MANAGEMENT_SHEETS
+                if name in workbook.sheetnames
+            ],
+            *[
+                worksheet
+                for worksheet in workbook.worksheets
+                if worksheet.title not in metrics.VISIBLE_MANAGEMENT_SHEETS
+            ],
+        ]
+        workbook.save(master)
+    finally:
+        workbook.close()
+    legacy_digest = downgrade_master_to_legacy_v3_navigation(master)
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="legacy-v3-navigation",
+        previous_manifest=None,
+    )
+    assert integrity.read_json_manifest(existing)[
+        "master_generated_content_sha256"
+    ] == legacy_digest
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="predates the current navigation contract",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=legacy_digest,
+        )
+
+    adopted, adopted_payload, adopted_sha256 = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+    assert adopted == existing
+    assert adopted_payload["_legacy_master_upgrade_pending"] is True
+    assert metrics.verify_integrity_anchor(archive_dir) == (
+        existing.resolve(),
+        adopted_sha256,
+    )
+
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    (input_dir / "Daily Report - TM - 07-21-2026.xlsx").write_bytes(
+        b"captured active report"
+    )
+    install_synthetic_parser(monkeypatch)
+    generated = metrics.run(args)
+
+    assert master in generated
+    assert metrics.validate_management_workbook(master)
+    upgraded = load_workbook(master, data_only=False)
+    try:
+        assert metrics.owner_roster_from_sheet(
+            upgraded["Management Setup"]
+        )[0] == {
+            "Owner Name": "Avery Manager",
+            "Active": "Yes",
+        }
+        carried_actions = [
+            *metrics.records_from_sheet(
+                upgraded["Action Board"],
+                "Action ID",
+            ),
+            *metrics.records_from_sheet(
+                upgraded["Action History"],
+                "Action ID",
+            ),
+        ]
+        carried = next(
+            row
+            for row in carried_actions
+            if row["Action ID"] == "NAV-UPGRADE-STATE"
+        )
+        assert (
+            carried["Context Notes"]
+            == "Preserve this protected manager note."
+        )
+        assert carried["Owner"] == "Avery Manager"
+        for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
+            worksheet = upgraded[sheet_name]
+            start_column, end_column = metrics.management_menu_bounds(worksheet)
+            assert {
+                str(merged)
+                for merged in worksheet.merged_cells.ranges
+                if merged.min_row <= 2 <= merged.max_row
+            } == {
+                (
+                    f"{metrics.get_column_letter(start_column)}2:"
+                    f"{metrics.get_column_letter(end_column)}2"
+                )
+            }
+            assert (
+                worksheet.cell(row=2, column=start_column).hyperlink.target
+                == metrics.MANAGEMENT_MENU_TARGET
+            )
+    finally:
+        upgraded.close()
+
+
+def test_manifest_pinned_legacy_v3_navigation_rejects_style_tampering(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    downgrade_master_to_legacy_v3_navigation(master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        dashboard = workbook["Dashboard"]
+        current_column = next(
+            column
+            for column, (_, target) in zip(
+                metrics.management_navigation_columns(dashboard),
+                metrics.MANAGEMENT_NAVIGATION_LINKS,
+                strict=True,
+            )
+            if target == "Dashboard"
+        )
+        dashboard.cell(row=2, column=current_column).font = Font(
+            color="7A1E1E",
+            bold=True,
+            underline=None,
+            size=9,
+        )
+        workbook.save(master)
+    finally:
+        workbook.close()
+    tampered_digest = metrics.stamp_generated_content_digest(master)
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="navigation style does not match the contract",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=tampered_digest,
+            allow_legacy_protection_upgrade=True,
+        )
+
+
+def test_legacy_v3_navigation_with_missing_sheet_fails_closed(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = downgrade_master_to_legacy_v3_navigation(master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook.remove(workbook["Dashboard"])
+        assert (
+            metrics.workbook_uses_legacy_multi_link_navigation(workbook)
+            is False
+        )
+        workbook.save(master)
+    finally:
+        workbook.close()
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="missing required sheets",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=legacy_digest,
+            allow_legacy_protection_upgrade=True,
+        )
+
+
 def test_manifest_pinned_v2_usability_upgrade_rejects_navigation_tampering(
     tmp_path: Path,
     valid_master_template: Path,
@@ -1072,6 +1359,12 @@ def test_v2_evidence_export_rejects_legacy_action_schema(
         ("unlocked", "editable-cell protection"),
         ("navigation_target", "invalid navigation target"),
         ("navigation_style", "navigation style"),
+        ("menu_merge", "approved workbook-menu merge"),
+        ("map_target", "invalid workbook-map navigation link"),
+        ("map_style", "invalid workbook-map navigation link"),
+        ("map_heading", "approved workbook-map heading"),
+        ("map_heading_layout", "invalid workbook-map heading layout"),
+        ("map_row_layout", "invalid workbook-map row layout"),
         ("guide_text", "missing required operating guidance"),
         ("title_merge", "title band must extend through column L"),
     ],
@@ -1106,6 +1399,18 @@ def test_current_workbook_rejects_guide_and_navigation_contract_tampering(
             guide["A2"].hyperlink = "#'Dashboard'!A1"
         elif tamper_kind == "navigation_style":
             guide["A2"].fill = metrics.PatternFill("solid", fgColor="00FF00")
+        elif tamper_kind == "menu_merge":
+            guide.unmerge_cells("A2:L2")
+        elif tamper_kind == "map_target":
+            guide["A46"].hyperlink = "#'Dashboard'!A1"
+        elif tamper_kind == "map_style":
+            guide["A46"].font = Font(bold=True, color="7A1E1E")
+        elif tamper_kind == "map_heading":
+            guide["A45"] = "Sheet"
+        elif tamper_kind == "map_heading_layout":
+            guide.unmerge_cells("A45:B45")
+        elif tamper_kind == "map_row_layout":
+            guide.unmerge_cells("A46:B46")
         elif tamper_kind == "guide_text":
             guide["A59"] = "Unsupported assumptions removed"
         else:
@@ -1122,7 +1427,14 @@ def test_current_workbook_rejects_guide_and_navigation_contract_tampering(
 
 @pytest.mark.parametrize(
     "tamper_kind",
-    ["guide_text", "navigation_target", "navigation_height", "guide_width"],
+    [
+        "guide_text",
+        "navigation_target",
+        "navigation_height",
+        "menu_merge",
+        "map_target",
+        "guide_width",
+    ],
 )
 def test_generated_content_digest_covers_workbook_usability_contract(
     tmp_path: Path,
@@ -1140,6 +1452,10 @@ def test_generated_content_digest_covers_workbook_usability_contract(
             workbook["Dashboard"]["A2"].hyperlink = "#'Action Board'!A1"
         elif tamper_kind == "navigation_height":
             workbook["Action History"].row_dimensions[2].height = 30
+        elif tamper_kind == "menu_merge":
+            workbook["Dashboard"].unmerge_cells("A2:L2")
+        elif tamper_kind == "map_target":
+            workbook["How to Use"]["A46"].hyperlink = "#'Dashboard'!A1"
         else:
             workbook["How to Use"].column_dimensions["L"].width = 14
         workbook.save(master)

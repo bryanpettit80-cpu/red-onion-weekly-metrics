@@ -4,10 +4,55 @@ from argparse import Namespace
 from datetime import date, timedelta
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 import pytest
 
 import red_onion_weekly_metrics as metrics
+
+
+@pytest.mark.parametrize(
+    ("hidden_columns", "expected_bounds"),
+    [
+        (frozenset(), (1, 12)),
+        (frozenset({1, 2}), (3, 14)),
+        (frozenset({12, 13}), (1, 14)),
+    ],
+)
+def test_management_menu_preserves_column_widths_and_visibility(
+    hidden_columns: frozenset[int],
+    expected_bounds: tuple[int, int],
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data Quality"
+    for index, width in enumerate((11, 96, 13, 22, 48, 69, 12, 14, 18, 50, 9, 10, 7, 16), start=1):
+        dimension = worksheet.column_dimensions[
+            metrics.get_column_letter(index)
+        ]
+        dimension.width = width
+        dimension.hidden = index in hidden_columns
+    before = {
+        column: (
+            worksheet.column_dimensions[column].width,
+            worksheet.column_dimensions[column].hidden,
+        )
+        for column in (
+            metrics.get_column_letter(index)
+            for index in range(1, 15)
+        )
+    }
+
+    metrics.add_management_navigation(worksheet)
+
+    after = {
+        column: (
+            worksheet.column_dimensions[column].width,
+            worksheet.column_dimensions[column].hidden,
+        )
+        for column in before
+    }
+    assert after == before
+    assert metrics.management_menu_bounds(worksheet) == expected_bounds
 
 
 def make_record(
@@ -925,6 +970,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert guide.row_dimensions[30].height == 42
     assert guide.row_dimensions[58].height == 24
     assert guide.row_dimensions[59].height == 72
+    assert guide["A44"].value == metrics.HOW_TO_USE_SECTION_HEADINGS[6]
     assert metrics.MANAGEMENT_METHODOLOGY_VERSION in "\n".join(guide_values)
     for phrase in (
         "never be the sole or determinative basis",
@@ -946,35 +992,67 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         assert field in guide_values
     for choice in (*metrics.ACTION_STATUS_CHOICES, *metrics.REVIEW_DISPOSITION_CHOICES):
         assert choice in "\n".join(guide_values)
-    assert {
+    assert guide["A45"].value == "Sheet - click to open"
+    assert [
         guide.cell(row=row, column=1).value for row in range(46, 58)
-    } == set(metrics.VISIBLE_MANAGEMENT_SHEETS)
+    ] == list(metrics.VISIBLE_MANAGEMENT_SHEETS)
+    assert [
+        guide.cell(row=row, column=1).hyperlink.target
+        for row in range(46, 58)
+    ] == [
+        f"#'{sheet_name}'!A1"
+        for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS
+    ]
+    assert all(
+        guide.cell(row=row, column=1).font.underline == "single"
+        and guide.cell(row=row, column=1).protection.locked is True
+        for row in range(46, 58)
+    )
 
-    expected_navigation = list(metrics.MANAGEMENT_NAVIGATION_LINKS)
     for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
         worksheet = wb[sheet_name]
-        navigation_columns = metrics.management_navigation_columns(worksheet)
-        assert worksheet.row_dimensions[2].height == 24
-        assert all(
-            worksheet.column_dimensions[
-                metrics.get_column_letter(column)
-            ].hidden is not True
-            for column in navigation_columns
+        start_column, end_column = metrics.management_menu_bounds(worksheet)
+        expected_merge = (
+            f"{metrics.get_column_letter(start_column)}2:"
+            f"{metrics.get_column_letter(end_column)}2"
         )
-        assert [
-            worksheet.cell(row=2, column=column).value
-            for column in navigation_columns
-        ] == [label for label, _ in expected_navigation]
-        assert [
-            worksheet.cell(row=2, column=column).hyperlink.target
-            for column in navigation_columns
-        ] == [f"#'{target}'!A1" for _, target in expected_navigation]
-        assert all(
+        menu_cell = worksheet.cell(row=2, column=start_column)
+        assert worksheet.row_dimensions[2].height == 24
+        assert {
+            str(merged)
+            for merged in worksheet.merged_cells.ranges
+            if merged.min_row <= 2 <= merged.max_row
+        } == {expected_merge}
+        assert menu_cell.value == metrics.MANAGEMENT_MENU_LABEL
+        assert menu_cell.hyperlink.target == metrics.MANAGEMENT_MENU_TARGET
+        assert menu_cell.font.underline == "single"
+        assert menu_cell.font.bold is True
+        assert menu_cell.font.size == 9
+        assert metrics.workbook_color_suffix(menu_cell.font.color) == "7A1E1E"
+        assert menu_cell.protection.locked is True
+        assert menu_cell.alignment.horizontal == "left"
+        assert menu_cell.alignment.vertical == "center"
+        assert menu_cell.alignment.shrink_to_fit is True
+        assert menu_cell.alignment.indent == 1
+        assert (
+            metrics.workbook_color_suffix(menu_cell.fill.fgColor)
+            == "F2F2F2"
+        )
+        assert getattr(menu_cell.border.left, "style", None) is None
+        assert getattr(menu_cell.border.right, "style", None) is None
+        assert menu_cell.border.top.style == "thin"
+        assert menu_cell.border.bottom.style == "thin"
+        assert (
             worksheet.column_dimensions[
-                metrics.get_column_letter(column)
-            ].width
-            >= 10
-            for column in navigation_columns
+                metrics.get_column_letter(start_column)
+            ].hidden
+            is not True
+        )
+        assert (
+            worksheet.column_dimensions[
+                metrics.get_column_letter(end_column)
+            ].hidden
+            is not True
         )
         assert (
             worksheet.page_setup.fitToWidth
@@ -988,37 +1066,6 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         assert worksheet.page_setup.orientation == "landscape"
         assert worksheet.print_area
         assert worksheet.print_title_rows
-        active_navigation_cells = [
-            worksheet.cell(row=2, column=column)
-            for column, (_, target) in zip(
-                navigation_columns, expected_navigation, strict=True
-            )
-            if target == sheet_name
-        ]
-        assert len(active_navigation_cells) == 1
-        assert active_navigation_cells[0].font.underline == "single"
-        assert all(
-            metrics.workbook_color_suffix(
-                worksheet.cell(row=2, column=column).fill.fgColor
-            )
-            == "F2F2F2"
-            for column in navigation_columns
-        )
-        assert all(
-            getattr(
-                worksheet.cell(row=2, column=column).border.left,
-                "style",
-                None,
-            )
-            is None
-            and getattr(
-                worksheet.cell(row=2, column=column).border.right,
-                "style",
-                None,
-            )
-            is None
-            for column in navigation_columns
-        )
         assert any(
             merged.min_row == merged.max_row == 1
             and merged.min_col == 1
@@ -1028,13 +1075,9 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         frozen_at = worksheet.freeze_panes
         assert frozen_at is not None
         assert int("".join(character for character in str(frozen_at) if character.isdigit())) >= 3
-    assert metrics.management_navigation_columns(wb["Action Board"]) == tuple(
-        range(3, 15)
-    )
-    assert metrics.management_navigation_columns(wb["Evidence Detail"]) == (
-        *range(1, 12),
-        14,
-    )
+    assert metrics.management_menu_bounds(wb["Action Board"]) == (3, 14)
+    assert metrics.management_menu_bounds(wb["Action History"]) == (3, 14)
+    assert metrics.management_menu_bounds(wb["Evidence Detail"]) == (1, 14)
 
     dashboard_values = {
         value
@@ -1079,6 +1122,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         evidence["A3"].value
     )
     assert evidence.row_dimensions[4].height == 42
+    assert evidence.column_dimensions["D"].width == 46
     assert evidence.column_dimensions["L"].hidden is True
     assert evidence.column_dimensions["M"].hidden is True
     assert all(
@@ -1107,12 +1151,36 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         run_notes.cell(row=row, column=1).value: row
         for row in range(1, run_notes.max_row + 1)
     }
-    assert run_notes.row_dimensions[run_note_rows["Peer Comparison"]].height == 54
-    assert run_notes.row_dimensions[run_note_rows["Signal Scoring"]].height == 54
+    for label in (
+        "8-Week Direction",
+        "Peer Comparison",
+        "Signal Scoring",
+        "Metric Caveat",
+    ):
+        assert run_notes.row_dimensions[run_note_rows[label]].height == 60
+        assert run_notes.cell(
+            row=run_note_rows[label],
+            column=2,
+        ).alignment.wrap_text is True
     assert "Check Count Coverage" in run_note_rows
+    assert wb["Management Setup"].row_dimensions[5].height == 30
+    assert wb["Management Setup"]["C5"].alignment.wrap_text is True
+    assert all(
+        wb["Store & Group Scorecards"].row_dimensions[row].height == 30
+        for row in range(18, 30)
+    )
+    assert "A18:G23" in {
+        str(merged)
+        for merged in wb["Store & Group Scorecards"].merged_cells.ranges
+    }
+    assert wb["Store & Group Scorecards"]["A18"].alignment.wrap_text is True
     assert wb["Dashboard"].row_dimensions[13].height == 66
     assert wb["Dashboard"].row_dimensions[14].height == 66
     assert wb["Dashboard"].row_dimensions[15].height == 66
+    assert wb["Dashboard"].row_dimensions[19].height == 60
+    assert wb["Dashboard"].row_dimensions[20].height == 60
+    assert wb["Dashboard"]["K19"].alignment.wrap_text is True
+    assert wb["Dashboard"]["K20"].alignment.wrap_text is True
     assert wb["Dashboard"].row_dimensions[9].height == 32
     assert wb["Action Focus"].row_dimensions[3].height == 48
     assert wb["Action Focus"].page_setup.fitToWidth == 2
@@ -1128,11 +1196,13 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for page_break in wb["Store & Group Scorecards"].row_breaks.brk
     ] == [16, 29, 42]
     for sheet_name, widths in {
-        "Action Focus": {"B": 15, "M": 21},
+        "Action Focus": {"B": 15, "J": 50, "M": 21},
         "Server Scorecard": {"E": 21, "F": 23, "G": 23, "H": 22},
         "Recent Movement Signals": {"A": 26, "F": 23},
         "Data Quality": {"D": 13, "F": 69},
         "Management Setup": {"D": 25, "E": 48},
+        "Run Notes": {"A": 30, "B": 96},
+        "Evidence Detail": {"D": 46},
     }.items():
         for column, expected_width in widths.items():
             assert (
