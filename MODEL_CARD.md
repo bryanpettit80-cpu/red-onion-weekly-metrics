@@ -3,7 +3,7 @@
 ## Identity And Status
 
 - **System:** Red Onion Weekly Metrics
-- **Release contract:** v0.3.0
+- **Release contract:** v0.3.1 (methodology unchanged from v0.3.0)
 - **Methodology:** `2026.07-v2`
 - **System type:** deterministic, rule-based observational coaching signal
 - **Owners:** Red Onion business owner and designated technical maintainer

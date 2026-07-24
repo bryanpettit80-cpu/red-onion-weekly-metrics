@@ -126,6 +126,113 @@ def downgrade_master_to_pre_protection_contract(path: Path) -> str:
     return metrics.stamp_generated_content_digest(path)
 
 
+def downgrade_master_to_v1_action_focus(path: Path) -> str:
+    """Model the protected 20-column Action Focus workbook from v0.2.x."""
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        workbook["Recent Movement Signals"].title = "Rising & Falling Stars"
+        action_board = workbook["Action Board"]
+        table = action_board.tables["ActionBoardTable"]
+        min_col, min_row, _, max_row = metrics.range_boundaries(table.ref)
+        assert min_col == 1
+        first_data_row = min_row + 1
+        for row in range(first_data_row, max_row + 1):
+            if action_board.cell(row=row, column=4).value == "Review Needed":
+                action_board.cell(row=row, column=4).value = "Open"
+        action_board.delete_cols(
+            len(metrics.LEGACY_ACTION_HEADERS_V1) + 1,
+            len(metrics.ACTION_HEADERS) - len(metrics.LEGACY_ACTION_HEADERS_V1),
+        )
+        for column, header in enumerate(metrics.LEGACY_ACTION_HEADERS_V1, start=1):
+            action_board.cell(row=min_row, column=column).value = header
+        table.ref = (
+            f"A{min_row}:"
+            f"{metrics.get_column_letter(len(metrics.LEGACY_ACTION_HEADERS_V1))}{max_row}"
+        )
+        table.tableColumns = table.tableColumns[
+            : len(metrics.LEGACY_ACTION_HEADERS_V1)
+        ]
+        for table_column, header in zip(
+            table.tableColumns,
+            metrics.LEGACY_ACTION_HEADERS_V1,
+            strict=True,
+        ):
+            table_column.name = header
+        if table.autoFilter is not None:
+            table.autoFilter.ref = table.ref
+
+        status_validation = next(
+            item
+            for item in action_board.data_validations.dataValidation
+            if item.formula1 == f'"{",".join(metrics.ACTION_STATUS_CHOICES)}"'
+        )
+        owner_validation = next(
+            item
+            for item in action_board.data_validations.dataValidation
+            if item.formula1 == f"={metrics.OWNER_ROSTER_DEFINED_NAME}"
+        )
+        status_validation.formula1 = (
+            f'"{",".join(metrics.LEGACY_ACTION_STATUS_CHOICES)}"'
+        )
+        status_validation.sqref = f"D{first_data_row}:D{max_row}"
+        owner_validation.sqref = f"E{first_data_row}:E{max_row}"
+        action_board.data_validations.dataValidation = [
+            status_validation,
+            owner_validation,
+        ]
+
+        action_history = workbook["Action History"]
+        history_table = action_history.tables.get("ActionHistoryTable")
+        history_header_row = 4
+        history_max_row = action_history.max_row
+        if history_table is not None:
+            _, history_header_row, _, history_max_row = metrics.range_boundaries(
+                history_table.ref
+            )
+        action_history.delete_cols(
+            len(metrics.LEGACY_ACTION_HEADERS_V1) + 1,
+            len(metrics.ACTION_HEADERS) - len(metrics.LEGACY_ACTION_HEADERS_V1),
+        )
+        for column, header in enumerate(metrics.LEGACY_ACTION_HEADERS_V1, start=1):
+            action_history.cell(row=history_header_row, column=column).value = header
+        if history_table is not None:
+            history_table.ref = (
+                f"A{history_header_row}:"
+                f"{metrics.get_column_letter(len(metrics.LEGACY_ACTION_HEADERS_V1))}"
+                f"{history_max_row}"
+            )
+            history_table.tableColumns = history_table.tableColumns[
+                : len(metrics.LEGACY_ACTION_HEADERS_V1)
+            ]
+            for table_column, header in zip(
+                history_table.tableColumns,
+                metrics.LEGACY_ACTION_HEADERS_V1,
+                strict=True,
+            ):
+                table_column.name = header
+            if history_table.autoFilter is not None:
+                history_table.autoFilter.ref = history_table.ref
+        workbook.save(path)
+    finally:
+        workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
+def downgrade_master_to_previous_action_schema(path: Path) -> str:
+    """Model the protected pre-Action-Focus master currently deployed in production."""
+
+    downgrade_master_to_v1_action_focus(path)
+    workbook = load_workbook(path, data_only=False)
+    try:
+        workbook.remove(workbook["Action Focus"])
+        workbook.remove(workbook["Evidence Detail"])
+        workbook.save(path)
+    finally:
+        workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
 def test_explicit_baseline_succeeds_without_active_input_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -452,6 +559,79 @@ def test_adopted_pre_contract_master_is_regenerated_with_strict_protection(
         }
     finally:
         upgraded.close()
+
+
+def test_protected_v1_action_focus_master_accepts_only_legacy_status_contract(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = downgrade_master_to_v1_action_focus(master)
+
+    assert metrics.verify_existing_management_workbook_integrity(
+        master,
+        expected_digest=legacy_digest,
+    ) == legacy_digest
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        formulas = {
+            validation.formula1
+            for validation in workbook[
+                "Action Board"
+            ].data_validations.dataValidation
+        }
+        assert (
+            f'"{",".join(metrics.LEGACY_ACTION_STATUS_CHOICES)}"'
+            in formulas
+        )
+        assert f'"{",".join(metrics.ACTION_STATUS_CHOICES)}"' not in formulas
+    finally:
+        workbook.close()
+
+
+def test_protected_previous_action_master_accepts_legacy_status_contract(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = downgrade_master_to_previous_action_schema(master)
+
+    assert metrics.verify_existing_management_workbook_integrity(
+        master,
+        expected_digest=legacy_digest,
+    ) == legacy_digest
+
+
+def test_current_action_board_rejects_legacy_status_validation(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        status_validation = next(
+            item
+            for item in workbook[
+                "Action Board"
+            ].data_validations.dataValidation
+            if item.formula1 == f'"{",".join(metrics.ACTION_STATUS_CHOICES)}"'
+        )
+        status_validation.formula1 = (
+            f'"{",".join(metrics.LEGACY_ACTION_STATUS_CHOICES)}"'
+        )
+        workbook.save(master)
+    finally:
+        workbook.close()
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="Action Board status list validation is missing or duplicated",
+    ):
+        metrics.validate_management_workbook(master)
 
 
 def test_pre_contract_adoption_rejects_a_manifest_digest_mismatch(
