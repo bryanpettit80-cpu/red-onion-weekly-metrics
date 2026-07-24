@@ -247,7 +247,7 @@ LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS = [
     "Management Setup",
     "Run Notes",
 ]
-VISIBLE_MANAGEMENT_SHEETS = [
+PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS = [
     "Dashboard",
     "Action Focus",
     "Action Board",
@@ -260,6 +260,34 @@ VISIBLE_MANAGEMENT_SHEETS = [
     "Management Setup",
     "Run Notes",
 ]
+VISIBLE_MANAGEMENT_SHEETS = [
+    "How to Use",
+    *PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS,
+]
+MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
+    ("Guide", "How to Use"),
+    ("Dashboard", "Dashboard"),
+    ("Focus", "Action Focus"),
+    ("Actions", "Action Board"),
+    ("Servers", "Server Scorecard"),
+    ("Stores", "Store & Group Scorecards"),
+    ("Movement", "Recent Movement Signals"),
+    ("Evidence", "Evidence Detail"),
+    ("History", "Action History"),
+    ("Quality", "Data Quality"),
+    ("Setup", "Management Setup"),
+    ("Run", "Run Notes"),
+)
+HOW_TO_USE_SECTION_HEADINGS: tuple[str, ...] = (
+    "SCOPE AND PROHIBITED USE",
+    "SIX-STEP WEEKLY WORKFLOW",
+    "REQUIRED EVIDENCE REVIEW",
+    "SIGNAL INTERPRETATION",
+    "ACTION BOARD EDIT SURFACE",
+    "DISPOSITION MEANINGS",
+    "WORKBOOK MAP",
+    "LIMITS, ASSUMPTIONS, AND ESCALATION",
+)
 
 OPERATING_WEEK_START_WEEKDAY = 1  # Tuesday; date.weekday() uses Monday=0.
 OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
@@ -7045,6 +7073,152 @@ def require_pre_contract_list_validations(wb: Workbook) -> None:
             )
 
 
+def workbook_color_suffix(color: Any) -> str | None:
+    value = getattr(color, "rgb", None)
+    return str(value)[-6:].upper() if value else None
+
+
+def require_current_workbook_usability_contract(wb: Workbook) -> None:
+    """Require the exact guide, navigation, and persistent top-bar contract."""
+
+    if not wb.sheetnames or wb.sheetnames[0] != "How to Use":
+        raise IntegrityError("How to Use must be the first worksheet.")
+    guide = wb["How to Use"]
+    if guide.sheet_state != "visible":
+        raise IntegrityError("How to Use must remain visible.")
+    if any(cell.protection.locked is False for cell in guide._cells.values()):
+        raise IntegrityError("How to Use must contain no editable cells.")
+    if guide._charts or guide._images:
+        raise IntegrityError("How to Use must not contain drawings.")
+    if any(cell.comment is not None for cell in guide._cells.values()):
+        raise IntegrityError("How to Use must not contain comments.")
+    if guide.freeze_panes != "A3":
+        raise IntegrityError("How to Use must freeze the title and navigation rows.")
+    if guide.sheet_view.zoomScale != 85:
+        raise IntegrityError("How to Use must use the approved 85% zoom.")
+    for column in range(1, 13):
+        letter = get_column_letter(column)
+        if guide.column_dimensions[letter].width != 13:
+            raise IntegrityError("How to Use must use uniform A:L column widths.")
+    guide_text = {
+        str(cell.value)
+        for cell in guide._cells.values()
+        if cell.value not in (None, "")
+    }
+    missing_headings = [
+        heading for heading in HOW_TO_USE_SECTION_HEADINGS if heading not in guide_text
+    ]
+    if missing_headings:
+        raise IntegrityError(
+            "How to Use is missing required section headings: "
+            + ", ".join(missing_headings)
+        )
+    required_guide_phrases = (
+        MANAGEMENT_METHODOLOGY_VERSION,
+        "never be the sole or determinative basis",
+        "Do not infer protected characteristics from names.",
+        "ExternalCheckRequired",
+        "D — Status",
+        "E — Owner",
+        "F — Due Date",
+        "N — Context Notes",
+        "U — Review Disposition",
+        "V — Reviewed By",
+        "W — Review Date",
+        "Rate of Sale currently assumes lower is better.",
+        "Ticket Time is guest-weighted",
+    )
+    flattened_guide_text = "\n".join(sorted(guide_text))
+    missing_phrases = [
+        phrase for phrase in required_guide_phrases if phrase not in flattened_guide_text
+    ]
+    missing_phrases.extend(
+        choice
+        for choice in (*ACTION_STATUS_CHOICES, *REVIEW_DISPOSITION_CHOICES)
+        if choice not in flattened_guide_text
+    )
+    if missing_phrases:
+        raise IntegrityError(
+            "How to Use is missing required operating guidance: "
+            + ", ".join(missing_phrases)
+        )
+    if "NotChecked" in flattened_guide_text:
+        raise IntegrityError(
+            "How to Use contains obsolete readiness terminology."
+        )
+
+    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
+    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
+        navigation_columns = management_navigation_columns(ws)
+        actual_labels = [
+            ws.cell(row=2, column=column).value
+            for column in navigation_columns
+        ]
+        if actual_labels != expected_labels:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not contain the approved navigation labels."
+            )
+        if any(
+            ws.column_dimensions[get_column_letter(column)].hidden is True
+            for column in navigation_columns
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} navigation must remain fully visible."
+            )
+        if ws.row_dimensions[2].height != 24:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the approved navigation height."
+            )
+        title_merges = [
+            merged
+            for merged in ws.merged_cells.ranges
+            if merged.min_row == merged.max_row == 1
+            and merged.min_col == 1
+            and merged.max_col >= 12
+        ]
+        if len(title_merges) != 1:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} title band must extend through column L."
+            )
+        frozen_at = ws.freeze_panes
+        if hasattr(frozen_at, "coordinate"):
+            frozen_at = frozen_at.coordinate
+        frozen_row_match = re.search(r"\d+", str(frozen_at or ""))
+        if not frozen_row_match or int(frozen_row_match.group()) < 3:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} must retain the title and navigation rows."
+            )
+        for column, (_, target) in zip(
+            navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
+        ):
+            cell = ws.cell(row=2, column=column)
+            expected_target = f"#'{target}'!A1"
+            if cell.hyperlink is None or cell.hyperlink.target != expected_target:
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} has an invalid navigation target."
+                )
+            is_current = target == ws.title
+            if (
+                workbook_color_suffix(cell.fill.fgColor)
+                != ("7A1E1E" if is_current else "F2F2F2")
+                or workbook_color_suffix(cell.font.color)
+                != ("FFFFFF" if is_current else "7A1E1E")
+                or cell.font.bold is not True
+                or cell.font.size != 9
+                or cell.font.underline is not None
+                or cell.alignment.horizontal != "center"
+                or cell.alignment.vertical != "center"
+                or cell.alignment.shrink_to_fit is not True
+                or cell.border.top.style != "thin"
+                or cell.border.bottom.style != "thin"
+                or cell.border.left.style != "thin"
+                or cell.border.right.style != "thin"
+            ):
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} navigation style does not match the contract."
+                )
+
+
 def validate_management_workbook(path: Path, expected_digest: str | None = None) -> str:
     """Validate protection, visibility, editable cells, tables, and digest."""
     reject_unapproved_workbook_drawings(path)
@@ -7058,6 +7232,8 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
         setup, action_board = validate_management_workbook_controls(
             wb, protect_objects_and_scenarios=True
         )
+        if "How to Use" in VISIBLE_MANAGEMENT_SHEETS:
+            require_current_workbook_usability_contract(wb)
         expected_validations = expected_management_list_validations(wb)
         require_exact_validation_count(
             wb, expected_validations, contract_label="strict protection-contract"
@@ -7084,6 +7260,46 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
             "Master workbook generated-content verification failed: "
             f"expected {required_digest or 'a stamped digest'}; actual {actual_digest}. "
             "No outputs were replaced and no active source files were moved."
+        )
+    return actual_digest
+
+
+def validate_pre_guide_management_workbook(path: Path, expected_digest: str) -> str:
+    """Verify the exact protected v0.3.1 workbook before adding the guide."""
+
+    required_digest = str(expected_digest).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
+        raise IntegrityError("The pre-guide workbook requires a valid recorded digest.")
+    reject_unapproved_workbook_drawings(path)
+    wb = load_workbook(path, data_only=False)
+    try:
+        if stamped_workbook_protection_contract(wb) != WORKBOOK_PROTECTION_CONTRACT:
+            raise IntegrityError("The pre-guide workbook protection contract is unsupported.")
+        validate_management_workbook_controls(
+            wb,
+            protect_objects_and_scenarios=True,
+            visible_sheets=PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS,
+        )
+        expected_validations = expected_management_list_validations(wb)
+        require_exact_validation_count(
+            wb, expected_validations, contract_label="pre-guide v0.3.1 schema"
+        )
+        for sheet_name, formula1, allow_blank, sqref, label in expected_validations:
+            require_stop_style_list_validation(
+                wb[sheet_name],
+                formula1=formula1,
+                label=label,
+                allow_blank=allow_blank,
+                sqref=sqref,
+            )
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    actual_digest = workbook_generated_content_sha256(path)
+    if stamped != required_digest or actual_digest != required_digest:
+        raise IntegrityError(
+            "Pre-guide workbook verification failed: the recorded, stamped, and actual "
+            "generated-content digests must match exactly."
         )
     return actual_digest
 
@@ -7198,7 +7414,7 @@ def validate_pre_contract_management_workbook(path: Path, expected_digest: str) 
                 and "Rising & Falling Stars" in wb.sheetnames
                 and "Recent Movement Signals" not in wb.sheetnames
             )
-            else VISIBLE_MANAGEMENT_SHEETS
+            else PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS
             if has_action_focus_schema
             else PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS
         )
@@ -7254,6 +7470,7 @@ def verify_existing_management_workbook_integrity(
         has_action_focus_schema = all(
             name in wb.sheetnames for name in ("Action Focus", "Evidence Detail")
         )
+        has_how_to_use_schema = "How to Use" in wb.sheetnames
         action_headers = (
             {
                 str(cell.value)
@@ -7272,7 +7489,11 @@ def verify_existing_management_workbook_integrity(
         wb.close()
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
         if has_v2_action_schema:
-            return validate_management_workbook(path, expected_digest or stamped)
+            if has_how_to_use_schema:
+                return validate_management_workbook(path, expected_digest or stamped)
+            return validate_pre_guide_management_workbook(
+                path, expected_digest or stamped or ""
+            )
         if has_action_focus_schema:
             return validate_v1_action_focus_workbook(
                 path, expected_digest or stamped or ""
@@ -8004,27 +8225,71 @@ def remove_sheet_if_present(wb: Workbook, name: str) -> None:
         wb.remove(wb[name])
 
 
+def management_navigation_columns(ws) -> tuple[int, ...]:
+    """Return the first 12 operator-visible columns for the persistent top bar."""
+
+    columns: list[int] = []
+    column = 1
+    while len(columns) < len(MANAGEMENT_NAVIGATION_LINKS):
+        letter = get_column_letter(column)
+        if ws.column_dimensions[letter].hidden is not True:
+            columns.append(column)
+        column += 1
+        if column > 256:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} has too few visible columns for navigation."
+            )
+    return tuple(columns)
+
+
 def add_management_navigation(ws) -> None:
-    links = [
-        ("Dashboard", "Dashboard"),
-        ("Focus", "Action Focus"),
-        ("Actions", "Action Board"),
-        ("Servers", "Server Scorecard"),
-        ("Stores", "Store & Group Scorecards"),
-        ("Movement", "Recent Movement Signals"),
-        ("Evidence", "Evidence Detail"),
-        ("Quality", "Data Quality"),
-        ("Setup", "Management Setup"),
-    ]
-    for col, (label, target) in enumerate(links, start=1):
+    neutral_fill = PatternFill("solid", fgColor="F2F2F2")
+    active_fill = PatternFill("solid", fgColor="7A1E1E")
+    navigation_border = Border(
+        left=Side(style="thin", color="B7B7B7"),
+        right=Side(style="thin", color="B7B7B7"),
+        top=Side(style="thin", color="B7B7B7"),
+        bottom=Side(style="thin", color="B7B7B7"),
+    )
+    navigation_columns = management_navigation_columns(ws)
+    content_end_column = max(ws.max_column, navigation_columns[-1])
+    for col, (label, target) in zip(
+        navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
+    ):
         cell = ws.cell(row=2, column=col, value=label)
         cell.hyperlink = f"#'{target}'!A1"
-        cell.font = Font(color="7A1E1E", bold=True, underline="single", size=9)
-        cell.alignment = Alignment(horizontal="center")
+        is_current = target == ws.title
+        cell.fill = active_fill if is_current else neutral_fill
+        cell.font = Font(
+            color="FFFFFF" if is_current else "7A1E1E",
+            bold=True,
+            underline=None,
+            size=9,
+        )
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            shrink_to_fit=True,
+        )
+        cell.border = navigation_border
+    navigation_column_set = set(navigation_columns)
+    for col in range(1, content_end_column + 1):
+        if col in navigation_column_set or ws.column_dimensions[
+            get_column_letter(col)
+        ].hidden is True:
+            continue
+        cell = ws.cell(row=2, column=col)
+        cell.fill = neutral_fill
+        cell.border = Border(
+            top=Side(style="thin", color="B7B7B7"),
+            bottom=Side(style="thin", color="B7B7B7"),
+        )
+    ws.row_dimensions[2].height = 24
 
 
 def style_management_title(ws, title: str, end_col: int) -> None:
     ws.sheet_view.showGridLines = False
+    end_col = max(end_col, len(MANAGEMENT_NAVIGATION_LINKS))
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
     cell = ws.cell(
         row=1,
@@ -8035,6 +8300,368 @@ def style_management_title(ws, title: str, end_col: int) -> None:
     cell.font = Font(color="FFFFFF", bold=True, size=16)
     cell.alignment = Alignment(vertical="center", wrap_text=True)
     ws.row_dimensions[1].height = 42
+
+
+def write_guide_text_row(
+    ws,
+    row: int,
+    text: str,
+    *,
+    height: float = 36,
+    fill_color: str = "FFFFFF",
+    bold: bool = False,
+    font_color: str = "1F1F1F",
+) -> None:
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
+    cell = ws.cell(row=row, column=1, value=text)
+    cell.fill = PatternFill("solid", fgColor=fill_color)
+    cell.font = Font(bold=bold, color=font_color, size=10)
+    cell.alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[row].height = height
+
+
+def write_guide_section_header(ws, row: int, label: str) -> None:
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
+    cell = ws.cell(row=row, column=1, value=label)
+    cell.fill = PatternFill("solid", fgColor="E7E6E6")
+    cell.font = Font(bold=True, color="7A1E1E", size=11)
+    cell.alignment = Alignment(vertical="center")
+    ws.row_dimensions[row].height = 24
+
+
+def write_how_to_use_sheet(wb: Workbook) -> None:
+    """Write the locked start-here guide for the protected management workbook."""
+
+    remove_sheet_if_present(wb, "How to Use")
+    ws = wb.create_sheet("How to Use")
+    style_management_title(ws, "How to Use This Workbook", 12)
+    ws.row_dimensions[1].height = 54
+    for column in range(1, 13):
+        ws.column_dimensions[get_column_letter(column)].width = 13
+    ws.freeze_panes = "A3"
+    ws.sheet_view.zoomScale = 85
+
+    write_guide_section_header(ws, 3, HOW_TO_USE_SECTION_HEADINGS[0])
+    write_guide_text_row(
+        ws,
+        4,
+        (
+            "This workbook is a deterministic, rule-based observational coaching aid. "
+            "It does not determine performance and is not statistically confident, "
+            "predictive, causal, or validated for demographic fairness. A signal may "
+            "never be the sole or determinative basis for discipline, termination, pay, "
+            "promotion, demotion, scheduling, reduced opportunity, training, or a formal "
+            "performance rating."
+        ),
+        height=54,
+        fill_color="FFF2CC",
+        bold=True,
+        font_color="7F6000",
+    )
+    write_guide_text_row(
+        ws,
+        5,
+        (
+            f"Methodology {MANAGEMENT_METHODOLOGY_VERSION}. "
+            f"{MANAGEMENT_SIGNAL_DISCLAIMER}"
+        ),
+        height=30,
+        fill_color="F3F4F6",
+    )
+
+    write_guide_section_header(ws, 6, HOW_TO_USE_SECTION_HEADINGS[1])
+    workflow_steps = (
+        (
+            "1. Read LAST RUN STATUS.txt. Ready means verified within that run's stated "
+            "local scope. Attention means stop. NotEvaluated makes no verification claim. "
+            "Use Outcome and Stage to confirm whether the run completed. "
+            "ExternalCheckRequired means the local run does not evaluate that external "
+            "assurance; independent recovery still requires a separate check."
+        ),
+        (
+            "2. Open Data Quality and confirm the latest Tuesday–Sunday week is complete, "
+            "reconciled, and free of unresolved source or identity problems."
+        ),
+        (
+            "3. Read Dashboard for aggregate context only. Do not make a person-level "
+            "decision from a dashboard card."
+        ),
+        (
+            "4. Use Action Focus to triage current items, then click Open in Action Board."
+        ),
+        (
+            "5. Review Evidence Detail, Server Scorecard, Recent Movement Signals, and "
+            "store context before choosing a disposition."
+        ),
+        (
+            "6. Complete the blue Action Board fields. Track follow-up; completed or "
+            "dismissed items move to Action History on the next successful run."
+        ),
+    )
+    for row, step in enumerate(workflow_steps, start=7):
+        write_guide_text_row(ws, row, step, height=42 if row in {7, 8, 11, 12} else 36)
+
+    write_guide_section_header(ws, 13, HOW_TO_USE_SECTION_HEADINGS[2])
+    required_review_rows = (
+        "Before dispositioning a generated row, verify:",
+        "• Source date, identity, location, completeness, and reconciliation",
+        "• Latest sample and peer-reference sufficiency",
+        (
+            "• Shift, daypart, section, party mix, staffing, event, training, tenure, "
+            "or menu context that could explain the result"
+        ),
+        "• Recurring metric drivers and leave-one-active-day stability",
+        "• Independent manager observations supporting any coaching or recognition",
+        "Do not infer protected characteristics from names.",
+    )
+    for row, text in enumerate(required_review_rows, start=14):
+        write_guide_text_row(
+            ws,
+            row,
+            text,
+            height=42 if row == 17 else 30,
+            fill_color="FCE8E6" if row == 20 else "FFFFFF",
+            bold=row in {14, 20},
+            font_color="9C0006" if row == 20 else "1F1F1F",
+        )
+
+    write_guide_section_header(ws, 21, HOW_TO_USE_SECTION_HEADINGS[3])
+    signal_rows = (
+        "Not Evaluated or Reference Unavailable — gates were not met; no prompt.",
+        "Context Review — investigate context only; this is not a coaching conclusion.",
+        (
+            "Coaching Prompt — second consecutive aligned qualified signal with a "
+            "recurring driver and stability; human corroboration is still required."
+        ),
+        (
+            "Recognition Prompt — the same persistence and stability requirements apply; "
+            "human corroboration is still required."
+        ),
+        (
+            "Monitor — observe another qualified period; no action quota exists. "
+            "Management targets and displayed rank are context only and cannot create "
+            "or change a person-level prompt."
+        ),
+    )
+    for row, text in enumerate(signal_rows, start=22):
+        write_guide_text_row(ws, row, text, height=42 if row >= 24 else 36)
+
+    write_guide_section_header(ws, 27, HOW_TO_USE_SECTION_HEADINGS[4])
+    write_guide_text_row(
+        ws,
+        28,
+        (
+            "Blue cells are the only editable cells. Do not alter generated fields, "
+            "formulas, technical sheets, or raw evidence."
+        ),
+        height=30,
+        fill_color="D9EAF7",
+        bold=True,
+        font_color="1F4E78",
+    )
+    ws.merge_cells("A29:B29")
+    ws.merge_cells("C29:L29")
+    ws["A29"] = "Field"
+    ws["C29"] = "Rule"
+    for cell in (ws["A29"], ws["C29"]):
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[29].height = 24
+    editable_fields = (
+        (
+            "D — Status",
+            (
+                "Generated rows start Review Needed. Open may remain pending. In Progress, "
+                "Blocked, Complete, and Dismissed require completed review fields."
+            ),
+        ),
+        ("E — Owner", "Select an active roster member or leave blank."),
+        ("F — Due Date", "Enter a real date or leave blank."),
+        (
+            "N — Context Notes",
+            "Record only the minimum information needed to explain the decision.",
+        ),
+        (
+            "U — Review Disposition",
+            "Use one of the exact approved choices in Disposition Meanings below.",
+        ),
+        (
+            "V — Reviewed By",
+            "Required for a completed disposition and must name an active roster member.",
+        ),
+        ("W — Review Date", "Required for a completed disposition."),
+    )
+    for row, (field, rule) in enumerate(editable_fields, start=30):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=12)
+        ws.cell(row=row, column=1, value=field).font = Font(bold=True, color="1F4E78")
+        ws.cell(row=row, column=3, value=rule)
+        for col in (1, 3):
+            cell = ws.cell(row=row, column=col)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7" if col == 1 else "FFFFFF")
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row].height = 42 if row == 30 else 36
+
+    write_guide_section_header(ws, 37, HOW_TO_USE_SECTION_HEADINGS[5])
+    disposition_descriptions = {
+        "Pending Review": "review is incomplete",
+        "Coaching Accepted": (
+            "independent manager review supports a coaching conversation"
+        ),
+        "Recognition Accepted": "independent manager review supports recognition",
+        "Context Explains": "operating or assignment context explains the signal",
+        "Data Issue": (
+            "source, identity, metric, or lineage problem; stop and escalate for correction"
+        ),
+        "Monitor": "no action now; watch a later qualified week",
+    }
+    for row, disposition in enumerate(REVIEW_DISPOSITION_CHOICES, start=38):
+        write_guide_text_row(
+            ws,
+            row,
+            f"{disposition} — {disposition_descriptions[disposition]}.",
+            height=36,
+        )
+
+    write_guide_section_header(ws, 44, HOW_TO_USE_SECTION_HEADINGS[6])
+    for start_col, end_col, value in (
+        (1, 2, "Sheet"),
+        (3, 10, "Purpose"),
+        (11, 12, "Editable?"),
+    ):
+        ws.merge_cells(
+            start_row=45,
+            start_column=start_col,
+            end_row=45,
+            end_column=end_col,
+        )
+        cell = ws.cell(row=45, column=start_col, value=value)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[45].height = 24
+    workbook_map = (
+        (
+            "How to Use",
+            "start-here workflow, interpretation, controls, and limitations",
+            "No — locked",
+        ),
+        ("Dashboard", "aggregate weekly brief", "No — locked"),
+        ("Action Focus", "current queue and links to Action Board", "No — locked"),
+        (
+            "Action Board",
+            "review and task tracking",
+            "Yes — seven blue fields only",
+        ),
+        (
+            "Server Scorecard",
+            "person-level sample, peer, movement, and evidence context",
+            "No — locked",
+        ),
+        (
+            "Store & Group Scorecards",
+            "operational context only",
+            "No — locked",
+        ),
+        (
+            "Recent Movement Signals",
+            "descriptive changes, not statistical significance",
+            "No — locked",
+        ),
+        (
+            "Evidence Detail",
+            (
+                "evidence weeks, cohort, threshold, stability, and methodology; exact "
+                "raw lineage stays hidden and protected for export and audit"
+            ),
+            "No — locked",
+        ),
+        (
+            "Action History",
+            "preserved closed and dismissed items",
+            "No — locked",
+        ),
+        (
+            "Data Quality",
+            "completeness, reconciliation, source provenance, and owner warnings",
+            "No — locked",
+        ),
+        (
+            "Management Setup",
+            "custodian-maintained store targets and owner roster",
+            "Yes — blue cells only",
+        ),
+        (
+            "Run Notes",
+            "release, integrity, methodology, and source-assumption audit trail",
+            "No — locked",
+        ),
+    )
+    for row, (sheet_name, purpose, editable) in enumerate(workbook_map, start=46):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=10)
+        ws.merge_cells(start_row=row, start_column=11, end_row=row, end_column=12)
+        sheet_cell = ws.cell(row=row, column=1, value=sheet_name)
+        sheet_cell.hyperlink = f"#'{sheet_name}'!A1"
+        sheet_cell.font = Font(bold=True, color="7A1E1E", underline=None)
+        ws.cell(row=row, column=3, value=purpose)
+        ws.cell(row=row, column=11, value=editable)
+        for col in (1, 3, 11):
+            cell = ws.cell(row=row, column=col)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row].height = (
+            42 if sheet_name in {
+                "How to Use",
+                "Server Scorecard",
+                "Recent Movement Signals",
+                "Evidence Detail",
+                "Data Quality",
+                "Management Setup",
+                "Run Notes",
+            }
+            else 36
+        )
+
+    write_guide_section_header(ws, 58, HOW_TO_USE_SECTION_HEADINGS[7])
+    limit_rows = (
+        (
+            "Rate of Sale currently assumes lower is better. Ticket Time is guest-weighted "
+            "because ticket/check count is unavailable. These are action-driving business "
+            "assumptions pending source-owner confirmation."
+        ),
+        (
+            "The source does not observe assignment and equal-opportunity context. Correct "
+            "bad source data through the protected run; do not rewrite prior evidence."
+        ),
+        (
+            "Record context or methodology disagreements without deleting the original "
+            "signal."
+        ),
+        (
+            "Evidence export or sharing remains a separate manual, exact-fingerprint "
+            "approval workflow."
+        ),
+        (
+            "Restricted employee-performance information must remain limited to authorized "
+            "users."
+        ),
+    )
+    for row, text in enumerate(limit_rows, start=59):
+        write_guide_text_row(
+            ws,
+            row,
+            text,
+            height=42 if row in {59, 60} else 36,
+            fill_color="FFF2CC" if row == 59 else "FFFFFF",
+        )
+
+    ws.print_area = "A1:L63"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_options.horizontalCentered = True
 
 
 def write_management_setup_sheet(
@@ -8204,7 +8831,7 @@ def write_management_setup_sheet(
     ws.add_data_validation(active_validation)
     active_validation.add(f"B{roster_header_row + 1}:B{roster_last_row}")
 
-    widths = {"A": 30, "B": 18, "C": 18, "D": 22, "E": 30, "F": 16, "G": 22}
+    widths = {"A": 30, "B": 18, "C": 18, "D": 25, "E": 48, "F": 16, "G": 22}
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
@@ -8485,7 +9112,7 @@ def write_action_focus_sheet(
         ws.add_table(table)
     for column, width in {
         "A": 12,
-        "B": 14,
+        "B": 15,
         "C": 18,
         "D": 13,
         "E": 20,
@@ -8496,7 +9123,7 @@ def write_action_focus_sheet(
         "J": 50,
         "K": 44,
         "L": 12,
-        "M": 19,
+        "M": 21,
     }.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "E6"
@@ -8521,6 +9148,27 @@ def write_evidence_detail_sheet(
     remove_sheet_if_present(wb, "Evidence Detail")
     ws = wb.create_sheet("Evidence Detail")
     style_management_title(ws, "Evidence Detail", len(EVIDENCE_DETAIL_HEADERS))
+    ws.merge_cells(
+        start_row=3,
+        start_column=1,
+        end_row=3,
+        end_column=len(EVIDENCE_DETAIL_HEADERS),
+    )
+    ws.cell(
+        row=3,
+        column=1,
+        value=(
+            "Operator view: exact raw Evidence Sources and Metric Evidence columns are "
+            "hidden. Their protected values remain unchanged for carry-forward, approved "
+            "evidence export, and audit."
+        ),
+    )
+    ws.cell(row=3, column=1).fill = PatternFill("solid", fgColor="D9EAF7")
+    ws.cell(row=3, column=1).font = Font(bold=True, color="1F4E78")
+    ws.cell(row=3, column=1).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[3].height = 36
     evidence_by_action: dict[str, dict[str, Any]] = {}
     for action in [*action_history, *current_actions]:
         action_id = str(action.get("Action ID") or "")
@@ -8540,6 +9188,7 @@ def write_evidence_detail_sheet(
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    ws.row_dimensions[header_row].height = 42
     board_rows = {
         str(row.get("Action ID")): index
         for index, row in enumerate(current_actions, start=5)
@@ -8551,7 +9200,14 @@ def write_evidence_detail_sheet(
             cell.alignment = Alignment(
                 vertical="top",
                 wrap_text=header
-                in {"Evidence Sources", "Metric Evidence", "Evidence Week Ends"},
+                in {
+                    "Evidence Week Ends",
+                    "Comparator Type",
+                    "Evidence Status",
+                    "Recurring Drivers",
+                    "Stability Result",
+                    "Review Disposition",
+                },
             )
             if header in {"Due Date", "Last Seen", "Review Date"}:
                 cell.number_format = "m/d/yyyy"
@@ -8561,7 +9217,23 @@ def write_evidence_detail_sheet(
             evidence_cell = ws.cell(row=row_index, column=1)
             evidence_cell.hyperlink = f"#'Action Board'!C{target_row}"
             evidence_cell.style = "Hyperlink"
-        ws.row_dimensions[row_index].height = 72
+        visible_lengths = [
+            len(str(action.get(header) or ""))
+            for header in (
+                "Evidence Week Ends",
+                "Comparator Type",
+                "Evidence Status",
+                "Recurring Drivers",
+                "Stability Result",
+                "Review Disposition",
+            )
+        ]
+        ws.row_dimensions[row_index].height = (
+            90
+            if max(visible_lengths, default=0) >= 100
+            or sum(visible_lengths) >= 260
+            else 75
+        )
     if rows:
         table = Table(
             displayName="ManagementEvidenceDetail",
@@ -8597,6 +9269,10 @@ def write_evidence_detail_sheet(
     }
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
+    for header in ("Evidence Sources", "Metric Evidence"):
+        ws.column_dimensions[
+            get_column_letter(EVIDENCE_DETAIL_HEADERS.index(header) + 1)
+        ].hidden = True
     for header, width in {
         "Comparator Type": 34,
         "Peer Cohort Size": 16,
@@ -8653,8 +9329,8 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
     ws = write_table_sheet(
         wb, "Server Scorecard", headers, data, "ServerScorecard",
         widths={
-            "A": 24, "B": 20, "C": 24, "D": 22, "E": 16, "F": 20,
-            "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
+            "A": 24, "B": 20, "C": 24, "D": 22, "E": 21, "F": 23,
+            "G": 23, "H": 22, "I": 54, "J": 40, "K": 40, "L": 48,
         },
     )
     style_management_title(ws, "Server Scorecard", len(headers))
@@ -8719,7 +9395,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
         data,
         "RecentMovementSignalsV3",
         widths={
-            "A": 15, "B": 24, "C": 20, "D": 24, "E": 22, "F": 20,
+            "A": 26, "B": 24, "C": 20, "D": 24, "E": 22, "F": 23,
             "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
         },
     )
@@ -9112,9 +9788,9 @@ def write_management_data_quality_sheet(
         "A": 44,
         "B": 16,
         "C": 34,
-        "D": 12,
+        "D": 13,
         "E": 16,
-        "F": 68,
+        "F": 69,
         "G": 30,
         "H": 14,
     }.items():
@@ -9635,6 +10311,8 @@ def write_management_run_notes(
     style_management_title(ws, "Red Onion Server Master", 2)
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 96
+    ws.freeze_panes = "A3"
+    ws.sheet_view.zoomScale = 85
     report_audit = config.get("_report_audit", {})
     integrity = config.get("_integrity", {})
     provenance = integrity.get("provenance", {})
@@ -9680,7 +10358,11 @@ def write_management_run_notes(
     for row, (label, value) in enumerate(note_rows, start=4):
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 45 if label == "8-Week Direction" else 30
+        ws.row_dimensions[row].height = (
+            45
+            if label in {"8-Week Direction", "Peer Comparison", "Signal Scoring"}
+            else 30
+        )
 
 
 def protect_worksheet(ws, password: str) -> None:
@@ -9713,6 +10395,7 @@ def finalize_management_workbook(wb: Workbook) -> None:
     wb._sheets = ordered
     wb.active = 0
     tab_colors = {
+        "How to Use": "FFD966",
         "Dashboard": "7A1E1E", "Action Focus": "C00000",
         "Action Board": "C00000", "Server Scorecard": "5B9BD5",
         "Store & Group Scorecards": "70AD47", "Recent Movement Signals": "FFC000",
@@ -9783,7 +10466,7 @@ def write_master_workbook(
             remove_sheet_if_present(wb, "_Data Quality Detail")
             wb["Data Quality"].title = "_Data Quality Detail"
         for name in (
-            "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars",
+            "How to Use", "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars",
             "Recent Movement Signals", "Run Notes",
             "Server Scorecard", "Store & Group Scorecards", "Action History", "Management Setup",
             "Evidence Detail",
@@ -9828,6 +10511,7 @@ def write_master_workbook(
             wb, records, weekly_location_rows, weekly_group_rows, visible_server_rows,
             store_rows, group_rows, current_actions, config, readiness,
         )
+        write_how_to_use_sheet(wb)
         finalize_management_workbook(wb)
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
@@ -11643,6 +12327,10 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 args,
                 RunStage.PUBLISHING,
                 "Staged workbooks validated; rechecking inputs and publishing exact bytes.",
+                readiness={
+                    "workbook": RunReadiness.READY,
+                    "distribution": RunReadiness.RUNNING,
+                },
             )
             if not rebuild_from_history:
                 verify_captured_active_inputs(active_captures, input_dir)
@@ -11767,7 +12455,19 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 new_manifest_hash,
                 anchor_dir,
             )
+            # The manifest and trusted anchor now form the committed state. Any later
+            # status-reporting or intake-cleanup failure must not roll back outputs while
+            # leaving the independently stored anchor pointed at a removed manifest.
             manifest_committed = True
+            record_run_stage(
+                args,
+                RunStage.COMMITTING_MANIFEST,
+                (
+                    "Integrity manifest and trusted anchor verified; exact local "
+                    "publication is complete."
+                ),
+                readiness={"distribution": RunReadiness.READY},
+            )
             if not rebuild_from_history:
                 quarantine_and_delete_captured_inputs(
                     active_captures, active_copies, input_dir, run_id
@@ -11835,6 +12535,46 @@ def parse_json_cell(value: Any, *, label: str, expected_type: type) -> Any:
     return parsed
 
 
+def validate_v2_management_evidence_workbook(
+    workbook_path: Path,
+    expected_digest: str,
+) -> str:
+    """Accept only current or protected pre-guide workbooks with the V2 action schema."""
+
+    wb = load_workbook(workbook_path, data_only=False)
+    try:
+        protection_contract = stamped_workbook_protection_contract(wb)
+        action_headers = (
+            {
+                str(cell.value)
+                for cell in wb["Action Board"][4]
+                if cell.value is not None
+            }
+            if "Action Board" in wb.sheetnames
+            else set()
+        )
+        has_v2_action_schema = {
+            "Context Notes",
+            "Review Disposition",
+            "Evidence Status",
+        }.issubset(action_headers)
+        has_guide = "How to Use" in wb.sheetnames
+    finally:
+        wb.close()
+
+    if (
+        protection_contract != WORKBOOK_PROTECTION_CONTRACT
+        or not has_v2_action_schema
+    ):
+        raise IntegrityError(
+            "Management Evidence Package V2 requires the protected V2 action schema; "
+            "legacy workbook evidence cannot be relabeled or promoted as V2."
+        )
+    if has_guide:
+        return validate_management_workbook(workbook_path, expected_digest)
+    return validate_pre_guide_management_workbook(workbook_path, expected_digest)
+
+
 def verified_evidence_source(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Path]:
@@ -11871,7 +12611,7 @@ def verified_evidence_source(
         raise IntegrityError(
             "The current manifest does not record a management workbook digest."
         )
-    validate_management_workbook(workbook_path, expected_digest)
+    validate_v2_management_evidence_workbook(workbook_path, expected_digest)
     wb = load_workbook(workbook_path, data_only=False)
     try:
         allowed_reviewers = (
@@ -12230,6 +12970,7 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
     integrity_status = "Attention"
     integrity_detail = "Archive and finished-report folders must exist."
     latest_manifest: Path | None = None
+    verified_manifest_payload: dict[str, Any] = {}
     if archive_dir.is_dir() and output_dir.is_dir() and config is not None:
         try:
             latest_manifest = latest_integrity_manifest_path(archive_dir)
@@ -12248,7 +12989,7 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
                 raise IntegrityError(
                     "The latest manifest does not match the machine-local trusted head."
                 )
-            _, verified_sha256 = verify_integrity_state(
+            verified_manifest_payload, verified_sha256 = verify_integrity_state(
                 archive_dir, output_dir, latest_manifest
             )
             if not secrets.compare_digest(verified_sha256, anchored_sha256):
@@ -12262,6 +13003,53 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             integrity_detail = str(exc)
     add("Integrity", integrity_status, integrity_detail)
+
+    recorded_master_digest = verified_manifest_payload.get(
+        "master_generated_content_sha256"
+    )
+    workbook_status = (
+        "Ready"
+        if integrity_status == "Ready"
+        and isinstance(recorded_master_digest, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", recorded_master_digest)
+        else "Attention"
+    )
+    workbook_detail = (
+        "Protected generated master content matches the manifest-recorded digest."
+        if workbook_status == "Ready"
+        else (
+            "The verified manifest does not record a protected management workbook."
+            if integrity_status == "Ready"
+            else integrity_detail
+        )
+    )
+    add("Workbook", workbook_status, workbook_detail)
+
+    published_inventory = verified_manifest_payload.get(
+        "published_output_inventory"
+    )
+    publication_status = (
+        "Ready"
+        if workbook_status == "Ready"
+        and isinstance(published_inventory, list)
+        and bool(published_inventory)
+        else "Attention"
+    )
+    publication_detail = (
+        "Exact managed per-location workbook bytes and protected generated master "
+        f"content are verified by {latest_manifest.name}."
+        if publication_status == "Ready" and latest_manifest is not None
+        else (
+            "The verified manifest does not record managed per-location published workbooks."
+            if integrity_status == "Ready"
+            else integrity_detail
+        )
+    )
+    add(
+        "Local publication",
+        publication_status,
+        publication_detail,
+    )
 
     overall = (
         "Ready"
@@ -12288,17 +13076,21 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "workbook": (
                 RunReadiness.READY.value
-                if integrity_status == "Ready"
+                if workbook_status == "Ready"
                 else RunReadiness.ATTENTION.value
             ),
-            "distribution": RunReadiness.NOT_EVALUATED.value,
-            "recovery": RunReadiness.NOT_CHECKED.value,
+            "distribution": (
+                RunReadiness.READY.value
+                if publication_status == "Ready"
+                else RunReadiness.ATTENTION.value
+            ),
+            "recovery": RunReadiness.EXTERNAL_CHECK_REQUIRED.value,
         },
         "latest_manifest": latest_manifest.name if latest_manifest else None,
         "checks": checks,
         "note": (
-            "Independent Google Drive backup freshness is NotChecked by this local, "
-            "read-only command."
+            "Independent Google Drive backup freshness and restore-test evidence require "
+            "a separate external verification; this local command does not access Drive."
         ),
     }
 
@@ -12307,7 +13099,10 @@ def print_health_check(payload: dict[str, Any]) -> None:
     print(f"Red Onion health: {payload['overall']}")
     for check in payload["checks"]:
         print(f"  [{check['status']}] {check['name']}: {check['detail']}")
-    print(f"  [NotChecked] Recovery: {payload['note']}")
+    print(
+        "  "
+        f"[{payload['readiness']['recovery']}] Independent recovery: {payload['note']}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

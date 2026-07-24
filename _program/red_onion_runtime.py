@@ -29,6 +29,7 @@ class RunReadiness(str, Enum):
     READY = "Ready"
     ATTENTION = "Attention"
     NOT_CHECKED = "NotChecked"
+    EXTERNAL_CHECK_REQUIRED = "ExternalCheckRequired"
 
 
 def utc_now() -> str:
@@ -122,7 +123,7 @@ class RunAttemptRecorder:
             "integrity": RunReadiness.RUNNING.value,
             "workbook": RunReadiness.NOT_EVALUATED.value,
             "distribution": RunReadiness.NOT_EVALUATED.value,
-            "recovery": RunReadiness.NOT_CHECKED.value,
+            "recovery": RunReadiness.EXTERNAL_CHECK_REQUIRED.value,
         }
     )
     message: str = "Configuration validated."
@@ -155,10 +156,40 @@ class RunAttemptRecorder:
             f"Finished (UTC): {payload['completed_at_utc'] or 'Still running'}",
             f"Message: {payload['message']}",
             "",
-            "Readiness:",
+            "Run verification:",
         ]
-        for name, value in payload["readiness"].items():
-            lines.append(f"  {name.title()}: {value}")
+        labels = {
+            "release": "Release",
+            "integrity": "Integrity",
+            "workbook": "Workbook",
+            "distribution": "Local publication",
+        }
+        for name in ("release", "integrity", "workbook", "distribution"):
+            lines.append(
+                f"  {labels[name]}: {payload['readiness'].get(name, RunReadiness.NOT_EVALUATED.value)}"
+            )
+        lines.extend(
+            [
+                "",
+                "External assurance:",
+                (
+                    "  Independent recovery: "
+                    f"{payload['readiness'].get('recovery', RunReadiness.EXTERNAL_CHECK_REQUIRED.value)}"
+                ),
+                (
+                    "    Verify the current independent backup and restore-test evidence "
+                    "separately; the local weekly run does not access Google Drive."
+                ),
+                "",
+                (
+                    "Scope: Local publication verifies exact bytes for managed per-location "
+                    "workbooks plus the protected generated content of the master workbook "
+                    "in the configured 02 Finished Reports folder. It does not verify approved "
+                    "editable master values, LAST RUN STATUS.txt, Dropbox cloud sync, or "
+                    "recipient access."
+                ),
+            ]
+        )
         return "\n".join(lines)
 
     def write(self) -> None:
@@ -193,11 +224,8 @@ class RunAttemptRecorder:
         self.stage = RunStage.COMPLETE
         self.message = safe_message(message)
         self.readiness["integrity"] = RunReadiness.READY.value
-        self.readiness["workbook"] = (
-            RunReadiness.READY.value
-            if self.operation == "weekly-run"
-            else RunReadiness.NOT_EVALUATED.value
-        )
+        if self.operation in {"weekly-run", "history-rebuild"}:
+            self.readiness["workbook"] = RunReadiness.READY.value
         if details:
             self.details.update(dict(details))
         self.write()
@@ -213,4 +241,6 @@ class RunAttemptRecorder:
                 "workbook": RunReadiness.ATTENTION.value,
             }
         )
+        if self.readiness.get("distribution") == RunReadiness.RUNNING.value:
+            self.readiness["distribution"] = RunReadiness.ATTENTION.value
         self.write()

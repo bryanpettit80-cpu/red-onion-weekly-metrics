@@ -65,7 +65,8 @@ Excel temporary files whose names start with `~$` are ignored.
 02 Finished Reports\LAST RUN STATUS.txt
 ```
 
-- The master workbook opens to a management dashboard with current KPIs, store and group trends, recent movement signals, and a guarded management-review queue.
+- The master workbook opens to a protected `How to Use` guide with the weekly workflow, signal meanings, required evidence review, editable-field rules, prohibited uses, and links to every visible sheet.
+- Every visible sheet uses the same Guide-to-Run navigation order and highlights the current sheet.
 - `Action Focus` presents current context reviews and coaching/recognition prompts and links each row back to the editable `Action Board`.
 - `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, peer-reference details, metric inputs, stability results, review disposition, and methodology version.
 - Person-level signals require at least 25 guests, 3 active days, 2 prior full self-weeks, and 50 prior-period guests.
@@ -76,6 +77,15 @@ Excel temporary files whose names start with `~$` are ignored.
 ```text
 03 Archive\processed-daily-reports\week-ending-YYYY-MM-DD\
 ```
+
+`LAST RUN STATUS.txt` separates run-scoped verification from external
+assurance. `Local publication: Ready` means the exact managed per-location
+workbook bytes and the protected generated content of the master workbook in
+the configured `02 Finished Reports` folder match the committed manifest. It
+does not cover approved editable master values, `LAST RUN STATUS.txt`, Dropbox
+cloud synchronization, or recipient access. Independent recovery remains
+`ExternalCheckRequired` until the current private backup and restore-test
+evidence are verified outside the weekly runner.
 
 The master workbook reads historical daily reports only from the canonical `processed-daily-reports` folder plus active files in the drop folder. Semantically identical same-date reports are counted once even when their file formats or bytes differ. Conflicting same-date reports stop the run before workbooks are created or active files are moved.
 
