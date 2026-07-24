@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from openpyxl import load_workbook
+import pytest
 
 import red_onion_weekly_metrics as metrics
 from red_onion_integrity import read_json_manifest
@@ -159,3 +160,45 @@ def test_history_rebuild_ignores_active_intake_and_commits_one_manifest(
     assert payload["details"]["history_week_end"] == week_end.isoformat()
     assert max(master_record_dates) == week_end
     assert partial_date not in master_record_dates
+
+
+def test_history_rebuild_requires_history_for_every_configured_location(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    args = rebuild_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    week_end = date(2026, 7, 19)
+    raw_week = (
+        archive_dir
+        / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
+        / f"week-ending-{week_end.isoformat()}"
+    )
+    raw_week.mkdir(parents=True)
+    report_records: dict[str, list[metrics.MetricRecord]] = {}
+    for offset in range(metrics.OPERATING_WEEK_DAYS):
+        report_date = week_end - timedelta(
+            days=metrics.OPERATING_WEEK_DAYS - 1 - offset
+        )
+        filename = f"Daily Report {report_date.isoformat()}.xls"
+        (raw_week / filename).write_bytes(f"history-{report_date}".encode())
+        report_records[filename] = [
+            record
+            for record in reconciled_day(report_date, filename)
+            if record.location == "RC Richmond"
+        ]
+
+    monkeypatch.setattr(
+        metrics,
+        "parse_daily_report",
+        lambda path, config: report_records[path.name],
+    )
+    baseline_args = Namespace(**vars(args))
+    baseline_args.initialize_integrity_baseline = True
+    metrics.run(baseline_args)
+    args.rebuild_from_history = True
+
+    with pytest.raises(ValueError, match="Missing all history for: RC Virginia Beach"):
+        metrics.run(args)
+
+    assert not Path(args.output_dir).exists()

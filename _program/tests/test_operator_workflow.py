@@ -694,6 +694,51 @@ def test_action_tracking_carries_manual_fields_and_moves_cleared_items_to_histor
     assert history[0]["Signal State"] == "Cleared"
 
 
+def test_new_evidence_resets_a_recurring_action_to_review_needed() -> None:
+    signal = {
+        "Entity Key": "server|richmond|server one|coaching",
+        "Evidence ID": "EVIDENCE-ONE",
+        "Priority": "Medium",
+        "Location": "RC Richmond",
+        "Person / Area": "Server One",
+        "Action": "Coaching Prompt",
+        "Signal": "Downward / Below Peer Reference",
+        "Why It Matters": "Watch: check average",
+        "Recommended Next Step": "Review comparable work context.",
+        "Peer Comparison": "Below Peer Reference",
+        "Recent Movement": "Downward",
+        "Evidence Status": "Stable",
+        "Last Seen": date(2026, 6, 21),
+    }
+    current, _ = metrics.merge_management_actions([signal], {})
+    current[0].update(
+        {
+            "Status": "In Progress",
+            "Owner": "Pat Manager",
+            "Review Disposition": "Coaching Accepted",
+            "Reviewed By": "Pat Manager",
+            "Review Date": date(2026, 6, 23),
+        }
+    )
+    changed_signal = {
+        **signal,
+        "Evidence ID": "EVIDENCE-TWO",
+        "Last Seen": date(2026, 6, 28),
+    }
+
+    carried, _ = metrics.merge_management_actions(
+        [changed_signal],
+        {"active_actions": current, "action_history": []},
+    )
+
+    assert carried[0]["Action ID"] == current[0]["Action ID"]
+    assert carried[0]["Status"] == "Review Needed"
+    assert carried[0]["Owner"] == "Pat Manager"
+    assert carried[0]["Review Disposition"] == "Pending Review"
+    assert carried[0]["Reviewed By"] == ""
+    assert carried[0]["Review Date"] is None
+
+
 def test_action_episode_id_uses_stable_sha256_identifier() -> None:
     action_id = metrics.action_episode_id(
         "server|richmond|server one|coaching", date(2026, 6, 21)

@@ -363,6 +363,11 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(
                 "management_peer_reference.leave_one_person_out must be boolean."
             )
+        if effective_peer["leave_one_person_out"] is not True:
+            raise ConfigError(
+                "management_peer_reference.leave_one_person_out must be true for "
+                "methodology 2026.07-v2."
+            )
 
     if "management_signal_persistence" in payload:
         persistence = _require_mapping(
@@ -392,6 +397,11 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(effective_persistence[field], bool):
                 raise ConfigError(
                     f"management_signal_persistence.{field} must be boolean."
+                )
+            if effective_persistence[field] is not True:
+                raise ConfigError(
+                    f"management_signal_persistence.{field} must be true for "
+                    "methodology 2026.07-v2."
                 )
 
     if "management_threshold_calibration" in payload:

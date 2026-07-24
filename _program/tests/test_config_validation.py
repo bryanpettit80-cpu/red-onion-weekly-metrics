@@ -106,6 +106,30 @@ def test_partial_config_is_deep_merged(tmp_path: Path) -> None:
             {"management_materiality": {"sales_pct": 1.5}},
             "management_materiality.sales_pct cannot exceed 1",
         ),
+        (
+            {
+                "management_peer_reference": {
+                    "leave_one_person_out": False,
+                }
+            },
+            "leave_one_person_out must be true",
+        ),
+        (
+            {
+                "management_signal_persistence": {
+                    "require_recurring_driver": False,
+                }
+            },
+            "require_recurring_driver must be true",
+        ),
+        (
+            {
+                "management_signal_persistence": {
+                    "require_leave_one_active_day_stability": False,
+                }
+            },
+            "require_leave_one_active_day_stability must be true",
+        ),
     ],
 )
 def test_invalid_config_is_rejected(

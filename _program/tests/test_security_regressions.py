@@ -302,6 +302,19 @@ def test_data_quality_coverage_rejects_extreme_ranges_without_iteration() -> Non
         )
 
 
+def test_duplicate_signature_distinguishes_unavailable_metrics_from_real_zero() -> None:
+    available = make_record(date(2026, 7, 18))
+    unavailable = replace(
+        available,
+        rate_available=False,
+        ticket_time_available=False,
+    )
+
+    assert metrics.semantic_report_signature([available]) != (
+        metrics.semantic_report_signature([unavailable])
+    )
+
+
 def test_run_rejects_excessive_history_span_before_writes_or_moves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

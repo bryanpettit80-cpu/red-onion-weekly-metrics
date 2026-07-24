@@ -1179,6 +1179,8 @@ def semantic_report_signature(records: list[MetricRecord]) -> tuple[tuple[Any, .
                 normalized_number(record.wine_sales),
                 normalized_number(record.rate_of_sale_by_guest_count),
                 normalized_number(record.average_ticket_time_seconds),
+                bool(record.rate_available),
+                bool(record.ticket_time_available),
             )
             for record in records
         )
@@ -5833,6 +5835,8 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
 
 def validate_action_board_records(
     records: list[dict[str, Any]],
+    *,
+    allowed_reviewers: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Normalize legacy headers and reject pasted workflow values that bypass Excel."""
     canonical_statuses = {
@@ -5843,6 +5847,15 @@ def validate_action_board_records(
         disposition.casefold(): disposition
         for disposition in REVIEW_DISPOSITION_CHOICES
     }
+    allowed_reviewer_keys = (
+        {
+            str(reviewer).strip().casefold()
+            for reviewer in allowed_reviewers
+            if str(reviewer).strip()
+        }
+        if allowed_reviewers is not None
+        else None
+    )
     allowed_text = ", ".join(ACTION_STATUS_CHOICES)
     for row_number, record in enumerate(records, start=5):
         legacy_schema = "Manager Notes" in record and "Context Notes" not in record
@@ -5901,6 +5914,16 @@ def validate_action_board_records(
                     f"Action {action_id!r} cannot move to {canonical_status} until "
                     "Review Disposition, Reviewed By, and Review Date are complete. "
                     "No workbooks were created and no source files were moved."
+                )
+            if (
+                allowed_reviewer_keys is not None
+                and reviewer.casefold() not in allowed_reviewer_keys
+            ):
+                action_id = str(record.get("Action ID") or f"row {row_number}")
+                raise ValueError(
+                    f"Action {action_id!r} Reviewed By must name an active person "
+                    "from the Owner Roster. No workbooks were created and no "
+                    "source files were moved."
                 )
             record["Reviewed By"] = excel_safe_text(reviewer)
             record["Review Date"] = review_date
@@ -6103,7 +6126,8 @@ def read_management_state(
             state["owner_roster_capacity"] = owner_roster_capacity_from_sheet(ws)
         if "Action Board" in wb.sheetnames:
             state["active_actions"] = validate_action_board_records(
-                records_from_sheet(wb["Action Board"], "Action ID")
+                records_from_sheet(wb["Action Board"], "Action ID"),
+                allowed_reviewers=state["owners"],
             )
         if "Action History" in wb.sheetnames:
             state["action_history"] = validate_action_board_records(
@@ -6957,9 +6981,12 @@ def validate_management_workbook_controls(
         raise IntegrityError("Management Setup is missing a required protected input table.")
     if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
         raise IntegrityError("The active-owner workbook name is missing.")
-    owner_roster_from_sheet(setup)
+    owner_roster = owner_roster_from_sheet(setup)
     action_board = wb["Action Board"]
-    validate_action_board_records(records_from_sheet(action_board, "Action ID"))
+    validate_action_board_records(
+        records_from_sheet(action_board, "Action ID"),
+        allowed_reviewers=active_owner_names(owner_roster),
+    )
     return setup, action_board
 
 
@@ -7139,12 +7166,19 @@ def validate_pre_contract_management_workbook(path: Path, expected_digest: str) 
             raise IntegrityError(
                 "The compatibility verifier only accepts a markerless pre-contract workbook."
             )
+        has_action_focus_schema = all(
+            name in wb.sheetnames
+            for name in ("Action Focus", "Evidence Detail")
+        )
         legacy_visible_sheets = (
-            VISIBLE_MANAGEMENT_SHEETS
-            if all(
-                name in wb.sheetnames
-                for name in ("Action Focus", "Evidence Detail")
+            LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS
+            if (
+                has_action_focus_schema
+                and "Rising & Falling Stars" in wb.sheetnames
+                and "Recent Movement Signals" not in wb.sheetnames
             )
+            else VISIBLE_MANAGEMENT_SHEETS
+            if has_action_focus_schema
             else PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS
         )
         validate_management_workbook_controls(
@@ -7736,6 +7770,8 @@ def merge_management_actions(
                 str(prior.get("Evidence ID") or "")
                 == str(signal.get("Evidence ID") or "")
             )
+            if not same_evidence:
+                status = "Review Needed"
             review_disposition = (
                 prior.get("Review Disposition") or "Pending Review"
                 if same_evidence
@@ -11414,11 +11450,29 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
 
     if rebuild_from_history:
         _, weekly_location_rows = weekly_rollups(records)
-        _, complete_week_ends = full_week_ends_by_location(weekly_location_rows)
+        full_by_location, _ = full_week_ends_by_location(weekly_location_rows)
+        configured_locations = set(config["locations"])
+        missing_locations = sorted(
+            configured_locations - set(full_by_location),
+            key=str.casefold,
+        )
+        complete_week_ends = (
+            set.intersection(
+                *(full_by_location[location] for location in configured_locations)
+            )
+            if not missing_locations
+            else set()
+        )
         if not complete_week_ends:
+            missing_detail = (
+                " Missing all history for: " + ", ".join(missing_locations) + "."
+                if missing_locations
+                else ""
+            )
             raise ValueError(
                 "History rebuild requires at least one complete Tuesday-Sunday "
-                "week for every configured location. No files were changed."
+                "week for every configured location."
+                f"{missing_detail} No files were changed."
             )
         active_week_end = max(complete_week_ends)
         public_start, public_end = week_period_for(active_week_end)
@@ -11799,8 +11853,16 @@ def verified_evidence_source(
     validate_management_workbook(workbook_path, expected_digest)
     wb = load_workbook(workbook_path, data_only=False)
     try:
+        allowed_reviewers = (
+            active_owner_names(
+                owner_roster_from_sheet(wb["Management Setup"])
+            )
+            if "Management Setup" in wb.sheetnames
+            else None
+        )
         action_rows = validate_action_board_records(
-            records_from_sheet(wb["Action Board"], "Action ID")
+            records_from_sheet(wb["Action Board"], "Action ID"),
+            allowed_reviewers=allowed_reviewers,
         )
         evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
     finally:

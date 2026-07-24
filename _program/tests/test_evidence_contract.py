@@ -200,6 +200,24 @@ def test_completed_disposition_requires_reviewer_and_review_date() -> None:
         metrics.validate_action_board_records([action])
 
 
+def test_completed_disposition_rejects_reviewer_outside_active_roster() -> None:
+    action = current_action()
+    action.update(
+        {
+            "Status": "Open",
+            "Review Disposition": "Coaching Accepted",
+            "Reviewed By": "Pasted Reviewer",
+            "Review Date": date(2026, 7, 23),
+        }
+    )
+
+    with pytest.raises(ValueError, match="active person from the Owner Roster"):
+        metrics.validate_action_board_records(
+            [action],
+            allowed_reviewers=["Authorized Manager"],
+        )
+
+
 def sample_package() -> metrics.ManagementEvidencePackageV2:
     record = metrics.EvidenceRecordV2(
         action_id="ABC123",
