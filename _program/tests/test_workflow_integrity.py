@@ -340,6 +340,7 @@ def test_adopted_pre_contract_master_is_regenerated_with_strict_protection(
         roster = workbook["Management Setup"]
         roster["A21"] = "Avery Manager"
         roster["B21"] = "Yes"
+        workbook["Recent Movement Signals"].title = "Rising & Falling Stars"
         workbook.save(master)
     finally:
         workbook.close()

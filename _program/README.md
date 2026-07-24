@@ -100,18 +100,47 @@ When the repository folder is named exactly `Red Onion Weekly Metrics Automation
 
 The launcher disables bytecode writes and redirects bytecode lookup to a fresh unused cache path for every run. It does not fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root, but the same source-bytecode safety check applies.
 
-## Master Workbook Management Layer
+## Coaching-Signal Interpretation
 
-The master workbook separates performance level from momentum:
+The v0.3.0 methodology is a deterministic, rule-based screening aid. It does
+not estimate statistical confidence, predict future performance, establish
+causality, or adjust for unobserved shift conditions. Its outputs are limited
+to human-reviewed coaching and recognition prompts.
 
-- Recent Momentum compares the latest complete week with up to four prior complete weeks across check average, wine percentage, rate of sale, and ticket time.
-- 8-Week Direction compares the most recent four complete weeks with the preceding four. Eight usable server weeks with at least 100 guests in each four-week block are labeled `Full`; six or seven may be labeled `Developing` when both blocks meet the configured week and guest thresholds.
-- Incomplete latest weeks are `Not Scored` and generate no server action. A low current sample also keeps Recent Momentum at `Not Scored`, while qualified longer-term context may still display.
-- Performance level compares the latest values with optional management targets, falling back to the store rolling baseline.
-- Average rank movement is capped at a one-point modifier on each horizon so it does not double-count the underlying metrics.
-- Prominent server actions require both the current-week volume thresholds and enough prior full-week history.
+- `Recent Movement` compares the current complete week with up to four prior
+  complete weeks for the same person.
+- `Peer Comparison` compares the current week with a leave-one-person-out,
+  same-store median from the prior four complete weeks.
+- `Evidence Status` describes sample, peer-reference, persistence, and
+  leave-one-active-day stability checks. It is not statistical confidence.
+- `Context Review` is a first-week or context-sensitive signal. `Coaching
+  Prompt` and `Recognition Prompt` require a second consecutive qualified
+  signal with a recurring metric driver.
 
-The management `Server Scorecard` shows the action, current sample, performance, both trend horizons, and the exact weeks and guests used. The hidden `Server Week-over-Week Detail` tab remains an audit view of adjacent-week changes; it is not the management coaching trend.
+The peer reference includes only qualified, non-excluded server-weeks and
+requires at least three usable prior weeks, five distinct peers in each usable
+week, and 20 peer-week observations. If those requirements are not met, the
+workbook displays `Reference Unavailable` and does not issue a coaching or
+recognition prompt. Management targets remain visible as business context but
+do not drive person-level prompts. Rank is descriptive only and cannot change
+an action classification.
+
+Incomplete or low-volume weeks, unavailable peer references, gaps, changed
+signal direction, common store-wide movement, and day-sensitive results prevent
+escalation. The management signal sheets visibly state:
+
+> Rule-based observational coaching signal—not a statistical, causal, or
+> employment decision. Verify comparable work context and source accuracy.
+
+These outputs must never be the sole or determinative basis for pay,
+scheduling, discipline, promotion, or termination. See
+[MODEL_CARD.md](../MODEL_CARD.md) and
+[DATA_GOVERNANCE.md](../DATA_GOVERNANCE.md).
+
+The management `Server Scorecard` shows current sample, peer comparison,
+recent movement, evidence status, and exact history used. The protected
+`Evidence Detail` sheet records the comparator, cohort size, threshold version,
+stability result, evidence weeks, and source lineage.
 
 `Action Focus` is the single execution view and links to editable fields on
 `Action Board`. `Evidence Detail` is protected/read-only and records stable
@@ -124,11 +153,47 @@ The supported management edit surface is intentionally narrow:
 
 - `Management Setup` configured-entity target cells in columns `B:G`.
 - The visible Owner Roster table beginning at `A20:B20`, with `Owner Name` and `Active` fields. Add new managers and mark departing managers inactive so historical assignments remain readable.
-- `Action Board` data cells for Status (`D`), Owner (`E`), Due Date (`F`), and Manager Notes (`N`).
+- `Action Board` data cells for Status (`D`), Owner (`E`), Due Date (`F`),
+  Context Notes (`N`), Review Disposition (`U`), Reviewed By (`V`), and Review
+  Date (`W`). A generated item starts at `Review Needed`; it cannot advance
+  without a non-pending disposition, reviewer, and review date.
 
 All other cells are locked, technical sheets are `veryHidden`, and workbook structure is protected. This guards against accidental manipulation but is not encryption; Dropbox access and the manifest/backup controls remain necessary.
 
 Technical calculation and raw-detail sheets remain in the workbook as `veryHidden` sheets. Do not delete them from the generator; they provide auditability and chart sources.
+
+## History Migration And Rebuild
+
+A technical maintainer can rebuild managed outputs entirely from
+manifest-pinned canonical history:
+
+```powershell
+python red_onion_weekly_metrics.py --rebuild-from-history
+```
+
+The rebuild verifies the manifest chain, trusted head, master workbook, and
+canonical history; ignores the active drop folder; preserves management review
+fields by header; and publishes the rebuilt workbooks, generated-workbook
+archive, successor manifest, and trusted head as one protected transaction.
+Migration from a separately approved staging folder can be combined with the
+rebuild:
+
+```powershell
+python red_onion_weekly_metrics.py `
+  --rebuild-from-history `
+  --migrate-history-from "C:\approved\red-onion-history"
+```
+
+Calibration and replay diagnostics are read-only and emit anonymized aggregate
+JSON:
+
+```powershell
+python red_onion_model_validation.py `
+  "C:\approved\canonical-history" `
+  "C:\approved\temporary-backfill" `
+  --start 2026-04-28 `
+  --end 2026-07-19
+```
 
 ## Read-Only Health Check
 

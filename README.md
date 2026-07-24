@@ -65,12 +65,12 @@ Excel temporary files whose names start with `~$` are ignored.
 02 Finished Reports\LAST RUN STATUS.txt
 ```
 
-- The master workbook opens to a management dashboard with current KPIs, store and group trends, selective rising/falling stars, and prioritized follow-up actions.
-- `Action Focus` presents only immediate manager work and links each row back to the editable `Action Board`.
-- `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, metric inputs, and methodology version.
-- Server actions require a credible sample: at least 25 guests, 3 active days, 2 prior full weeks, and 50 prior-period guests.
+- The master workbook opens to a management dashboard with current KPIs, store and group trends, recent movement signals, and a guarded management-review queue.
+- `Action Focus` presents current context reviews and coaching/recognition prompts and links each row back to the editable `Action Board`.
+- `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, peer-reference details, metric inputs, stability results, review disposition, and methodology version.
+- Person-level signals require at least 25 guests, 3 active days, 2 prior full self-weeks, and 50 prior-period guests.
 - Partial weeks stay visible in Data Quality but are excluded from management baselines and prominent server actions.
-- Management can assign action owners, due dates, status, and notes in the master workbook. Those fields carry forward on the next successful run.
+- Management can record Status, Owner, Due Date, Context Notes, Review Disposition, Reviewed By, and Review Date in the master workbook. Those fields carry forward on the next successful run.
 - Moves successfully processed source files to:
 
 ```text
@@ -91,7 +91,49 @@ Before the first protected weekly run, a maintainer must explicitly confirm the 
 
 An ordinary run fails closed if that baseline, its manifest history, or the machine-local trusted head is missing; it never silently establishes a replacement baseline. On the first run after upgrading an older deployment that already has manifests but no local anchor, the same explicit initialization command verifies the complete current state and adopts that existing head once. A manifest-pinned owner-roster workbook from the immediately preceding protection contract is accepted only through that explicit adoption; it is not rewritten during adoption, history-only migration remains blocked, and the next ordinary weekly run regenerates it with the current strict controls. Each later run verifies the trusted head, full manifest chain, canonical raw archive, generated-workbook archive, published public workbooks, and the master workbook's generated-content digest before reading prior management state. Approved scalar values in blue cells and the Action Board remain editable, while their styles, validation, hyperlinks, and protection metadata stay covered; formulas or external links in editable cells and changes to generated content stop the run.
 
-## One-Time History Migration
+## Coaching-Signal Interpretation
+
+The v0.3.0 methodology is a deterministic, rule-based screening aid. It does
+not estimate statistical confidence, predict future performance, establish
+causality, or determine whether a person is performing fairly relative to
+unobserved shift conditions. Its output is limited to coaching and recognition
+review prompts.
+
+The workbook uses the following visible terms:
+
+- `Recent Movement`: the current complete week compared with up to four prior
+  complete weeks for the same person.
+- `Peer Comparison`: the current week compared with a leave-one-person-out,
+  same-store median from the prior four complete weeks.
+- `Evidence Status`: whether the sample, peer reference, persistence, and
+  stability requirements are satisfied. It is not statistical confidence.
+- `Context Review`: a first-week or context-sensitive signal that requires
+  investigation before any coaching or recognition conclusion.
+- `Coaching Prompt` and `Recognition Prompt`: a second consecutive qualified
+  signal with a recurring metric driver that remains stable when any one active
+  day is removed.
+
+The peer reference includes only qualified, non-excluded server-weeks. It
+requires at least three usable prior weeks, five distinct peers in each usable
+week, and 20 peer-week observations. If those requirements are not met, the
+workbook displays `Reference Unavailable` and does not issue a coaching or
+recognition prompt. Management targets remain visible as business context, but
+they do not drive person-level prompts. Rank, when shown, is descriptive only
+and cannot change an action classification.
+
+A gap, incomplete or low-volume week, unavailable peer reference, changed
+signal direction, or day-sensitive result prevents escalation. The report also
+checks for common store-wide movement before attributing a signal to one
+person. Every management-facing signal sheet states:
+
+> Rule-based observational coaching signal—not a statistical, causal, or
+> employment decision. Verify comparable work context and source accuracy.
+
+These outputs must never be the sole or determinative basis for pay,
+scheduling, discipline, promotion, or termination. See
+[MODEL_CARD.md](MODEL_CARD.md) and [DATA_GOVERNANCE.md](DATA_GOVERNANCE.md).
+
+## History Migration And Rebuild
 
 Legacy backup folders can be copied into the canonical history without moving or deleting the originals. The command validates every candidate first, copies one representative per business date into the correct week-ending folder, and is safe to repeat:
 
@@ -103,6 +145,68 @@ python _program\red_onion_weekly_metrics.py `
 ```
 
 If same-date files contain different metric data, migration stops before copying anything and lists the files to reconcile.
+
+After a validated migration, a technical maintainer can rebuild the managed
+outputs entirely from canonical history:
+
+```powershell
+python _program\red_onion_weekly_metrics.py `
+  --rebuild-from-history
+```
+
+`--rebuild-from-history` is a maintainer operation, not part of the normal
+weekly launcher. It verifies the current manifest, trusted head, master
+workbook, and canonical history before publication. It does not process the
+drop folder or move active weekly inputs. The rebuild preserves management
+review fields by header and publishes the rebuilt outputs, generated-workbook
+archive, manifest, and trusted head as one protected transaction. A validation,
+conflict, or write failure leaves the preexisting managed state unchanged.
+
+Migration and rebuilding may be combined when importing a separately staged
+history folder:
+
+```powershell
+python _program\red_onion_weekly_metrics.py `
+  --rebuild-from-history `
+  --migrate-history-from "C:\approved\red-onion-history"
+```
+
+### One-Time Gmail Backfill
+
+The initial v0.3.0 calibration may use a one-time, read-only retrieval of
+original `Daily Report - TM` attachments from the Marketing Vitals sender.
+This is a controlled backfill, not an ongoing Gmail integration:
+
+- Select reports by their embedded business date; the attachment filename and
+  email date may be one day later.
+- Accept only the original TM report family. Exclude Store reports, forwarded
+  duplicates, Monday reports, unrelated messages, and conflicting same-date
+  files.
+- Stage attachments outside the Git repository and live Dropbox operator
+  folders. Do not retain email bodies or message identifiers.
+- Validate the expected workbook schema, six Tuesday-Sunday dates per week,
+  configured locations, metric values, and daily guest/sales reconciliation
+  before migration.
+- Use the protected history migration/rebuild transaction above. After the
+  canonical archive and outputs verify, remove the temporary staging copies.
+
+The repository contains no Gmail credentials, background mail reader, or
+recurring email connector. A normal weekly run never accesses Gmail.
+
+Maintainers can reproduce the anonymized calibration and replay diagnostics
+without writing files:
+
+```powershell
+python _program\red_onion_model_validation.py `
+  "C:\approved\canonical-history" `
+  "C:\approved\temporary-backfill" `
+  --start 2026-04-28 `
+  --end 2026-07-19
+```
+
+The command prints JSON only. It reports aggregate observation counts,
+thresholds, review rates, prompt stability, and reversal rates; it does not
+emit person-level rows.
 
 ## If Something Fails
 
@@ -126,17 +230,49 @@ processing weekly reports.
 
 ## Configuration
 
-Configuration lives in `_program\red_onion_config.json`. It controls location short codes, confidence rules, scoring thresholds, materiality thresholds, display aliases, and exclusions. Only the technical maintainer should edit this file or anything else in `Red Onion Weekly Metrics Automation`.
+Configuration lives in `_program\red_onion_config.json`. It controls location
+short codes, sample and peer-reference rules, calibrated scoring thresholds,
+persistence and stability rules, materiality thresholds, display aliases, and
+exclusions. Only the technical maintainer should edit this file or anything
+else in `Red Onion Weekly Metrics Automation`.
 
-The master workbook also contains a `Management Setup` sheet. Blue target cells in columns `B:G` hold optional store/group targets; blank targets use the rolling baseline of up to four prior full Tuesday-Sunday weeks. The visible Owner Roster begins at `A20` with `Owner Name` and `Active` columns. Add a manager once and mark departed managers inactive instead of deleting history. The `Action Board` Owner dropdown reflects active roster names immediately in Excel; the next successful run carries the roster forward and flags assignments that are inactive or no longer listed.
+The master workbook also contains a `Management Setup` sheet. Blue target cells
+in columns `B:G` hold optional store/group targets. These targets and rolling
+store baselines remain store-level business context; person-level prompts use
+the qualified same-store peer reference described above. The visible Owner
+Roster begins at `A20` with `Owner Name` and `Active` columns. Add a manager
+once and mark departed managers inactive instead of deleting history. The
+`Action Board` Owner dropdown reflects active roster names immediately in
+Excel; the next successful run carries the roster forward and flags assignments
+that are inactive or no longer listed.
+
+The frozen scoring thresholds identify their calibration dataset, date,
+quantile method, rounding rules, and methodology version. v0.3.0 uses the
+larger of the business minimum and the R-7 75th percentile of absolute
+qualified deviations for a neutral band, and the larger of the business
+minimum and R-7 90th percentile for a strong band. Values are rounded half-up
+to $0.50 for check average, 0.001 for percentage/rate metrics, and 60 seconds
+for ticket time. Thresholds are frozen for a methodology release and are not
+recomputed during an ordinary weekly run.
+
+Rate of Sale is assumed to be lower-is-better. Average Ticket Time is pooled by
+guest count because the source does not provide ticket counts. These are
+business assumptions pending validation with Toast or the source owner.
 
 ## Protected Edit Surface
 
 Workbook protection is designed to prevent accidental changes while preserving the management workflow:
 
 - `Management Setup`: configured-entity target cells in `B:G` and the Owner Roster input table are editable.
-- `Action Board`: only Status (`D`), Owner (`E`), Due Date (`F`), and Manager Notes (`N`) data cells are editable.
+- `Action Board`: only Status, Owner, Due Date, Context Notes, Review
+  Disposition, Reviewed By, and Review Date data cells are editable.
 - Other workbook cells are locked, technical sheets are `veryHidden`, and workbook structure is protected.
+
+Generated rows begin with `Pending Review`. A completed disposition requires a
+reviewer and review date. Valid dispositions are `Coaching Accepted`,
+`Recognition Accepted`, `Context Explains`, `Data Issue`, and `Monitor`.
+Invalid or incomplete combinations remain visibly pending and are rejected by
+the next protected run.
 
 This protection is an operational guardrail, not encryption or a security boundary. Anyone who can download a workbook can keep a separate copy, and an authorized Dropbox editor can replace files. Use the manifests and restricted Dropbox roles to detect or reduce inappropriate changes.
 
@@ -155,7 +291,8 @@ Official references: [Dropbox sharing permissions](https://help.dropbox.com/shar
 
 Maintainers should also follow [MAINTAINER.md](MAINTAINER.md),
 [RECOVERY.md](RECOVERY.md), [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md), and
-[DATA_GOVERNANCE.md](DATA_GOVERNANCE.md).
+[DATA_GOVERNANCE.md](DATA_GOVERNANCE.md). The analytical-use contract and
+validation limits are documented in [MODEL_CARD.md](MODEL_CARD.md).
 
 ## Standalone Use
 

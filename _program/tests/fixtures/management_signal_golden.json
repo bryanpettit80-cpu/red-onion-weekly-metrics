@@ -1,9 +1,9 @@
 {
-  "Action Code": "COACH_NOW",
-  "Evidence ID": "D888A5E8BD1A8AE1",
+  "Action Code": "COACHING_PROMPT",
+  "Evidence ID": "11730570B4691BC8",
   "Evidence Sources": "[{\"format\":\".xlsx\",\"parser_engine\":\"openpyxl\",\"report_date\":\"2026-07-19\",\"report_date_source\":\"Workbook Date(s) field\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"source_file\":\"Daily Report.xlsx\"}]",
   "Evidence Week Ends": "2026-07-12, 2026-07-19",
-  "Methodology Version": "2026.07-v1",
+  "Methodology Version": "2026.07-v2",
   "Metric Evidence": "{\"guest_count\":42,\"recent_metric_scores\":{\"check_average\":-2}}",
-  "Reason Code": "SERVER_FALLING_BELOW_BENCHMARK"
+  "Reason Code": "SERVER_TWO_WEEK_DOWNWARD_BELOW_PEER_STABLE"
 }

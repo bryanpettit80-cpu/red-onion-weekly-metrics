@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from dataclasses import replace
 from datetime import date, time
 from pathlib import Path
 
@@ -222,7 +223,7 @@ def test_carried_forward_management_text_is_sanitized(tmp_path: Path) -> None:
     ]
     assert state["active_actions"][0]["Owner"] == f"'{malicious}"
     assert state["active_actions"][0]["Person / Area"] == f"'{malicious}"
-    assert state["active_actions"][0]["Manager Notes"] == f"'{malicious}"
+    assert state["active_actions"][0]["Context Notes"] == f"'{malicious}"
 
     regenerated = Workbook()
     metrics.write_management_setup_sheet(
@@ -301,6 +302,19 @@ def test_data_quality_coverage_rejects_extreme_ranges_without_iteration() -> Non
         )
 
 
+def test_duplicate_signature_distinguishes_unavailable_metrics_from_real_zero() -> None:
+    available = make_record(date(2026, 7, 18))
+    unavailable = replace(
+        available,
+        rate_available=False,
+        ticket_time_available=False,
+    )
+
+    assert metrics.semantic_report_signature([available]) != (
+        metrics.semantic_report_signature([unavailable])
+    )
+
+
 def test_run_rejects_excessive_history_span_before_writes_or_moves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -321,7 +335,14 @@ def test_run_rejects_excessive_history_span_before_writes_or_moves(
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
         day = active_day if path.name == active_source.name else archived_day
-        return [make_record(day, source_file=path.name)]
+        person = make_record(day, source_file=path.name)
+        total = replace(
+            person,
+            raw_user_name="",
+            display_name="",
+            is_location_total=True,
+        )
+        return [total, person]
 
     def unexpected_writer(*args, **kwargs):
         pytest.fail("workbook writer must not run for an excessive date range")
@@ -371,7 +392,14 @@ def test_active_and_archive_identical_reports_are_used_once(
     real_master_writer = metrics.write_master_workbook
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        return [make_record(date(2026, 7, 18), source_file=path.name)]
+        person = make_record(date(2026, 7, 18), source_file=path.name)
+        total = replace(
+            person,
+            raw_user_name="",
+            display_name="",
+            is_location_total=True,
+        )
+        return [total, person]
 
     def fake_public(location, records, output_path, config, start, end):
         output_path.mkdir(parents=True, exist_ok=True)
@@ -402,7 +430,7 @@ def test_active_and_archive_identical_reports_are_used_once(
     initialize_integrity(args)
     metrics.run(args)
 
-    assert len(master_records) == 1
+    assert len(master_records) == 2
     assert {record.report_date for record in master_records} == {date(2026, 7, 18)}
     assert not active_source.exists()
 

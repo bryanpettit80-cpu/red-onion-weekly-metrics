@@ -333,11 +333,23 @@ def test_active_owner_defined_name_and_action_validation_are_live() -> None:
         for item in action_validations
         if item.formula1 == f"={metrics.OWNER_ROSTER_DEFINED_NAME}"
     )
-    assert str(owner_validation.sqref) == "E5"
+    disposition_validation = next(
+        item
+        for item in action_validations
+        if item.formula1
+        == f'"{",".join(metrics.REVIEW_DISPOSITION_CHOICES)}"'
+    )
+    assert str(owner_validation.sqref) == "E5 V5"
+    assert str(disposition_validation.sqref) == "U5"
     active_validation = workbook["Management Setup"].data_validations.dataValidation[0]
     assert active_validation.formula1 == '"Yes,No"'
     assert str(active_validation.sqref) == "B21:B70"
-    for validation in (active_validation, status_validation, owner_validation):
+    for validation in (
+        active_validation,
+        status_validation,
+        owner_validation,
+        disposition_validation,
+    ):
         assert validation.showErrorMessage is True
         assert validation.errorStyle == "stop"
         assert validation.errorTitle
@@ -345,6 +357,7 @@ def test_active_owner_defined_name_and_action_validation_are_live() -> None:
     assert active_validation.allowBlank is True
     assert status_validation.allowBlank is False
     assert owner_validation.allowBlank is True
+    assert disposition_validation.allowBlank is False
     workbook.close()
 
 
@@ -367,7 +380,15 @@ def test_workbook_protection_uses_exact_unlocked_cell_allowlist(
         for column in "AB"
     )
     assert unlocked_cells(workbook["Management Setup"]) == expected_setup
-    assert unlocked_cells(workbook["Action Board"]) == {"D5", "E5", "F5", "N5"}
+    assert unlocked_cells(workbook["Action Board"]) == {
+        "D5",
+        "E5",
+        "F5",
+        "N5",
+        "U5",
+        "V5",
+        "W5",
+    }
     assert unlocked_cells(workbook[metrics.OWNER_VALIDATION_SHEET]) == set()
     assert unlocked_cells(workbook["_Technical"]) == set()
     workbook.close()

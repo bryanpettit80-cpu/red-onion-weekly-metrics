@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Iterable
 
 import pandas as pd
@@ -54,6 +55,21 @@ from red_onion_runtime import (
     RunStage,
     safe_message,
     write_json_atomic,
+)
+from red_onion_fairness import (
+    CandidatePolarity,
+    MetricBand,
+    PeerComparison,
+    PeerObservation,
+    PromptAction,
+    RecentMovement,
+    WeeklyCandidateSignal,
+    assess_common_store_shock,
+    classify_candidate,
+    evaluate_two_week_persistence,
+    leave_one_day_stability,
+    leave_one_out_same_store_peer_reference,
+    score_metric,
 )
 
 
@@ -105,6 +121,31 @@ ACTION_HEADERS = [
     "Why It Matters",
     "Recommended Next Step",
     "Last Seen",
+    "Context Notes",
+    "Peer Comparison",
+    "Recent Movement",
+    "First Seen",
+    "Weeks Open",
+    "Evidence Status",
+    "Signal State",
+    "Review Disposition",
+    "Reviewed By",
+    "Review Date",
+]
+LEGACY_ACTION_HEADERS_V1 = [
+    "Action ID",
+    "Entity Key",
+    "Priority",
+    "Status",
+    "Owner",
+    "Due Date",
+    "Location",
+    "Person / Area",
+    "Action",
+    "Signal",
+    "Why It Matters",
+    "Recommended Next Step",
+    "Last Seen",
     "Manager Notes",
     "Performance Level",
     "Momentum",
@@ -115,13 +156,26 @@ ACTION_HEADERS = [
 ]
 
 ACTION_STATUS_CHOICES: tuple[str, ...] = (
+    "Review Needed",
     "Open",
     "In Progress",
     "Blocked",
     "Complete",
     "Dismissed",
 )
-MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v1"
+REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
+    "Pending Review",
+    "Coaching Accepted",
+    "Recognition Accepted",
+    "Context Explains",
+    "Data Issue",
+    "Monitor",
+)
+MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v2"
+MANAGEMENT_SIGNAL_DISCLAIMER = (
+    "Rule-based observational coaching signal—not a statistical, causal, or "
+    "employment decision. Verify comparable work context and source accuracy."
+)
 EVIDENCE_DETAIL_HEADERS: tuple[str, ...] = (
     "Evidence ID",
     "Action ID",
@@ -136,6 +190,16 @@ EVIDENCE_DETAIL_HEADERS: tuple[str, ...] = (
     "Evidence Week Ends",
     "Evidence Sources",
     "Metric Evidence",
+    "Comparator Type",
+    "Peer Cohort Size",
+    "Peer Cohort Weeks",
+    "Threshold Version",
+    "Evidence Status",
+    "Recurring Drivers",
+    "Stability Result",
+    "Review Disposition",
+    "Reviewed By",
+    "Review Date",
     "Methodology Version",
     "Last Seen",
 )
@@ -146,6 +210,13 @@ ACTION_EVIDENCE_FIELDS: tuple[str, ...] = (
     "Evidence Week Ends",
     "Evidence Sources",
     "Metric Evidence",
+    "Comparator Type",
+    "Peer Cohort Size",
+    "Peer Cohort Weeks",
+    "Threshold Version",
+    "Evidence Status",
+    "Recurring Drivers",
+    "Stability Result",
     "Methodology Version",
 )
 
@@ -160,13 +231,26 @@ PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS = [
     "Management Setup",
     "Run Notes",
 ]
-VISIBLE_MANAGEMENT_SHEETS = [
+LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS = [
     "Dashboard",
     "Action Focus",
     "Action Board",
     "Server Scorecard",
     "Store & Group Scorecards",
     "Rising & Falling Stars",
+    "Evidence Detail",
+    "Action History",
+    "Data Quality",
+    "Management Setup",
+    "Run Notes",
+]
+VISIBLE_MANAGEMENT_SHEETS = [
+    "Dashboard",
+    "Action Focus",
+    "Action Board",
+    "Server Scorecard",
+    "Store & Group Scorecards",
+    "Recent Movement Signals",
     "Evidence Detail",
     "Action History",
     "Data Quality",
@@ -237,6 +321,8 @@ class MetricRecord:
     source_format: str = ""
     parser_engine: str = ""
     report_date_source: str = "Unknown"
+    rate_available: bool = True
+    ticket_time_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -381,6 +467,71 @@ class ManagementEvidencePackageV1:
         }
 
 
+@dataclass(frozen=True)
+class EvidenceRecordV2(EvidenceRecord):
+    comparator_type: str = "Same-store prior-four-week median"
+    peer_cohort_size: int = 0
+    peer_cohort_weeks: int = 0
+    threshold_version: str = MANAGEMENT_METHODOLOGY_VERSION
+    evidence_status: str = ""
+    recurring_drivers: str = ""
+    stability_result: str = ""
+    review_disposition: str = "Pending Review"
+    reviewed_by: str = ""
+    review_date: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(
+            {
+                "comparator_type": self.comparator_type,
+                "peer_cohort_size": self.peer_cohort_size,
+                "peer_cohort_weeks": self.peer_cohort_weeks,
+                "threshold_version": self.threshold_version,
+                "evidence_status": self.evidence_status,
+                "recurring_drivers": self.recurring_drivers,
+                "stability_result": self.stability_result,
+                "review_disposition": self.review_disposition,
+                "reviewed_by": self.reviewed_by,
+                "review_date": self.review_date,
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class ManagementEvidencePackageV2:
+    source: dict[str, Any]
+    records: tuple[EvidenceRecordV2, ...]
+    retention_delete_after: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": "ManagementEvidencePackageV2",
+            "schema_version": 2,
+            "classification": "Restricted Employee Performance Information",
+            "permitted_use": (
+                "Human-reviewed observational coaching and recognition prompts only."
+            ),
+            "prohibited_use": (
+                "Not the sole or determinative basis for pay, scheduling, discipline, "
+                "promotion, or termination."
+            ),
+            "retention": {
+                "days": 365,
+                "delete_after": self.retention_delete_after,
+                "automatic_deletion": False,
+            },
+            "distribution": {
+                "mode": "Manual local export after exact-fingerprint approval",
+                "automatic_upload": False,
+                "automatic_send": False,
+            },
+            "source": self.source,
+            "records": [record.to_dict() for record in self.records],
+        }
+
+
 def is_blank(value: Any) -> bool:
     if value is None:
         return True
@@ -396,8 +547,12 @@ def to_float(value: Any) -> float:
     if is_blank(value):
         return 0.0
     if isinstance(value, (int, float)):
-        return float(value)
-    return float(str(value).replace(",", "").replace("$", "").strip())
+        number = float(value)
+    else:
+        number = float(str(value).replace(",", "").replace("$", "").strip())
+    if not math.isfinite(number):
+        raise ValueError(f"Expected a finite number, received {value!r}.")
+    return number
 
 
 def ticket_time_to_seconds(value: Any) -> float:
@@ -424,6 +579,35 @@ def ticket_time_to_seconds(value: Any) -> float:
     hours, minutes, seconds, fraction = match.groups()
     micros = float(f"0.{fraction}") if fraction else 0.0
     return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + micros
+
+
+def optional_float(value: Any) -> tuple[float, bool]:
+    """Return a finite numeric value plus whether it was actually available."""
+
+    if is_blank(value):
+        return 0.0, False
+    try:
+        return to_float(value), True
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, False
+
+
+def optional_ticket_time_seconds(value: Any) -> tuple[float, bool]:
+    """Parse ticket time without turning malformed or non-finite input into a benefit."""
+
+    if is_blank(value):
+        return 0.0, False
+    if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+        return 0.0, False
+    if isinstance(value, str) and not re.match(
+        r"^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$", value.strip()
+    ):
+        return 0.0, False
+    try:
+        seconds = ticket_time_to_seconds(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, False
+    return (seconds, True) if math.isfinite(seconds) else (0.0, False)
 
 
 def parse_date_text(text: str) -> date:
@@ -553,8 +737,10 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
             gross_sales = to_float(values[0])
             guest_count = to_float(values[1])
             wine_sales = to_float(values[3])
-            rate = to_float(values[4])
-            ticket_seconds = ticket_time_to_seconds(values[5])
+            rate, rate_available = optional_float(values[4])
+            ticket_seconds, ticket_time_available = optional_ticket_time_seconds(
+                values[5]
+            )
 
             if raw_user_name and gross_sales == 0 and guest_count == 0 and wine_sales == 0:
                 continue
@@ -580,6 +766,10 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
                     source_format=path.suffix.lower(),
                     parser_engine=parser_engine,
                     report_date_source=report_date_source,
+                    rate_available=(guest_count <= 0 or rate_available),
+                    ticket_time_available=(
+                        guest_count <= 0 or ticket_time_available
+                    ),
                 )
             )
             break
@@ -989,6 +1179,8 @@ def semantic_report_signature(records: list[MetricRecord]) -> tuple[tuple[Any, .
                 normalized_number(record.wine_sales),
                 normalized_number(record.rate_of_sale_by_guest_count),
                 normalized_number(record.average_ticket_time_seconds),
+                bool(record.rate_available),
+                bool(record.ticket_time_available),
             )
             for record in records
         )
@@ -1159,6 +1351,63 @@ def validated_data_quality_coverage(
             "source files were moved."
         )
     return coverage_start, coverage_end, row_count
+
+
+def validate_daily_location_reconciliation(
+    records: Iterable[MetricRecord],
+    config: dict[str, Any],
+) -> None:
+    """Require daily person rows to reconcile to each configured location total."""
+
+    grouped: dict[tuple[date, str], list[MetricRecord]] = defaultdict(list)
+    for record in records:
+        if is_operating_day(record.report_date):
+            grouped[(record.report_date, record.location)].append(record)
+    failures: list[str] = []
+    for (report_date, location), rows in sorted(grouped.items()):
+        if location not in config.get("locations", {}):
+            continue
+        totals = [row for row in rows if row.is_location_total]
+        people = [row for row in rows if not row.is_location_total]
+        if len(totals) != 1:
+            failures.append(
+                f"{report_date.isoformat()} {location}: expected one location total, "
+                f"found {len(totals)}"
+            )
+            continue
+        total = totals[0]
+        comparisons = (
+            (
+                "guest count",
+                sum(row.guest_count for row in people),
+                total.guest_count,
+                1e-6,
+            ),
+            (
+                "gross sales",
+                sum(row.gross_sales for row in people),
+                total.gross_sales,
+                0.01,
+            ),
+            (
+                "wine sales",
+                sum(row.wine_sales for row in people),
+                total.wine_sales,
+                0.01,
+            ),
+        )
+        for label, person_value, total_value, tolerance in comparisons:
+            if abs(person_value - total_value) > tolerance:
+                failures.append(
+                    f"{report_date.isoformat()} {location}: {label} person rows "
+                    f"{person_value:.4f} != location total {total_value:.4f}"
+                )
+    if failures:
+        detail = "; ".join(failures[:5])
+        raise ValueError(
+            "Daily reconciliation failed. No history files were copied, no workbooks "
+            f"were created, and no active source files were moved. {detail}"
+        )
 
 
 def archive_destination_for(
@@ -1784,7 +2033,10 @@ def aggregate_records(
                     "rate_weight": 0.0,
                     "ticket_weighted_sum": 0.0,
                     "ticket_weight": 0.0,
+                    "rate_available": True,
+                    "ticket_time_available": True,
                     "active_dates": set(),
+                    "daily_records": [],
                     "source_files": set(),
                     "source_evidence": set(),
                 }
@@ -1794,17 +2046,37 @@ def aggregate_records(
         group["gross_sales"] += record.gross_sales
         group["guest_count"] += record.guest_count
         group["wine_sales"] += record.wine_sales
-        if record.guest_count > 0:
+        if record.guest_count > 0 and record.rate_available:
             group["rate_weighted_sum"] += (
                 record.rate_of_sale_by_guest_count * record.guest_count
             )
             group["rate_weight"] += record.guest_count
+        if record.guest_count > 0 and record.ticket_time_available:
             group["ticket_weighted_sum"] += (
                 record.average_ticket_time_seconds * record.guest_count
             )
             group["ticket_weight"] += record.guest_count
+        if record.guest_count > 0:
+            group["rate_available"] = (
+                group["rate_available"] and record.rate_available
+            )
+            group["ticket_time_available"] = (
+                group["ticket_time_available"] and record.ticket_time_available
+            )
         if record.guest_count > 0 or record.gross_sales > 0:
             group["active_dates"].add(record.report_date)
+        group["daily_records"].append(
+            {
+                "report_date": record.report_date,
+                "gross_sales": record.gross_sales,
+                "guest_count": record.guest_count,
+                "wine_sales": record.wine_sales,
+                "rate_of_sale_by_guest_count": record.rate_of_sale_by_guest_count,
+                "average_ticket_time_seconds": record.average_ticket_time_seconds,
+                "rate_available": record.rate_available,
+                "ticket_time_available": record.ticket_time_available,
+            }
+        )
         group["source_files"].add(record.source_file)
         group["source_evidence"].add(
             (
@@ -1836,6 +2108,9 @@ def aggregate_records(
         rollup["active_days"] = len(group["active_dates"])
         rollup["source_days"] = len(group["active_dates"])
         rollup["source_files"] = ", ".join(sorted(group["source_files"]))
+        rollup["daily_records"] = sorted(
+            group["daily_records"], key=lambda item: item["report_date"]
+        )
         rollup["source_evidence"] = [
             {
                 "source_file": item[0],
@@ -2989,22 +3264,30 @@ def priority_fill(value: Any) -> PatternFill | None:
     if text in {
         "high", "coach", "coach now", "falling", "declining", "falling star",
         "below benchmark", "traffic watch", "incomplete week",
+        "coaching prompt", "downward", "below peer reference",
     }:
         return soft_fill("F4CCCC")
     if text in {
         "medium", "coach fundamentals", "protect performance", "reinforce improvement",
         "store review", "group review", "upsell watch", "service watch", "mixed watch",
-        "building history", "low sample",
+        "building history", "low sample", "context review", "sensitive",
+        "limited history", "limited volume", "reference unavailable",
     }:
         return soft_fill("FFF2CC")
     if text in {
         "recognize", "recognize & replicate", "share", "rising", "improving",
-        "rising star", "above benchmark",
+        "rising star", "above benchmark", "recognition prompt", "upward",
+        "above peer reference",
     }:
         return soft_fill("D9EAD3")
-    if text in {"review", "data quality", "short week"}:
+    if text in {
+        "review", "review needed", "data quality", "short week", "eligible",
+    }:
         return soft_fill("D9EAF7")
-    if text in {"monitor", "stable", "stable / mixed", "on track", "not scored"}:
+    if text in {
+        "monitor", "stable", "stable / mixed", "on track", "not scored",
+        "not evaluated", "within peer range",
+    }:
         return soft_fill("EDEDED")
     return None
 
@@ -4324,9 +4607,19 @@ def safe_pct_delta(current: float | None, comparison: float | None) -> float | N
     return (current - comparison) / comparison
 
 
-def management_threshold(config: dict[str, Any], field: str) -> dict[str, Any]:
-    defaults = DEFAULT_CONFIG["management_score_thresholds"][field]
-    configured = config.get("management_score_thresholds", {}).get(field, {})
+def management_threshold(
+    config: dict[str, Any],
+    field: str,
+    *,
+    comparator: str = "movement",
+) -> dict[str, Any]:
+    family = (
+        "management_peer_score_thresholds"
+        if comparator == "peer"
+        else "management_score_thresholds"
+    )
+    defaults = DEFAULT_CONFIG[family][field]
+    configured = config.get(family, {}).get(field, {})
     return {**defaults, **configured}
 
 
@@ -4359,17 +4652,37 @@ def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, float] | 
     gross_sales = sum(float(row.get("gross_sales", 0) or 0) for row in selected)
     guest_count = sum(float(row.get("guest_count", 0) or 0) for row in selected)
     wine_sales = sum(float(row.get("wine_sales", 0) or 0) for row in selected)
-    rate_weight = sum(float(row.get("guest_count", 0) or 0) for row in selected)
-    ticket_weight = rate_weight
+    rate_available = all(
+        bool(row.get("rate_available", True))
+        for row in selected
+        if float(row.get("guest_count", 0) or 0) > 0
+    )
+    ticket_time_available = all(
+        bool(row.get("ticket_time_available", True))
+        for row in selected
+        if float(row.get("guest_count", 0) or 0) > 0
+    )
+    rate_weight = sum(
+        float(row.get("guest_count", 0) or 0)
+        for row in selected
+        if bool(row.get("rate_available", True))
+    )
+    ticket_weight = sum(
+        float(row.get("guest_count", 0) or 0)
+        for row in selected
+        if bool(row.get("ticket_time_available", True))
+    )
     rate_weighted = sum(
         float(row.get("rate_of_sale_by_guest_count", 0) or 0)
         * float(row.get("guest_count", 0) or 0)
         for row in selected
+        if bool(row.get("rate_available", True))
     )
     ticket_weighted = sum(
         float(row.get("average_ticket_time_seconds", 0) or 0)
         * float(row.get("guest_count", 0) or 0)
         for row in selected
+        if bool(row.get("ticket_time_available", True))
     )
     return {
         "gross_sales": gross_sales,
@@ -4381,6 +4694,8 @@ def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, float] | 
         "average_ticket_time_seconds": (
             ticket_weighted / ticket_weight if ticket_weight else 0.0
         ),
+        "rate_available": rate_available,
+        "ticket_time_available": ticket_time_available,
     }
 
 
@@ -4509,30 +4824,532 @@ def merged_source_evidence(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any
 
 
 def recommended_server_follow_up(row: dict[str, Any]) -> str:
-    negative_fields = [field for field, score in row["metric_scores"].items() if score < 0]
-    positive_fields = [field for field, score in row["metric_scores"].items() if score > 0]
-    field = negative_fields[0] if negative_fields else positive_fields[0] if positive_fields else None
-    if row["action"] == "Recognize & Replicate":
-        if negative_fields:
-            return "Recognize the improvement, then address the watch item before sharing the successful practice."
-        return "Recognize the improvement and ask what changed so the practice can be shared."
-    if row["action"] == "Reinforce Improvement":
-        return "Acknowledge the progress and reinforce the strongest improving behavior."
-    if row["action"] == "Protect Performance":
-        return "Check in on the decline while reinforcing the server's current strengths."
-    if row["action"] == "Coach Fundamentals":
-        return "Review recent shifts and agree on one measurable improvement for next week."
-    if row["action"] != "Coach Now":
-        return "Monitor another full week before taking action."
-    if field == "check_average":
-        return "Review suggestive selling, add-ons, and check-building opportunities on recent shifts."
-    if field == "wine_pct":
-        return "Coach wine pairing prompts and wine attachment opportunities on recent shifts."
+    action = str(row.get("action") or "Monitor")
+    recurring = row.get("recurring_driver_fields", []) or []
+    driver_text = ", ".join(
+        field.replace("_", " ")
+        for field in recurring
+    )
+    context_prompt = (
+        "Review whether shift mix, section load, guest mix, staffing, or service "
+        "conditions explain the signal; verify the source data before acting."
+    )
+    if action == "Coaching Prompt":
+        suffix = f" Recurring drivers: {driver_text}." if driver_text else ""
+        return (
+            "Complete the documented context review, then agree on one measurable "
+            f"coaching step if the signal remains actionable.{suffix}"
+        )
+    if action == "Recognition Prompt":
+        suffix = f" Recurring drivers: {driver_text}." if driver_text else ""
+        return (
+            "Complete the documented context review, then recognize the result and ask "
+            f"what practice can be shared if the signal remains supported.{suffix}"
+        )
+    if action == "Context Review":
+        return context_prompt
+    return "Monitor another complete, qualified week before opening a coaching prompt."
+
+
+def management_metric_available(row: dict[str, Any], field: str) -> bool:
     if field == "rate_of_sale_by_guest_count":
-        return "Review table pacing and section load to identify the source of the slower rate."
+        return bool(row.get("rate_available", True))
     if field == "average_ticket_time_seconds":
-        return "Review service flow and ticket-time bottlenecks on the affected shifts."
-    return "Review recent shifts and coach the largest declining driver."
+        return bool(row.get("ticket_time_available", True))
+    value = row.get(field)
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def management_metric_band(
+    config: dict[str, Any],
+    field: str,
+    *,
+    comparator: str = "movement",
+) -> MetricBand:
+    threshold = management_threshold(config, field, comparator=comparator)
+    return MetricBand(
+        neutral=float(threshold["neutral"]),
+        strong=float(threshold["strong"]),
+    )
+
+
+def management_metric_score(
+    change: float | None,
+    config: dict[str, Any],
+    field: str,
+    *,
+    comparator: str = "movement",
+) -> int | None:
+    threshold = management_threshold(config, field, comparator=comparator)
+    return score_metric(
+        change,
+        management_metric_band(config, field, comparator=comparator),
+        higher_is_better=not bool(threshold.get("lower_is_better")),
+    )
+
+
+def classification_from_metric_scores(
+    scores: dict[str, int | None],
+    *,
+    positive_label: str,
+    negative_label: str,
+    unavailable_label: str,
+) -> tuple[str, int]:
+    if any(scores.get(field) is None for field in SERVER_TREND_FIELDS):
+        return unavailable_label, 0
+    return management_trend_classification(
+        {field: int(scores[field] or 0) for field in SERVER_TREND_FIELDS},
+        0,
+        improving_label=positive_label,
+        declining_label=negative_label,
+    )
+
+
+def weekly_row_from_daily_records(
+    daily_records: Iterable[dict[str, Any]],
+) -> dict[str, Any] | None:
+    rows = list(daily_records)
+    if not rows:
+        return None
+    gross_sales = sum(float(row.get("gross_sales", 0) or 0) for row in rows)
+    guest_count = sum(float(row.get("guest_count", 0) or 0) for row in rows)
+    wine_sales = sum(float(row.get("wine_sales", 0) or 0) for row in rows)
+    active_dates = {
+        as_date(row.get("report_date"))
+        for row in rows
+        if (
+            float(row.get("guest_count", 0) or 0) > 0
+            or float(row.get("gross_sales", 0) or 0) > 0
+        )
+    }
+    rate_available = all(
+        bool(row.get("rate_available", True))
+        for row in rows
+        if float(row.get("guest_count", 0) or 0) > 0
+    )
+    ticket_available = all(
+        bool(row.get("ticket_time_available", True))
+        for row in rows
+        if float(row.get("guest_count", 0) or 0) > 0
+    )
+    rate_weight = sum(
+        float(row.get("guest_count", 0) or 0)
+        for row in rows
+        if bool(row.get("rate_available", True))
+    )
+    ticket_weight = sum(
+        float(row.get("guest_count", 0) or 0)
+        for row in rows
+        if bool(row.get("ticket_time_available", True))
+    )
+    return {
+        "gross_sales": gross_sales,
+        "guest_count": guest_count,
+        "check_average": gross_sales / guest_count if guest_count else 0.0,
+        "wine_sales": wine_sales,
+        "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
+        "rate_of_sale_by_guest_count": (
+            sum(
+                float(row.get("rate_of_sale_by_guest_count", 0) or 0)
+                * float(row.get("guest_count", 0) or 0)
+                for row in rows
+                if bool(row.get("rate_available", True))
+            )
+            / rate_weight
+            if rate_weight
+            else 0.0
+        ),
+        "average_ticket_time_seconds": (
+            sum(
+                float(row.get("average_ticket_time_seconds", 0) or 0)
+                * float(row.get("guest_count", 0) or 0)
+                for row in rows
+                if bool(row.get("ticket_time_available", True))
+            )
+            / ticket_weight
+            if ticket_weight
+            else 0.0
+        ),
+        "active_days": len({value for value in active_dates if value is not None}),
+        "source_days": len({value for value in active_dates if value is not None}),
+        "rate_available": rate_available,
+        "ticket_time_available": ticket_available,
+        "daily_records": rows,
+    }
+
+
+def evaluate_server_week_signal(
+    current: dict[str, Any],
+    weekly_server_rows: list[dict[str, Any]],
+    full_by_location: dict[str, set[date]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    location = current["location"]
+    current_week_end = current["week_end"]
+    baseline_limit = int(config.get("dashboard_baseline_full_weeks", 4))
+    min_prior_weeks = int(config.get("dashboard_min_prior_full_weeks", 2))
+    min_prior_guests = float(config.get("dashboard_min_prior_guest_count", 50))
+    peer_config = config.get("management_peer_reference", {})
+    peer_prior_limit = int(peer_config.get("prior_full_weeks", 4))
+    min_peer_weeks = int(peer_config.get("min_prior_full_weeks", 3))
+    min_peers_per_week = int(
+        peer_config.get("min_distinct_peers_per_week", 5)
+    )
+    min_peer_server_weeks = int(peer_config.get("min_peer_server_weeks", 20))
+    eligible_week_ends = sorted(
+        week_end
+        for week_end in full_by_location.get(location, set())
+        if week_end < current_week_end
+    )
+    self_week_ends = eligible_week_ends[-baseline_limit:]
+    peer_week_ends = eligible_week_ends[-peer_prior_limit:]
+    prior_rows = [
+        row
+        for row in weekly_server_rows
+        if row["location"] == location
+        and row["raw_user_name"] == current["raw_user_name"]
+        and row["week_end"] in self_week_ends
+    ]
+    baseline = aggregate_weekly_rows(prior_rows)
+    prior_guest_count = sum(
+        float(row.get("guest_count", 0) or 0) for row in prior_rows
+    )
+    full_latest = current_week_end in full_by_location.get(location, set())
+    current_sample_eligible = dashboard_trend_eligible(current, config)
+    self_history_eligible = (
+        len(prior_rows) >= min_prior_weeks
+        and prior_guest_count >= min_prior_guests
+    )
+
+    changes: dict[str, float | None] = {}
+    metric_scores: dict[str, int | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        available = (
+            baseline is not None
+            and management_metric_available(current, field)
+            and management_metric_available(baseline, field)
+        )
+        change = (
+            float(current[field]) - float(baseline[field])
+            if available and baseline is not None
+            else None
+        )
+        changes[field] = change
+        metric_scores[field] = management_metric_score(change, config, field)
+    movement, composite_score = classification_from_metric_scores(
+        metric_scores,
+        positive_label=RecentMovement.UPWARD.value,
+        negative_label=RecentMovement.DOWNWARD.value,
+        unavailable_label=RecentMovement.NOT_EVALUATED.value,
+    )
+
+    peer_references: dict[str, Any] = {}
+    peer_scores: dict[str, int | None] = {}
+    peer_changes: dict[str, float | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        observations = [
+            PeerObservation(
+                person_id=str(row.get("raw_user_name") or ""),
+                location=str(row.get("location") or ""),
+                week_end=row["week_end"],
+                value=(
+                    float(row[field])
+                    if management_metric_available(row, field)
+                    else None
+                ),
+                qualified=dashboard_trend_eligible(row, config),
+                excluded=dashboard_excluded(row, config),
+            )
+            for row in weekly_server_rows
+            if row["location"] == location and row["week_end"] in peer_week_ends
+        ]
+        reference = leave_one_out_same_store_peer_reference(
+            observations,
+            focal_person_id=str(current.get("raw_user_name") or ""),
+            location=location,
+            prior_week_ends=peer_week_ends,
+            max_prior_weeks=peer_prior_limit,
+            min_usable_weeks=min_peer_weeks,
+            min_distinct_peers_per_week=min_peers_per_week,
+            min_peer_weeks=min_peer_server_weeks,
+        )
+        peer_references[field] = reference
+        peer_change = (
+            float(current[field]) - float(reference.value)
+            if reference.sufficient
+            and reference.value is not None
+            and management_metric_available(current, field)
+            else None
+        )
+        peer_changes[field] = peer_change
+        peer_scores[field] = management_metric_score(
+            peer_change,
+            config,
+            field,
+            comparator="peer",
+        )
+    peer_reference_available = all(
+        reference.sufficient for reference in peer_references.values()
+    )
+    peer_score_label, peer_composite_score = classification_from_metric_scores(
+        peer_scores,
+        positive_label=PeerComparison.ABOVE.value,
+        negative_label=PeerComparison.BELOW.value,
+        unavailable_label=PeerComparison.UNAVAILABLE.value,
+    )
+    if (
+        peer_score_label == "Stable"
+        and peer_reference_available
+    ):
+        peer_score_label = PeerComparison.WITHIN.value
+
+    combined_scores: dict[str, int | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        movement_score = metric_scores.get(field)
+        peer_score = peer_scores.get(field)
+        if movement_score is None or peer_score is None:
+            combined_scores[field] = None
+        elif movement_score and peer_score and movement_score * peer_score > 0:
+            direction = 1 if movement_score > 0 else -1
+            combined_scores[field] = direction * min(
+                abs(movement_score), abs(peer_score)
+            )
+        else:
+            combined_scores[field] = 0
+    candidate = classify_candidate(
+        movement,
+        peer_score_label,
+        combined_scores,
+        required_metrics=SERVER_TREND_FIELDS,
+    )
+
+    current_peer_rows = [
+        row
+        for row in weekly_server_rows
+        if row["location"] == location
+        and row["week_end"] == current_week_end
+        and str(row.get("raw_user_name") or "").casefold()
+        != str(current.get("raw_user_name") or "").casefold()
+        and dashboard_trend_eligible(row, config)
+        and not dashboard_excluded(row, config)
+    ]
+    current_peer_changes: dict[str, float | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        valid_values = [
+            float(row[field])
+            for row in current_peer_rows
+            if management_metric_available(row, field)
+        ]
+        reference = peer_references[field]
+        current_peer_changes[field] = (
+            float(median(valid_values)) - float(reference.value)
+            if len(valid_values) >= min_peers_per_week
+            and reference.sufficient
+            and reference.value is not None
+            else None
+        )
+    shock = assess_common_store_shock(
+        candidate.polarity,
+        peer_changes,
+        current_peer_changes,
+        {
+            field: management_metric_band(config, field, comparator="peer")
+            for field in SERVER_TREND_FIELDS
+        },
+        {
+            field: not bool(
+                management_threshold(
+                    config,
+                    field,
+                    comparator="peer",
+                ).get("lower_is_better")
+            )
+            for field in SERVER_TREND_FIELDS
+        },
+        candidate_drivers=candidate.agreeing_drivers,
+    )
+    base_qualified = (
+        full_latest
+        and current_sample_eligible
+        and self_history_eligible
+        and peer_reference_available
+    )
+    candidate_qualified = base_qualified and candidate.eligible
+    full_candidate_polarity = (
+        candidate.polarity
+        if candidate_qualified and shock.guard_passed
+        else CandidatePolarity.NONE
+    )
+
+    daily_records = list(current.get("daily_records", []) or [])
+    leave_one_day_polarities: list[CandidatePolarity] = []
+    if candidate_qualified and daily_records:
+        active_dates = sorted(
+            {
+                as_date(item.get("report_date"))
+                for item in daily_records
+                if (
+                    float(item.get("guest_count", 0) or 0) > 0
+                    or float(item.get("gross_sales", 0) or 0) > 0
+                )
+                and as_date(item.get("report_date")) is not None
+            }
+        )
+        for removed_date in active_dates:
+            reduced = weekly_row_from_daily_records(
+                item
+                for item in daily_records
+                if as_date(item.get("report_date")) != removed_date
+            )
+            if reduced is None or not dashboard_trend_eligible(reduced, config):
+                leave_one_day_polarities.append(CandidatePolarity.NONE)
+                continue
+            reduced_movement_scores: dict[str, int | None] = {}
+            reduced_peer_scores: dict[str, int | None] = {}
+            reduced_peer_changes: dict[str, float | None] = {}
+            for field in SERVER_TREND_FIELDS:
+                movement_change = (
+                    float(reduced[field]) - float(baseline[field])
+                    if baseline is not None
+                    and management_metric_available(reduced, field)
+                    and management_metric_available(baseline, field)
+                    else None
+                )
+                peer_reference = peer_references[field]
+                peer_change = (
+                    float(reduced[field]) - float(peer_reference.value)
+                    if peer_reference.sufficient
+                    and peer_reference.value is not None
+                    and management_metric_available(reduced, field)
+                    else None
+                )
+                reduced_movement_scores[field] = management_metric_score(
+                    movement_change, config, field
+                )
+                reduced_peer_scores[field] = management_metric_score(
+                    peer_change,
+                    config,
+                    field,
+                    comparator="peer",
+                )
+                reduced_peer_changes[field] = peer_change
+            reduced_movement, _ = classification_from_metric_scores(
+                reduced_movement_scores,
+                positive_label=RecentMovement.UPWARD.value,
+                negative_label=RecentMovement.DOWNWARD.value,
+                unavailable_label=RecentMovement.NOT_EVALUATED.value,
+            )
+            reduced_peer_label, _ = classification_from_metric_scores(
+                reduced_peer_scores,
+                positive_label=PeerComparison.ABOVE.value,
+                negative_label=PeerComparison.BELOW.value,
+                unavailable_label=PeerComparison.UNAVAILABLE.value,
+            )
+            if reduced_peer_label == "Stable":
+                reduced_peer_label = PeerComparison.WITHIN.value
+            reduced_combined: dict[str, int | None] = {}
+            for field in SERVER_TREND_FIELDS:
+                left = reduced_movement_scores[field]
+                right = reduced_peer_scores[field]
+                if left is None or right is None:
+                    reduced_combined[field] = None
+                elif left and right and left * right > 0:
+                    reduced_combined[field] = (
+                        1 if left > 0 else -1
+                    ) * min(abs(left), abs(right))
+                else:
+                    reduced_combined[field] = 0
+            reduced_candidate = classify_candidate(
+                reduced_movement,
+                reduced_peer_label,
+                reduced_combined,
+                required_metrics=SERVER_TREND_FIELDS,
+            )
+            reduced_shock = assess_common_store_shock(
+                reduced_candidate.polarity,
+                reduced_peer_changes,
+                current_peer_changes,
+                {
+                    field: management_metric_band(
+                        config,
+                        field,
+                        comparator="peer",
+                    )
+                    for field in SERVER_TREND_FIELDS
+                },
+                {
+                    field: not bool(
+                        management_threshold(
+                            config,
+                            field,
+                            comparator="peer",
+                        ).get(
+                            "lower_is_better"
+                        )
+                    )
+                    for field in SERVER_TREND_FIELDS
+                },
+                candidate_drivers=reduced_candidate.agreeing_drivers,
+            )
+            leave_one_day_polarities.append(
+                reduced_candidate.polarity
+                if reduced_candidate.eligible and reduced_shock.guard_passed
+                else CandidatePolarity.NONE
+            )
+    day_stable = leave_one_day_stability(
+        full_candidate_polarity, leave_one_day_polarities
+    )
+
+    if not full_latest:
+        evidence_status = "Incomplete Week"
+    elif not current_sample_eligible:
+        evidence_status = "Limited Volume"
+    elif not self_history_eligible:
+        evidence_status = "Limited History"
+    elif any(
+        not management_metric_available(current, field)
+        for field in SERVER_TREND_FIELDS
+    ):
+        evidence_status = "Data Issue"
+    elif not peer_reference_available:
+        evidence_status = "Reference Unavailable"
+    elif candidate_qualified and not day_stable:
+        evidence_status = "Sensitive"
+    elif candidate_qualified and shock.guard_passed:
+        evidence_status = "Stable"
+    else:
+        evidence_status = "Eligible"
+
+    return {
+        "prior_rows": prior_rows,
+        "prior_week_ends": self_week_ends,
+        "prior_guest_count": prior_guest_count,
+        "baseline": baseline,
+        "full_latest": full_latest,
+        "current_sample_eligible": current_sample_eligible,
+        "self_history_eligible": self_history_eligible,
+        "changes": changes,
+        "metric_scores": metric_scores,
+        "composite_score": composite_score,
+        "movement": movement if base_qualified else RecentMovement.NOT_EVALUATED.value,
+        "peer_comparison": (
+            peer_score_label
+            if peer_reference_available
+            else PeerComparison.UNAVAILABLE.value
+        ),
+        "peer_composite_score": peer_composite_score,
+        "peer_changes": peer_changes,
+        "peer_scores": peer_scores,
+        "peer_references": peer_references,
+        "peer_reference_available": peer_reference_available,
+        "combined_scores": combined_scores,
+        "candidate": candidate,
+        "candidate_qualified": candidate_qualified,
+        "store_shock": shock,
+        "day_stable": day_stable,
+        "leave_one_day_polarities": leave_one_day_polarities,
+        "evidence_status": evidence_status,
+    }
 
 
 def management_server_rows(
@@ -4545,9 +5362,6 @@ def management_server_rows(
     if not weekly_server_rows:
         return []
     latest_week_end = max(row["week_end"] for row in weekly_server_rows)
-    baseline_limit = int(config.get("dashboard_baseline_full_weeks", 4))
-    min_prior_weeks = int(config.get("dashboard_min_prior_full_weeks", 2))
-    min_prior_guests = float(config.get("dashboard_min_prior_guest_count", 50))
     long_term_limit = int(config.get("dashboard_long_term_full_weeks", 8))
     long_term_block = int(config.get("dashboard_long_term_block_weeks", 4))
     full_min_recent_guests = float(
@@ -4572,70 +5386,35 @@ def management_server_rows(
         config.get("dashboard_long_term_developing_min_earlier_guests", 50)
     )
     full_by_location, _ = full_week_ends_by_location(weekly_location_rows)
-    rank_lookup = {
-        (row["week_end"], row["location"], row["raw_user_name"]): row for row in ranked_rows
-    }
-    location_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in weekly_location_rows:
-        location_rows[row["location"]].append(row)
+    evaluations: dict[tuple[date, str, str], dict[str, Any]] = {}
+
+    def evaluation_for(row: dict[str, Any]) -> dict[str, Any]:
+        key = (row["week_end"], row["location"], row["raw_user_name"])
+        if key not in evaluations:
+            evaluations[key] = evaluate_server_week_signal(
+                row, weekly_server_rows, full_by_location, config
+            )
+        return evaluations[key]
 
     output: list[dict[str, Any]] = []
     for current in weekly_server_rows:
         if current["week_end"] != latest_week_end or dashboard_excluded(current, config):
             continue
         location = current["location"]
-        eligible_week_ends = sorted(
-            week_end
-            for week_end in full_by_location.get(location, set())
-            if week_end < latest_week_end
-        )[-baseline_limit:]
-        prior_rows = [
-            row
-            for row in weekly_server_rows
-            if row["location"] == location
-            and row["raw_user_name"] == current["raw_user_name"]
-            and row["week_end"] in eligible_week_ends
-        ]
-        baseline = aggregate_weekly_rows(prior_rows)
-        location_baseline = aggregate_weekly_rows(
-            row
-            for row in location_rows.get(location, [])
-            if row["week_end"] in eligible_week_ends
-        )
-        prior_guest_count = sum(float(row.get("guest_count", 0) or 0) for row in prior_rows)
-        full_latest = latest_week_end in full_by_location.get(location, set())
-        current_sample_eligible = dashboard_trend_eligible(current, config)
-        prominent = (
-            full_latest
-            and current_sample_eligible
-            and len(prior_rows) >= min_prior_weeks
-            and prior_guest_count >= min_prior_guests
-        )
-
-        metric_scores: dict[str, int] = {}
-        changes: dict[str, float | None] = {}
+        evaluated = evaluation_for(current)
+        prior_rows = evaluated["prior_rows"]
+        changes = evaluated["changes"]
+        metric_scores = evaluated["metric_scores"]
         positive_drivers: list[str] = []
         negative_drivers: list[str] = []
         for field in SERVER_TREND_FIELDS:
-            change = current[field] - baseline[field] if baseline else None
-            score = directional_score(change, management_threshold(config, field))
-            changes[field] = change
-            metric_scores[field] = score
+            change = changes[field]
+            score = metric_scores[field]
             if change is not None and score > 0:
                 positive_drivers.append(metric_driver(field, change))
             elif change is not None and score < 0:
                 negative_drivers.append(metric_driver(field, change))
-
-        average_rank_move, rank_score = management_rank_block_movement(
-            [current], prior_rows, rank_lookup
-        )
-        scored_momentum, composite_score = management_trend_classification(
-            metric_scores,
-            rank_score,
-            improving_label="Rising",
-            declining_label="Falling",
-        )
-        momentum = scored_momentum if prominent else "Not Scored"
+        movement = evaluated["movement"]
 
         history_week_ends = sorted(
             week_end
@@ -4706,121 +5485,177 @@ def management_server_rows(
                 else None
             )
             long_term_changes[field] = change
-            long_term_metric_scores[field] = directional_score(
-                change, management_threshold(config, field)
+            long_term_metric_scores[field] = management_metric_score(
+                change, config, field
             )
-        long_term_average_rank_move, long_term_rank_modifier = management_rank_block_movement(
-            recent_history_rows, earlier_history_rows, rank_lookup
-        )
-        scored_long_term_direction, long_term_composite_score = management_trend_classification(
+        scored_long_term_direction, long_term_composite_score = classification_from_metric_scores(
             long_term_metric_scores,
-            long_term_rank_modifier,
-            improving_label="Improving",
-            declining_label="Declining",
+            positive_label=RecentMovement.UPWARD.value,
+            negative_label=RecentMovement.DOWNWARD.value,
+            unavailable_label=RecentMovement.NOT_EVALUATED.value,
         )
         long_term_direction = (
             scored_long_term_direction
-            if full_latest and history_label in {"Full", "Developing"}
-            else "Not Scored"
+            if evaluated["full_latest"] and history_label in {"Full", "Developing"}
+            else RecentMovement.NOT_EVALUATED.value
         )
 
-        benchmark_values: dict[str, float | None] = {}
+        benchmark_values = {
+            field: evaluated["peer_references"][field].value
+            for field in SERVER_TREND_FIELDS
+        }
         benchmark_sources: dict[str, str] = {}
         level_statuses: dict[str, str] = {}
         for field in SERVER_TREND_FIELDS:
             target_value = targets.get(location, {}).get(field)
-            benchmark_value = target_value if target_value is not None else (
-                location_baseline.get(field) if location_baseline else None
-            )
-            benchmark_values[field] = benchmark_value
             benchmark_sources[field] = (
-                "Target" if target_value is not None else f"{len(eligible_week_ends)}-week baseline"
+                "Same-store prior-four-week median"
+                if evaluated["peer_references"][field].sufficient
+                else "Reference unavailable"
             )
-            if benchmark_value is None:
+            score = evaluated["peer_scores"][field] if "peer_scores" in evaluated else None
+            if score is None:
                 level_statuses[field] = "Unavailable"
-                continue
-            threshold = management_threshold(config, field)
-            variance = directional_variance(current[field], benchmark_value, threshold)
-            neutral = float(threshold["neutral"])
-            level_statuses[field] = (
-                "Above" if variance >= neutral else "Below" if variance <= -neutral else "On Track"
-            )
-        below_count = sum(status == "Below" for status in level_statuses.values())
-        above_count = sum(status == "Above" for status in level_statuses.values())
-        available_levels = sum(status != "Unavailable" for status in level_statuses.values())
-        if not available_levels:
-            performance_level = "Insufficient History"
-        elif below_count >= 2:
-            performance_level = "Below Benchmark"
-        elif above_count >= 2 and below_count <= 1:
-            performance_level = "Above Benchmark"
-        else:
-            performance_level = "On Track"
+            else:
+                level_statuses[field] = (
+                    "Above"
+                    if score > 0
+                    else "Below"
+                    if score < 0
+                    else "Within"
+                )
+        peer_comparison = evaluated["peer_comparison"]
 
-        if not full_latest:
-            priority, action, confidence = "Monitor", "Monitor", "Incomplete Week"
-        elif not current_sample_eligible:
-            priority, action, confidence = "Monitor", "Monitor", "Low Sample"
-        elif not prominent:
-            priority, action, confidence = "Monitor", "Monitor", "Building History"
-        elif momentum == "Falling" and performance_level == "Below Benchmark":
-            priority, action, confidence = "High", "Coach Now", "High"
-        elif momentum == "Falling":
-            priority, action, confidence = "Medium", "Protect Performance", "High"
-        elif momentum == "Rising" and performance_level == "Below Benchmark":
-            priority, action, confidence = "Medium", "Reinforce Improvement", "High"
-        elif momentum == "Rising":
-            priority, action, confidence = "Recognize", "Recognize & Replicate", "High"
-        elif performance_level == "Below Benchmark":
-            priority, action, confidence = "Medium", "Coach Fundamentals", "High"
+        previous_row = next(
+            (
+                row
+                for row in weekly_server_rows
+                if row["location"] == location
+                and row["raw_user_name"] == current["raw_user_name"]
+                and row["week_end"] == latest_week_end - timedelta(days=7)
+            ),
+            None,
+        )
+        previous_evaluation = evaluation_for(previous_row) if previous_row else None
+        current_candidate = evaluated["candidate"]
+        current_week_signal = WeeklyCandidateSignal(
+            week_end=latest_week_end,
+            polarity=current_candidate.polarity,
+            drivers=current_candidate.agreeing_drivers,
+            qualified=evaluated["candidate_qualified"],
+            leave_one_day_stable=evaluated["day_stable"],
+            store_shock_guard_passed=evaluated["store_shock"].guard_passed,
+        )
+        previous_week_signal = None
+        if previous_row is not None and previous_evaluation is not None:
+            previous_candidate = previous_evaluation["candidate"]
+            previous_week_signal = WeeklyCandidateSignal(
+                week_end=previous_row["week_end"],
+                polarity=previous_candidate.polarity,
+                drivers=previous_candidate.agreeing_drivers,
+                qualified=previous_evaluation["candidate_qualified"],
+                leave_one_day_stable=previous_evaluation["day_stable"],
+                store_shock_guard_passed=previous_evaluation[
+                    "store_shock"
+                ].guard_passed,
+            )
+        persistence = evaluate_two_week_persistence(
+            current_week_signal, previous_week_signal
+        )
+        action = persistence.action.value
+        if action == PromptAction.COACHING_PROMPT.value:
+            priority = "Medium"
+        elif action == PromptAction.RECOGNITION_PROMPT.value:
+            priority = "Recognize"
+        elif action == PromptAction.CONTEXT_REVIEW.value:
+            priority = "Review"
         else:
-            priority, action, confidence = "Monitor", "Monitor", "High"
+            priority = "Monitor"
+        evidence_status = evaluated["evidence_status"]
+        if persistence.reason == "day_sensitive":
+            evidence_status = "Sensitive"
+        prominent = action != PromptAction.MONITOR.value
 
         why_parts = []
         if positive_drivers:
             why_parts.append("Improving: " + "; ".join(positive_drivers[:3]))
         if negative_drivers:
             why_parts.append("Watch: " + "; ".join(negative_drivers[:3]))
-        if average_rank_move is not None and rank_score:
-            why_parts.append(f"Rank movement {average_rank_move:+.1f}")
-        if long_term_direction != "Not Scored":
+        if peer_comparison != PeerComparison.UNAVAILABLE.value:
+            why_parts.append(f"Peer comparison {peer_comparison}")
+        if long_term_direction != RecentMovement.NOT_EVALUATED.value:
             why_parts.append(f"8-week direction {long_term_direction} ({history_label})")
+        if evaluated["store_shock"].common_store_shock:
+            why_parts.append("Common-store movement guard applied")
         row = {
             **current,
             "prior_weeks": len(prior_rows),
-            "prior_guest_count": prior_guest_count,
-            "baseline": baseline,
+            "prior_guest_count": evaluated["prior_guest_count"],
+            "baseline": evaluated["baseline"],
             "changes": changes,
             "metric_scores": metric_scores,
-            "rank_modifier": rank_score,
-            "average_rank_movement": average_rank_move,
-            "composite_score": composite_score,
-            "momentum": momentum,
+            "rank_modifier": 0,
+            "average_rank_movement": None,
+            "composite_score": evaluated["composite_score"],
+            "momentum": movement,
             "long_term_direction": long_term_direction,
             "long_term_history_label": history_label,
             "history_used": history_used,
             "long_term_changes": long_term_changes,
             "long_term_metric_scores": long_term_metric_scores,
-            "long_term_rank_modifier": long_term_rank_modifier,
-            "long_term_average_rank_movement": long_term_average_rank_move,
+            "long_term_rank_modifier": 0,
+            "long_term_average_rank_movement": None,
             "long_term_composite_score": long_term_composite_score,
-            "performance_level": performance_level,
+            "performance_level": peer_comparison,
+            "peer_composite_score": evaluated["peer_composite_score"],
             "benchmark_values": benchmark_values,
             "benchmark_sources": benchmark_sources,
             "level_statuses": level_statuses,
+            "peer_changes": evaluated["peer_changes"],
+            "peer_scores": evaluated["peer_scores"],
+            "combined_scores": evaluated["combined_scores"],
+            "target_values": {
+                field: targets.get(location, {}).get(field)
+                for field in SERVER_TREND_FIELDS
+            },
             "positive_drivers": positive_drivers,
             "negative_drivers": negative_drivers,
             "priority": priority,
             "action": action,
-            "confidence": confidence,
+            "confidence": evidence_status,
             "prominent": prominent,
             "why": " | ".join(why_parts) if why_parts else "No material movement",
+            "candidate_polarity": current_candidate.polarity.value,
+            "persistence_reason": persistence.reason,
+            "recurring_driver_fields": list(persistence.recurring_drivers),
+            "stability_result": (
+                "Stable under every active-day removal"
+                if evaluated["day_stable"]
+                else "Sensitive to at least one active-day removal"
+                if evaluated["candidate_qualified"]
+                else "Not applicable"
+            ),
+            "peer_cohort_size": min(
+                reference.distinct_peer_count
+                for reference in evaluated["peer_references"].values()
+            ),
+            "peer_cohort_weeks": min(
+                len(reference.usable_weeks)
+                for reference in evaluated["peer_references"].values()
+            ),
+            "peer_server_weeks": min(
+                reference.peer_week_count
+                for reference in evaluated["peer_references"].values()
+            ),
+            "threshold_version": config.get(
+                "management_threshold_calibration", {}
+            ).get("version", MANAGEMENT_METHODOLOGY_VERSION),
             "evidence_week_ends": [
                 week_end.isoformat()
                 for week_end in sorted(
                     {
                         latest_week_end,
-                        *eligible_week_ends,
+                        *evaluated["prior_week_ends"],
                         *history_week_ends,
                     }
                 )
@@ -4830,12 +5665,9 @@ def management_server_rows(
             ),
         }
         row["recommended_next_step"] = recommended_server_follow_up(row)
-        context = server_trend_context(momentum, long_term_direction)
-        if context:
-            row["recommended_next_step"] = f"{row['recommended_next_step']} {context}"
         output.append(row)
 
-    priority_order = {"High": 0, "Medium": 1, "Recognize": 2, "Monitor": 3}
+    priority_order = {"Medium": 0, "Review": 1, "Recognize": 2, "Monitor": 3}
     output.sort(
         key=lambda row: (
             priority_order.get(row["priority"], 9),
@@ -4857,6 +5689,9 @@ def management_entity_rows(
     if not weekly_rows:
         return []
     baseline_limit = int(config.get("dashboard_baseline_full_weeks", 4))
+    minimum_baseline_weeks = int(
+        config.get("management_min_entity_baseline_weeks", 2)
+    )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in weekly_rows:
         grouped[row[entity_field]].append(row)
@@ -4918,7 +5753,14 @@ def management_entity_rows(
                 and ticket_change_minutes >= float(materiality["ticket_minutes"]),
             ]
         )
-        if sales_pct is not None and guest_pct is not None and sales_pct <= -float(materiality["sales_pct"]) and guest_pct <= -float(materiality["guest_pct"]):
+        if len(baseline_rows) < minimum_baseline_weeks:
+            priority = "Monitor"
+            status = "Limited History"
+            focus = (
+                f"Wait for at least {minimum_baseline_weeks} complete baseline weeks "
+                "before opening an operational review."
+            )
+        elif sales_pct is not None and guest_pct is not None and sales_pct <= -float(materiality["sales_pct"]) and guest_pct <= -float(materiality["guest_pct"]):
             priority = "High"
             status = "Traffic Watch"
             focus = "Review traffic drivers, staffing, holidays, and the event calendar."
@@ -4993,14 +5835,38 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
 
 def validate_action_board_records(
     records: list[dict[str, Any]],
+    *,
+    allowed_reviewers: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Reject pasted status values that Excel list validation can be made to bypass."""
+    """Normalize legacy headers and reject pasted workflow values that bypass Excel."""
     canonical_statuses = {
         status.casefold(): status
         for status in ACTION_STATUS_CHOICES
     }
+    canonical_dispositions = {
+        disposition.casefold(): disposition
+        for disposition in REVIEW_DISPOSITION_CHOICES
+    }
+    allowed_reviewer_keys = (
+        {
+            str(reviewer).strip().casefold()
+            for reviewer in allowed_reviewers
+            if str(reviewer).strip()
+        }
+        if allowed_reviewers is not None
+        else None
+    )
     allowed_text = ", ".join(ACTION_STATUS_CHOICES)
     for row_number, record in enumerate(records, start=5):
+        legacy_schema = "Manager Notes" in record and "Context Notes" not in record
+        for old, new in (
+            ("Manager Notes", "Context Notes"),
+            ("Performance Level", "Peer Comparison"),
+            ("Momentum", "Recent Movement"),
+            ("Confidence", "Evidence Status"),
+        ):
+            if is_blank(record.get(new)) and not is_blank(record.get(old)):
+                record[new] = record.get(old)
         raw_status = record.get("Status")
         status_text = "" if is_blank(raw_status) else str(raw_status).strip()
         canonical_status = canonical_statuses.get(status_text.casefold())
@@ -5012,6 +5878,55 @@ def validate_action_board_records(
                 "No workbooks were created and no source files were moved."
             )
         record["Status"] = canonical_status
+        raw_disposition = record.get("Review Disposition")
+        disposition_text = (
+            "Pending Review"
+            if is_blank(raw_disposition)
+            else str(raw_disposition).strip()
+        )
+        canonical_disposition = canonical_dispositions.get(
+            disposition_text.casefold()
+        )
+        if canonical_disposition is None:
+            action_id = str(record.get("Action ID") or f"row {row_number}")
+            allowed = ", ".join(REVIEW_DISPOSITION_CHOICES)
+            raise ValueError(
+                f"Action Board Review Disposition values must be one of {allowed}; "
+                f"received {raw_disposition!r} for action {action_id!r}. "
+                "No workbooks were created and no source files were moved."
+            )
+        record["Review Disposition"] = canonical_disposition
+        if legacy_schema:
+            record.setdefault("Reviewed By", "")
+            record.setdefault("Review Date", None)
+            continue
+        review_completed = canonical_disposition != "Pending Review"
+        status_requires_review = canonical_status.casefold() not in {
+            "review needed",
+            "open",
+        }
+        if review_completed or status_requires_review:
+            reviewer = str(record.get("Reviewed By") or "").strip()
+            review_date = as_date(record.get("Review Date"))
+            if canonical_disposition == "Pending Review" or not reviewer or review_date is None:
+                action_id = str(record.get("Action ID") or f"row {row_number}")
+                raise ValueError(
+                    f"Action {action_id!r} cannot move to {canonical_status} until "
+                    "Review Disposition, Reviewed By, and Review Date are complete. "
+                    "No workbooks were created and no source files were moved."
+                )
+            if (
+                allowed_reviewer_keys is not None
+                and reviewer.casefold() not in allowed_reviewer_keys
+            ):
+                action_id = str(record.get("Action ID") or f"row {row_number}")
+                raise ValueError(
+                    f"Action {action_id!r} Reviewed By must name an active person "
+                    "from the Owner Roster. No workbooks were created and no "
+                    "source files were moved."
+                )
+            record["Reviewed By"] = excel_safe_text(reviewer)
+            record["Review Date"] = review_date
     return records
 
 
@@ -5211,10 +6126,13 @@ def read_management_state(
             state["owner_roster_capacity"] = owner_roster_capacity_from_sheet(ws)
         if "Action Board" in wb.sheetnames:
             state["active_actions"] = validate_action_board_records(
-                records_from_sheet(wb["Action Board"], "Action ID")
+                records_from_sheet(wb["Action Board"], "Action ID"),
+                allowed_reviewers=state["owners"],
             )
         if "Action History" in wb.sheetnames:
-            state["action_history"] = records_from_sheet(wb["Action History"], "Action ID")
+            state["action_history"] = validate_action_board_records(
+                records_from_sheet(wb["Action History"], "Action ID")
+            )
         if "Evidence Detail" in wb.sheetnames:
             evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
             state["evidence_by_action_id"] = {
@@ -5632,7 +6550,16 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
                 for col in range(1, ws.max_column + 1)
                 if ws.cell(row=header_row, column=col).value
             }
-            for header in ("Status", "Owner", "Due Date", "Manager Notes"):
+            for header in (
+                "Status",
+                "Owner",
+                "Due Date",
+                "Context Notes",
+                "Manager Notes",
+                "Review Disposition",
+                "Reviewed By",
+                "Review Date",
+            ):
                 col = headers.get(header)
                 if col is None:
                     continue
@@ -5919,7 +6846,10 @@ def expected_management_list_validations(
         action_min_col, action_min_row, action_max_col, action_max_row = range_boundaries(
             action_board.tables["ActionBoardTable"].ref
         )
-        if (action_min_col, action_max_col) != (1, len(ACTION_HEADERS)):
+        if action_min_col != 1 or action_max_col not in {
+            len(ACTION_HEADERS),
+            len(LEGACY_ACTION_HEADERS_V1),
+        }:
             raise IntegrityError("The Action Board table has an unexpected shape.")
         expected.extend(
             [
@@ -5930,15 +6860,41 @@ def expected_management_list_validations(
                     column_range("D", action_min_row + 1, action_max_row),
                     "Action Board status",
                 ),
+            ]
+        )
+        if action_max_col == len(ACTION_HEADERS):
+            expected.extend(
+                [
+                    (
+                        "Action Board",
+                        f"={OWNER_ROSTER_DEFINED_NAME}",
+                        True,
+                        (
+                            column_range("E", action_min_row + 1, action_max_row)
+                            + " "
+                            + column_range("V", action_min_row + 1, action_max_row)
+                        ),
+                        "Action Board owner and reviewer",
+                    ),
+                    (
+                        "Action Board",
+                        f'"{",".join(REVIEW_DISPOSITION_CHOICES)}"',
+                        False,
+                        column_range("U", action_min_row + 1, action_max_row),
+                        "Action Board review disposition",
+                    ),
+                ]
+            )
+        else:
+            expected.append(
                 (
                     "Action Board",
                     f"={OWNER_ROSTER_DEFINED_NAME}",
                     True,
                     column_range("E", action_min_row + 1, action_max_row),
                     "Action Board owner",
-                ),
-            ]
-        )
+                )
+            )
     elif records_from_sheet(action_board, "Action ID"):
         raise IntegrityError("The Action Board table is missing.")
     return expected
@@ -6025,9 +6981,12 @@ def validate_management_workbook_controls(
         raise IntegrityError("Management Setup is missing a required protected input table.")
     if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
         raise IntegrityError("The active-owner workbook name is missing.")
-    owner_roster_from_sheet(setup)
+    owner_roster = owner_roster_from_sheet(setup)
     action_board = wb["Action Board"]
-    validate_action_board_records(records_from_sheet(action_board, "Action ID"))
+    validate_action_board_records(
+        records_from_sheet(action_board, "Action ID"),
+        allowed_reviewers=active_owner_names(owner_roster),
+    )
     return setup, action_board
 
 
@@ -6108,6 +7067,46 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
     return actual_digest
 
 
+def validate_v1_action_focus_workbook(path: Path, expected_digest: str) -> str:
+    """Verify the exact v0.2.x protected workbook before one-way v2 migration."""
+
+    required_digest = str(expected_digest).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
+        raise IntegrityError("The v1 workbook requires a valid recorded digest.")
+    reject_unapproved_workbook_drawings(path)
+    wb = load_workbook(path, data_only=False)
+    try:
+        if stamped_workbook_protection_contract(wb) != WORKBOOK_PROTECTION_CONTRACT:
+            raise IntegrityError("The v1 workbook protection contract is unsupported.")
+        validate_management_workbook_controls(
+            wb,
+            protect_objects_and_scenarios=True,
+            visible_sheets=LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS,
+        )
+        expected_validations = expected_management_list_validations(wb)
+        require_exact_validation_count(
+            wb, expected_validations, contract_label="v1 action-focus schema"
+        )
+        for sheet_name, formula1, allow_blank, sqref, label in expected_validations:
+            require_stop_style_list_validation(
+                wb[sheet_name],
+                formula1=formula1,
+                label=label,
+                allow_blank=allow_blank,
+                sqref=sqref,
+            )
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    actual_digest = workbook_generated_content_sha256(path)
+    if stamped != required_digest or actual_digest != required_digest:
+        raise IntegrityError(
+            "V1 workbook verification failed: the recorded, stamped, and actual "
+            "generated-content digests must match exactly."
+        )
+    return actual_digest
+
+
 def validate_previous_action_schema_workbook(
     path: Path, expected_digest: str
 ) -> str:
@@ -6167,12 +7166,19 @@ def validate_pre_contract_management_workbook(path: Path, expected_digest: str) 
             raise IntegrityError(
                 "The compatibility verifier only accepts a markerless pre-contract workbook."
             )
+        has_action_focus_schema = all(
+            name in wb.sheetnames
+            for name in ("Action Focus", "Evidence Detail")
+        )
         legacy_visible_sheets = (
-            VISIBLE_MANAGEMENT_SHEETS
-            if all(
-                name in wb.sheetnames
-                for name in ("Action Focus", "Evidence Detail")
+            LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS
+            if (
+                has_action_focus_schema
+                and "Rising & Falling Stars" in wb.sheetnames
+                and "Recent Movement Signals" not in wb.sheetnames
             )
+            else VISIBLE_MANAGEMENT_SHEETS
+            if has_action_focus_schema
             else PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS
         )
         validate_management_workbook_controls(
@@ -6227,11 +7233,29 @@ def verify_existing_management_workbook_integrity(
         has_action_focus_schema = all(
             name in wb.sheetnames for name in ("Action Focus", "Evidence Detail")
         )
+        action_headers = (
+            {
+                str(cell.value)
+                for cell in wb["Action Board"][4]
+                if cell.value is not None
+            }
+            if "Action Board" in wb.sheetnames
+            else set()
+        )
+        has_v2_action_schema = {
+            "Context Notes",
+            "Review Disposition",
+            "Evidence Status",
+        }.issubset(action_headers)
     finally:
         wb.close()
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
-        if has_action_focus_schema:
+        if has_v2_action_schema:
             return validate_management_workbook(path, expected_digest or stamped)
+        if has_action_focus_schema:
+            return validate_v1_action_focus_workbook(
+                path, expected_digest or stamped or ""
+            )
         return validate_previous_action_schema_workbook(
             path, expected_digest or stamped or ""
         )
@@ -6268,7 +7292,7 @@ def compact_server_evidence(row: dict[str, Any]) -> str:
         parts.append("Improving: " + "; ".join(row["positive_drivers"][:2]))
     if row["negative_drivers"]:
         parts.append("Watch: " + "; ".join(row["negative_drivers"][:2]))
-    if row.get("long_term_direction") != "Not Scored":
+    if row.get("long_term_direction") != RecentMovement.NOT_EVALUATED.value:
         parts.append(
             f"8-week {row['long_term_direction']} ({row['long_term_history_label']})"
         )
@@ -6278,6 +7302,9 @@ def compact_server_evidence(row: dict[str, Any]) -> str:
 
 def stable_action_code(action: Any) -> str:
     codes = {
+        "coaching prompt": "COACHING_PROMPT",
+        "recognition prompt": "RECOGNITION_PROMPT",
+        "context review": "CONTEXT_REVIEW",
         "coach now": "COACH_NOW",
         "protect performance": "PROTECT_PERFORMANCE",
         "reinforce improvement": "REINFORCE_IMPROVEMENT",
@@ -6295,24 +7322,28 @@ def stable_action_code(action: Any) -> str:
 
 def stable_reason_code(signal: dict[str, Any]) -> str:
     action = str(signal.get("Action") or "").strip().casefold()
-    momentum = str(signal.get("Momentum") or "").strip().casefold()
-    performance = str(signal.get("Performance Level") or "").strip().casefold()
+    movement = str(
+        signal.get("Recent Movement", signal.get("Momentum")) or ""
+    ).strip().casefold()
+    comparison = str(
+        signal.get("Peer Comparison", signal.get("Performance Level")) or ""
+    ).strip().casefold()
     entity_key = str(signal.get("Entity Key") or "").casefold()
     if action == "data quality":
         return "DQ_INCOMPLETE_LATEST_WEEK"
     if action == "paused carryover":
         return "LATEST_WEEK_INCOMPLETE_PRIOR_ACTION_RETAINED"
     if entity_key.startswith("server|"):
-        if momentum == "falling" and performance == "below benchmark":
-            return "SERVER_FALLING_BELOW_BENCHMARK"
-        if momentum == "falling":
-            return "SERVER_FALLING"
-        if momentum == "rising" and performance == "below benchmark":
-            return "SERVER_RISING_BELOW_BENCHMARK"
-        if momentum == "rising":
-            return "SERVER_RISING"
-        if performance == "below benchmark":
-            return "SERVER_BELOW_BENCHMARK"
+        if action == "coaching prompt":
+            return "SERVER_TWO_WEEK_DOWNWARD_BELOW_PEER_STABLE"
+        if action == "recognition prompt":
+            return "SERVER_TWO_WEEK_UPWARD_ABOVE_PEER_STABLE"
+        if action == "context review":
+            if movement == "downward" and comparison == "below peer reference":
+                return "SERVER_DOWNWARD_BELOW_PEER_CONTEXT_REVIEW"
+            if movement == "upward" and comparison == "above peer reference":
+                return "SERVER_UPWARD_ABOVE_PEER_CONTEXT_REVIEW"
+            return "SERVER_CONTEXT_REVIEW"
         return "SERVER_MATERIAL_SIGNAL"
     if entity_key.startswith("store|"):
         return "STORE_" + stable_action_code(signal.get("Signal"))
@@ -6363,6 +7394,20 @@ def enrich_management_signal(signal: dict[str, Any]) -> dict[str, Any]:
                 sort_keys=True,
                 separators=(",", ":"),
             ),
+            "Comparator Type": enriched.get(
+                "Comparator Type", "Same-store prior-four-week median"
+            ),
+            "Peer Cohort Size": enriched.get("Peer Cohort Size", 0),
+            "Peer Cohort Weeks": enriched.get("Peer Cohort Weeks", 0),
+            "Threshold Version": enriched.get(
+                "Threshold Version", MANAGEMENT_METHODOLOGY_VERSION
+            ),
+            "Evidence Status": enriched.get(
+                "Evidence Status",
+                enriched.get("Confidence", ""),
+            ),
+            "Recurring Drivers": enriched.get("Recurring Drivers", ""),
+            "Stability Result": enriched.get("Stability Result", ""),
             "Methodology Version": MANAGEMENT_METHODOLOGY_VERSION,
         }
     )
@@ -6421,13 +7466,23 @@ def refresh_management_evidence(
         metric_evidence = {
             "signal": refreshed.get("Signal"),
             "why_it_matters": refreshed.get("Why It Matters"),
-            "confidence": refreshed.get("Confidence"),
+            "evidence_status": refreshed.get(
+                "Evidence Status", refreshed.get("Confidence")
+            ),
             "provenance_status": (
                 "Legacy action carried forward before row-level source evidence "
                 "was introduced."
             ),
         }
-    for field in ACTION_EVIDENCE_FIELDS:
+    for field in (
+        "Evidence ID",
+        "Action Code",
+        "Reason Code",
+        "Evidence Week Ends",
+        "Evidence Sources",
+        "Metric Evidence",
+        "Methodology Version",
+    ):
         refreshed.pop(field, None)
     refreshed.update(
         {
@@ -6451,7 +7506,11 @@ def build_management_action_signals(
     for row in server_rows if analytical_ready else []:
         if not row["prominent"] or row["action"] == "Monitor":
             continue
-        family = "recognition" if row["action"] == "Recognize & Replicate" else "coaching"
+        family = (
+            "recognition"
+            if row.get("candidate_polarity") == CandidatePolarity.POSITIVE.value
+            else "coaching"
+        )
         entity_key = "|".join(
             ["server", row["location"], str(row["raw_user_name"]), family]
         ).casefold()
@@ -6468,9 +7527,19 @@ def build_management_action_signals(
                 ),
                 "Why It Matters": compact_server_evidence(row),
                 "Recommended Next Step": row["recommended_next_step"],
-                "Performance Level": row["performance_level"],
-                "Momentum": row["momentum"],
-                "Confidence": row["confidence"],
+                "Peer Comparison": row["performance_level"],
+                "Recent Movement": row["momentum"],
+                "Evidence Status": row["confidence"],
+                "Comparator Type": "Same-store prior-four-week median",
+                "Peer Cohort Size": row.get("peer_cohort_size", 0),
+                "Peer Cohort Weeks": row.get("peer_cohort_weeks", 0),
+                "Threshold Version": row.get(
+                    "threshold_version", MANAGEMENT_METHODOLOGY_VERSION
+                ),
+                "Recurring Drivers": ", ".join(
+                    row.get("recurring_driver_fields", []) or []
+                ),
+                "Stability Result": row.get("stability_result", ""),
                 "Last Seen": row["week_end"],
                 "_evidence_week_ends": row.get("evidence_week_ends", []),
                 "_source_evidence": row.get("source_evidence", []),
@@ -6481,10 +7550,19 @@ def build_management_action_signals(
                     },
                     "recent_changes": row.get("changes"),
                     "recent_metric_scores": row.get("metric_scores"),
+                    "peer_changes": row.get("peer_changes"),
+                    "peer_metric_scores": row.get("peer_scores"),
+                    "combined_metric_scores": row.get("combined_scores"),
                     "long_term_changes": row.get("long_term_changes"),
                     "long_term_metric_scores": row.get("long_term_metric_scores"),
                     "benchmark_values": row.get("benchmark_values"),
                     "benchmark_sources": row.get("benchmark_sources"),
+                    "target_values_context_only": row.get("target_values"),
+                    "peer_cohort_size": row.get("peer_cohort_size"),
+                    "peer_cohort_weeks": row.get("peer_cohort_weeks"),
+                    "peer_server_weeks": row.get("peer_server_weeks"),
+                    "persistence_reason": row.get("persistence_reason"),
+                    "stability_result": row.get("stability_result"),
                     "history_used": row.get("history_used"),
                 },
             }
@@ -6513,9 +7591,17 @@ def build_management_action_signals(
                         else "Material movement requires management review"
                     ),
                     "Recommended Next Step": row["recommended_focus"],
-                    "Performance Level": row["status"],
-                    "Momentum": "Watch",
-                    "Confidence": "High" if row["baseline_weeks"] >= 2 else "Low Sample",
+                    "Peer Comparison": row["status"],
+                    "Recent Movement": "Operational Watch",
+                    "Evidence Status": (
+                        "Eligible" if row["baseline_weeks"] >= 2 else "Limited History"
+                    ),
+                    "Comparator Type": "Store/group rolling baseline",
+                    "Peer Cohort Size": 0,
+                    "Peer Cohort Weeks": row["baseline_weeks"],
+                    "Threshold Version": MANAGEMENT_METHODOLOGY_VERSION,
+                    "Recurring Drivers": "",
+                    "Stability Result": "Not applicable",
                     "Last Seen": latest["week_end"],
                     "_evidence_week_ends": row.get("evidence_week_ends", []),
                     "_source_evidence": row.get("source_evidence", []),
@@ -6555,9 +7641,9 @@ def build_management_action_signals(
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": detail,
                     "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
-                    "Performance Level": "Preliminary",
-                    "Momentum": "Not Scored",
-                    "Confidence": "Low Sample",
+                    "Peer Comparison": "Preliminary",
+                    "Recent Movement": "Not Evaluated",
+                    "Evidence Status": "Incomplete Week",
                     "Last Seen": readiness.latest_week_end,
                     "_evidence_week_ends": [readiness.latest_week_end.isoformat()],
                     "_source_evidence": (
@@ -6583,9 +7669,9 @@ def build_management_action_signals(
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": f"Missing {readiness.missing_text}",
                     "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
-                    "Performance Level": "Preliminary",
-                    "Momentum": "Not Scored",
-                    "Confidence": "Low Sample",
+                    "Peer Comparison": "Preliminary",
+                    "Recent Movement": "Not Evaluated",
+                    "Evidence Status": "Incomplete Week",
                     "Last Seen": readiness.latest_week_end,
                     "_evidence_week_ends": [readiness.latest_week_end.isoformat()],
                     "_source_evidence": merged_source_evidence(
@@ -6617,9 +7703,9 @@ def build_management_action_signals(
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": f"{row['source_days']} of {OPERATING_WEEK_DAYS} source days",
                     "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
-                    "Performance Level": "Preliminary",
-                    "Momentum": "Not Scored",
-                    "Confidence": "Low Sample",
+                    "Peer Comparison": "Preliminary",
+                    "Recent Movement": "Not Evaluated",
+                    "Evidence Status": "Incomplete Week",
                     "Last Seen": latest_week_end,
                     "_evidence_week_ends": [latest_week_end.isoformat()],
                     "_source_evidence": row.get("source_evidence", []),
@@ -6671,10 +7757,30 @@ def merge_management_actions(
         if prior and prior_status not in completed_statuses:
             first_seen = as_date(prior.get("First Seen")) or last_seen
             action_id = str(prior.get("Action ID") or action_episode_id(key, first_seen))
-            status = prior.get("Status") or "Open"
+            status = prior.get("Status") or "Review Needed"
+            if (
+                "Review Disposition" not in prior
+                and str(status).casefold() in {"open", "in progress", "blocked"}
+            ):
+                status = "Review Needed"
             owner = prior.get("Owner") or ""
             due_date = as_date(prior.get("Due Date"))
-            notes = prior.get("Manager Notes") or ""
+            notes = prior.get("Context Notes", prior.get("Manager Notes")) or ""
+            same_evidence = (
+                str(prior.get("Evidence ID") or "")
+                == str(signal.get("Evidence ID") or "")
+            )
+            if not same_evidence:
+                status = "Review Needed"
+            review_disposition = (
+                prior.get("Review Disposition") or "Pending Review"
+                if same_evidence
+                else "Pending Review"
+            )
+            reviewed_by = prior.get("Reviewed By") or "" if same_evidence else ""
+            review_date = (
+                as_date(prior.get("Review Date")) if same_evidence else None
+            )
         else:
             if prior:
                 completed = dict(prior)
@@ -6682,7 +7788,12 @@ def merge_management_actions(
                 history.append(completed)
             first_seen = last_seen
             action_id = action_episode_id(key, first_seen)
-            status, owner, due_date, notes = "Open", "", None, ""
+            status, owner, due_date, notes = "Review Needed", "", None, ""
+            review_disposition, reviewed_by, review_date = (
+                "Pending Review",
+                "",
+                None,
+            )
         weeks_open = max(1, ((last_seen - first_seen).days // 7) + 1)
         current.append(
             {
@@ -6693,8 +7804,11 @@ def merge_management_actions(
                 "Due Date": due_date,
                 "First Seen": first_seen,
                 "Weeks Open": weeks_open,
-                "Manager Notes": notes,
+                "Context Notes": notes,
                 "Signal State": "Current",
+                "Review Disposition": review_disposition,
+                "Reviewed By": reviewed_by,
+                "Review Date": review_date,
             }
         )
     for key, prior in prior_active.items():
@@ -6712,6 +7826,16 @@ def merge_management_actions(
             and not is_data_quality
         ):
             paused = dict(prior)
+            if "Review Disposition" not in paused:
+                paused["Status"] = "Review Needed"
+                paused["Context Notes"] = (
+                    paused.get("Context Notes")
+                    or paused.get("Manager Notes")
+                    or ""
+                )
+                paused["Review Disposition"] = "Pending Review"
+                paused["Reviewed By"] = ""
+                paused["Review Date"] = None
             prior_last_seen = as_date(paused.get("Last Seen"))
             first_seen = (
                 as_date(paused.get("First Seen"))
@@ -6741,9 +7865,9 @@ def merge_management_actions(
                 "Keep the manual assignment on hold until a complete week can confirm, "
                 "update, or clear the prior signal."
             )
-            paused["Performance Level"] = "Preliminary"
-            paused["Momentum"] = "Not Scored"
-            paused["Confidence"] = "Paused"
+            paused["Peer Comparison"] = "Preliminary"
+            paused["Recent Movement"] = "Not Evaluated"
+            paused["Evidence Status"] = "Paused"
             paused["Signal State"] = "Paused / Carryover"
             paused_context = {
                 "latest_week_end": (
@@ -6866,7 +7990,7 @@ def add_management_navigation(ws) -> None:
         ("Actions", "Action Board"),
         ("Servers", "Server Scorecard"),
         ("Stores", "Store & Group Scorecards"),
-        ("Stars", "Rising & Falling Stars"),
+        ("Movement", "Recent Movement Signals"),
         ("Evidence", "Evidence Detail"),
         ("Quality", "Data Quality"),
         ("Setup", "Management Setup"),
@@ -6881,11 +8005,15 @@ def add_management_navigation(ws) -> None:
 def style_management_title(ws, title: str, end_col: int) -> None:
     ws.sheet_view.showGridLines = False
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
-    cell = ws.cell(row=1, column=1, value=title)
+    cell = ws.cell(
+        row=1,
+        column=1,
+        value=f"{title} — {MANAGEMENT_SIGNAL_DISCLAIMER}",
+    )
     cell.fill = PatternFill("solid", fgColor="7A1E1E")
     cell.font = Font(color="FFFFFF", bold=True, size=16)
-    cell.alignment = Alignment(vertical="center")
-    ws.row_dimensions[1].height = 26
+    cell.alignment = Alignment(vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 42
 
 
 def write_management_setup_sheet(
@@ -7123,18 +8251,24 @@ def write_action_tracking_sheet(
     for row_index, row in enumerate(rows, start=header_row + 1):
         for col, value in enumerate(action_row_values(row), start=1):
             cell = ws.cell(row=row_index, column=col, value=value)
-            cell.alignment = Alignment(vertical="top", wrap_text=col in {10, 11, 12, 14})
+            cell.alignment = Alignment(
+                vertical="top", wrap_text=col in {10, 11, 12, 14, 15, 16, 19, 21}
+            )
         priority_style = priority_fill(row.get("Priority"))
         if priority_style:
             ws.cell(row=row_index, column=3).fill = priority_style
         ws.cell(row=row_index, column=6).number_format = "m/d/yyyy"
         ws.cell(row=row_index, column=13).number_format = "m/d/yyyy"
         ws.cell(row=row_index, column=17).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=23).number_format = "m/d/yyyy"
         ws.row_dimensions[row_index].height = 60
     if rows:
         table = Table(
             displayName="ActionBoardTable" if editable else "ActionHistoryTable",
-            ref=f"A{header_row}:T{header_row + len(rows)}",
+            ref=(
+                f"A{header_row}:{get_column_letter(len(ACTION_HEADERS))}"
+                f"{header_row + len(rows)}"
+            ),
         )
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleLight1", showFirstColumn=False, showLastColumn=False,
@@ -7143,14 +8277,11 @@ def write_action_tracking_sheet(
         ws.add_table(table)
     ws.column_dimensions["A"].hidden = True
     ws.column_dimensions["B"].hidden = True
-    ws.column_dimensions["O"].hidden = True
-    ws.column_dimensions["P"].hidden = True
-    ws.column_dimensions["S"].hidden = True
     ws.column_dimensions["T"].hidden = True
     widths = {
         "C": 12, "D": 14, "E": 18, "F": 13, "G": 20, "H": 24, "I": 22,
         "J": 22, "K": 46, "L": 48, "M": 14, "N": 34, "O": 20, "P": 14,
-        "Q": 13, "R": 12, "S": 14,
+        "Q": 13, "R": 12, "S": 18, "T": 14, "U": 22, "V": 18, "W": 13,
     }
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
@@ -7176,7 +8307,7 @@ def write_action_tracking_sheet(
         )
         if editable:
             for row in range(first, last + 1):
-                for col in (4, 5, 6, 14):
+                for col in (4, 5, 6, 14, 21, 22, 23):
                     cell = ws.cell(row=row, column=col)
                     cell.fill = blue_fill
                     cell.protection = Protection(locked=False)
@@ -7198,10 +8329,22 @@ def write_action_tracking_sheet(
                 errorTitle="Choose an active owner",
                 error="Select an active owner from the Owner Roster or leave the cell blank.",
             )
+            disposition_validation = DataValidation(
+                type="list",
+                formula1=f'"{",".join(REVIEW_DISPOSITION_CHOICES)}"',
+                allow_blank=False,
+                showErrorMessage=True,
+                errorStyle="stop",
+                errorTitle="Choose a review disposition",
+                error="Select a review disposition from the list.",
+            )
             ws.add_data_validation(status_validation)
             ws.add_data_validation(owner_validation)
+            ws.add_data_validation(disposition_validation)
             status_validation.add(f"D{first}:D{last}")
             owner_validation.add(f"E{first}:E{last}")
+            owner_validation.add(f"V{first}:V{last}")
+            disposition_validation.add(f"U{first}:U{last}")
             ws.conditional_formatting.add(
                 f"E{first}:E{last}",
                 FormulaRule(
@@ -7210,6 +8353,17 @@ def write_action_tracking_sheet(
                         f'$D{first}<>"Complete",$D{first}<>"Dismissed")'
                     ],
                     fill=amber_fill,
+                ),
+            )
+            ws.conditional_formatting.add(
+                f"U{first}:W{last}",
+                FormulaRule(
+                    formula=[
+                        f'AND(OR($D{first}="Complete",$D{first}="Dismissed"),'
+                        f'OR($U{first}="Pending Review",$U{first}="",'
+                        f'$V{first}="",$W{first}=""))'
+                    ],
+                    fill=red_fill,
                 ),
             )
 
@@ -7227,6 +8381,8 @@ def write_action_focus_sheet(
         "Location",
         "Person / Area",
         "Action",
+        "Evidence Status",
+        "Review Disposition",
         "Recommended Next Step",
         "Why It Matters",
         "Weeks Open",
@@ -7238,8 +8394,8 @@ def write_action_focus_sheet(
         row=3,
         column=1,
         value=(
-            "Immediate manager work only. Use Open Action to update owner, due date, "
-            "status, or notes on the protected Action Board."
+            "Rule-based observational coaching signal—not a statistical, causal, or "
+            "employment decision. Verify comparable work context and source accuracy."
         ),
     )
     ws.cell(row=3, column=1).fill = PatternFill("solid", fgColor="FFF2CC")
@@ -7271,6 +8427,8 @@ def write_action_focus_sheet(
             action.get("Location"),
             action.get("Person / Area"),
             action.get("Action"),
+            action.get("Evidence Status"),
+            action.get("Review Disposition"),
             action.get("Recommended Next Step"),
             action.get("Why It Matters"),
             action.get("Weeks Open"),
@@ -7279,12 +8437,12 @@ def write_action_focus_sheet(
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row=row_index, column=col, value=excel_safe_text(value))
             cell.alignment = Alignment(
-                vertical="top", wrap_text=col in {6, 7, 8, 9}
+                vertical="top", wrap_text=col in {6, 7, 8, 9, 10, 11}
             )
         ws.cell(row=row_index, column=4).number_format = "m/d/yyyy"
         target_row = board_rows.get(action_id)
         if target_row:
-            link = ws.cell(row=row_index, column=11)
+            link = ws.cell(row=row_index, column=13)
             link.hyperlink = f"#'Action Board'!C{target_row}"
             link.style = "Hyperlink"
         fill = priority_fill(action.get("Priority"))
@@ -7294,7 +8452,7 @@ def write_action_focus_sheet(
     if actionable:
         table = Table(
             displayName="ActionFocusTable",
-            ref=f"A{header_row}:K{header_row + len(actionable)}",
+            ref=f"A{header_row}:M{header_row + len(actionable)}",
         )
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",
@@ -7312,10 +8470,12 @@ def write_action_focus_sheet(
         "E": 20,
         "F": 24,
         "G": 23,
-        "H": 50,
-        "I": 44,
-        "J": 12,
-        "K": 19,
+        "H": 18,
+        "I": 22,
+        "J": 50,
+        "K": 44,
+        "L": 12,
+        "M": 19,
     }.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "E6"
@@ -7372,7 +8532,7 @@ def write_evidence_detail_sheet(
                 wrap_text=header
                 in {"Evidence Sources", "Metric Evidence", "Evidence Week Ends"},
             )
-            if header in {"Due Date", "Last Seen"}:
+            if header in {"Due Date", "Last Seen", "Review Date"}:
                 cell.number_format = "m/d/yyyy"
         action_id = str(action.get("Action ID") or "")
         target_row = board_rows.get(action_id)
@@ -7416,6 +8576,21 @@ def write_evidence_detail_sheet(
     }
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
+    for header, width in {
+        "Comparator Type": 34,
+        "Peer Cohort Size": 16,
+        "Peer Cohort Weeks": 16,
+        "Threshold Version": 18,
+        "Evidence Status": 18,
+        "Recurring Drivers": 32,
+        "Stability Result": 42,
+        "Review Disposition": 22,
+        "Reviewed By": 18,
+        "Review Date": 13,
+    }.items():
+        ws.column_dimensions[
+            get_column_letter(EVIDENCE_DETAIL_HEADERS.index(header) + 1)
+        ].width = width
     ws.freeze_panes = "E5"
     ws.sheet_view.zoomScale = 70
 
@@ -7427,9 +8602,9 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
         "Location",
         "Server",
         "Current Sample",
-        "Confidence",
-        "Performance",
-        "Recent Momentum",
+        "Evidence Status",
+        "Peer Comparison",
+        "Recent Movement",
         "8-Week Direction",
         "History Used",
         "Positive Drivers",
@@ -7461,6 +8636,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
             "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
         },
     )
+    style_management_title(ws, "Server Scorecard", len(headers))
     ws.freeze_panes = "D4"
     ws.sheet_view.zoomScale = 80
     ws.row_dimensions[3].height = 30
@@ -7476,15 +8652,22 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
 
 def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     remove_sheet_if_present(wb, "Rising & Falling Stars")
-    star_rows = [row for row in rows if row["prominent"] and row["momentum"] in {"Rising", "Falling"}]
+    remove_sheet_if_present(wb, "Recent Movement Signals")
+    star_rows = [
+        row
+        for row in rows
+        if row["prominent"]
+        and row["momentum"]
+        in {RecentMovement.UPWARD.value, RecentMovement.DOWNWARD.value}
+    ]
     headers = [
         "Category",
         "Action",
         "Location",
         "Server",
         "Current Sample",
-        "Performance",
-        "Recent Momentum",
+        "Peer Comparison",
+        "Recent Movement",
         "8-Week Direction",
         "History Used",
         "Positive Drivers",
@@ -7493,7 +8676,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
     ]
     data = [
         [
-            f"{row['momentum']} Star",
+            f"{row['momentum']} Movement Signal",
             row["action"],
             row["location"],
             excel_safe_text(row["display_name"]),
@@ -7509,12 +8692,17 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
         for row in star_rows
     ]
     ws = write_table_sheet(
-        wb, "Rising & Falling Stars", headers, data, "RisingFallingStarsV2",
+        wb,
+        "Recent Movement Signals",
+        headers,
+        data,
+        "RecentMovementSignalsV3",
         widths={
             "A": 15, "B": 24, "C": 20, "D": 24, "E": 22, "F": 20,
             "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
         },
     )
+    style_management_title(ws, "Recent Movement Signals", len(headers))
     ws.freeze_panes = "E4"
     ws.sheet_view.zoomScale = 80
     ws.row_dimensions[3].height = 30
@@ -7856,12 +9044,29 @@ def write_management_data_quality_sheet(
         }
         parsers = {record.parser_engine for record in source_records if record.parser_engine}
         formats = {record.source_format for record in source_records if record.source_format}
-        status = (
-            "Verified"
-            if len(hashes) == 1
+        unavailable_metrics = sorted(
+            {
+                metric
+                for record in source_records
+                if record.guest_count > 0
+                for metric, available in (
+                    ("Rate of Sale", record.rate_available),
+                    ("Ticket Time", record.ticket_time_available),
+                )
+                if not available
+            }
+        )
+        provenance_verified = (
+            len(hashes) == 1
             and len(date_sources) == 1
             and len(parsers) == 1
             and len(formats) == 1
+        )
+        status = (
+            "Metric unavailable: " + ", ".join(unavailable_metrics)
+            if unavailable_metrics
+            else "Verified"
+            if provenance_verified
             else "Review"
         )
         values = [
@@ -8171,7 +9376,7 @@ def write_management_dashboard_sheet(
     ws["A3"].alignment = Alignment(vertical="center")
     ws.merge_cells("A4:L4")
     ws["A4"] = (
-        "READY FOR MANAGEMENT REVIEW - comparisons, actions, and recognition are active"
+        "READY FOR HUMAN REVIEW - rule-based prompts are available for context checking"
         if latest_complete
         else f"PRELIMINARY - missing {missing_text or 'daily reports'}; comparisons, actions, and recognition are paused"
     )
@@ -8216,16 +9421,16 @@ def write_management_dashboard_sheet(
 
     if latest_complete:
         action_value: str | int = len(all_action_items)
-        action_note = "Open coaching and review items"
+        action_note = "Open coaching-context review items"
         action_color = "C00000" if all_action_items else "548235"
     else:
         action_value, action_note, action_color = "PAUSED", f"Missing {missing_text or 'daily reports'}", "7F7F7F"
     write_dashboard_card(
-        ws, 9, "High-Priority Actions", action_value, action_note, action_color
+        ws, 9, "Review Items", action_value, action_note, action_color
     )
 
     ws.merge_cells("A11:L11")
-    ws["A11"] = "TOP THREE ACTIONS"
+    ws["A11"] = "TOP THREE REVIEW ITEMS"
     ws["A11"].fill = PatternFill("solid", fgColor="E7E6E6")
     ws["A11"].font = Font(bold=True, color="7A1E1E")
     action_headers = [
@@ -8347,7 +9552,7 @@ def write_management_dashboard_sheet(
         ws.row_dimensions[row_index].height = 36
 
     ws.merge_cells("A22:L22")
-    ws["A22"] = "RECOGNITION / REPLICATE"
+    ws["A22"] = "RECOGNITION REVIEW"
     ws["A22"].fill = PatternFill("solid", fgColor="E7E6E6")
     ws["A22"].font = Font(bold=True, color="7A1E1E")
     ws.merge_cells("A23:L23")
@@ -8434,21 +9639,22 @@ def write_management_run_notes(
         ("Report Conflicts", "None; conflicting same-date reports stop the run before output or archiving."),
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
-        ("Recent Momentum", f"Latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete weeks. Partial latest weeks and low current samples are Not Scored."),
-        ("Recent Momentum Confidence", f"Latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests."),
+        ("Recent Movement", f"Latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete person-weeks. Partial weeks, limited samples, missing metrics, and insufficient references are Not Evaluated."),
+        ("Evidence Status", f"Eligibility requires latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests. This is not statistical confidence."),
         ("8-Week Direction", f"Compares the most recent {config.get('dashboard_long_term_block_weeks', 4)} complete weeks with the preceding {config.get('dashboard_long_term_block_weeks', 4)}. Full uses eight server weeks with at least {config.get('dashboard_long_term_full_min_recent_guests', 100)} recent / {config.get('dashboard_long_term_full_min_earlier_guests', 100)} earlier guests; Developing requires at least {config.get('dashboard_long_term_developing_min_total_weeks', 6)} usable weeks, {config.get('dashboard_long_term_developing_min_recent_weeks', 3)} recent / {config.get('dashboard_long_term_developing_min_earlier_weeks', 2)} earlier weeks, and {config.get('dashboard_long_term_developing_min_recent_guests', 75)} recent / {config.get('dashboard_long_term_developing_min_earlier_guests', 50)} earlier guests."),
-        ("Targets", "Management Setup targets take precedence; blank targets use the rolling baseline. Edits apply on the next run."),
-        ("Trend Scoring", "Both trend horizons use four metric families scored from -2 to +2 using materiality bands; average rank movement contributes only -1, 0, or +1."),
-        ("Performance Level", "Latest metrics are assessed separately as Above Benchmark, On Track, or Below Benchmark."),
-        ("Technical Trend Detail", "Server Week-over-Week Detail shows adjacent-week changes for audit use. Management coaching uses Recent Momentum and 8-Week Direction instead."),
-        ("Action Tracking", "Owner, due date, status, and manager notes carry forward between weekly runs. Cleared signals move to Action History."),
+        ("Peer Comparison", "Person-level comparison uses a leave-one-person-out same-store median pooled across the prior four complete weeks. It fails closed when cohort sufficiency gates are not met. Store totals are never a person fallback."),
+        ("Targets", "Management Setup targets apply only to store/group operational context. They do not create person-level coaching prompts."),
+        ("Signal Scoring", "Movement and peer comparison use separately calibrated four-metric bands. Rank is display-only and contributes no points. A prompt requires aligned movement and peer context, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
+        ("Review Gate", "Generated rows start at Review Needed. A later workflow state requires Review Disposition, Reviewed By, and Review Date; the signal cannot be the sole basis for an adverse employment decision."),
+        ("Technical Trend Detail", "Server Week-over-Week Detail is descriptive audit context. Generated coaching prompts use Recent Movement, peer comparison, evidence stability, and two-week persistence."),
+        ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward between weekly runs. Cleared signals move to Action History."),
         (
             "Evidence Contract",
             "Action and reason codes, exact evidence weeks, source hashes/parser "
-            f"provenance, and metric inputs use methodology {MANAGEMENT_METHODOLOGY_VERSION}.",
+            f"provenance, comparator/cohort metadata, review disposition, and metric inputs use methodology {MANAGEMENT_METHODOLOGY_VERSION}.",
         ),
         ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
-        ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
+        ("Metric Caveat", "Rate of sale direction and guest-weighted ticket-time aggregation remain source-owner assumptions. Treat them as descriptive coaching context until Toast confirms definitions and denominators."),
     ]
     for row, (label, value) in enumerate(note_rows, start=4):
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
@@ -8488,7 +9694,7 @@ def finalize_management_workbook(wb: Workbook) -> None:
     tab_colors = {
         "Dashboard": "7A1E1E", "Action Focus": "C00000",
         "Action Board": "C00000", "Server Scorecard": "5B9BD5",
-        "Store & Group Scorecards": "70AD47", "Rising & Falling Stars": "FFC000",
+        "Store & Group Scorecards": "70AD47", "Recent Movement Signals": "FFC000",
         "Evidence Detail": "8064A2", "Action History": "A5A5A5",
         "Data Quality": "5B9BD5", "Management Setup": "4472C4",
         "Run Notes": "7F7F7F",
@@ -8556,7 +9762,8 @@ def write_master_workbook(
             remove_sheet_if_present(wb, "_Data Quality Detail")
             wb["Data Quality"].title = "_Data Quality Detail"
         for name in (
-            "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars", "Run Notes",
+            "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars",
+            "Recent Movement Signals", "Run Notes",
             "Server Scorecard", "Store & Group Scorecards", "Action History", "Management Setup",
             "Evidence Detail",
         ):
@@ -9928,6 +11135,8 @@ def run(args: argparse.Namespace) -> list[Path]:
         if bool(getattr(args, "initialize_integrity_baseline", False))
         else "history-migration"
         if bool(getattr(args, "migrate_history_only", False))
+        else "history-rebuild"
+        if bool(getattr(args, "rebuild_from_history", False))
         else "weekly-run"
     )
     run_id = str(uuid.uuid4())
@@ -10012,6 +11221,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         Path(path).resolve() for path in (getattr(args, "migrate_history_from", None) or [])
     ]
     migration_only = bool(getattr(args, "migrate_history_only", False))
+    rebuild_from_history = bool(getattr(args, "rebuild_from_history", False))
     initialize_baseline = bool(
         getattr(args, "initialize_integrity_baseline", False)
     )
@@ -10020,6 +11230,16 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     if initialize_baseline and (migration_only or migration_sources):
         raise ValueError(
             "--initialize-integrity-baseline cannot be combined with history migration options."
+        )
+    if rebuild_from_history and (migration_only or initialize_baseline):
+        raise ValueError(
+            "--rebuild-from-history cannot be combined with "
+            "--migrate-history-only or --initialize-integrity-baseline."
+        )
+    if rebuild_from_history and (args.week_start or args.week_end):
+        raise ValueError(
+            "--rebuild-from-history selects the latest complete historical week "
+            "and cannot be combined with --week-start or --week-end."
         )
 
     record_run_stage(
@@ -10040,7 +11260,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         return [latest]
 
     active_paths: list[Path] = []
-    if not migration_only:
+    if not migration_only and not rebuild_from_history:
         active_paths = daily_report_paths(input_dir)
         if not active_paths:
             raise FileNotFoundError(
@@ -10150,30 +11370,44 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             raise
         return copied_paths
 
-    record_run_stage(
-        args,
-        RunStage.READING_INPUTS,
-        "Capturing and validating the active weekly input files.",
-    )
-    active_captures = capture_active_inputs(active_paths, input_dir)
-    with tempfile.TemporaryDirectory(
-        prefix=".weekly-input-", dir=str(integrity_manifest_dir(archive_dir))
-    ) as input_stage_name:
-        input_stage = Path(input_stage_name)
-        captured_parse_paths: list[Path] = []
-        for capture in active_captures:
-            staged_input = input_stage / capture.source.name
-            written_hash = verified_write_bytes(capture.content, staged_input)
-            if written_hash != capture.fingerprint.sha256:
-                raise IntegrityError(
-                    f"Input staging verification failed for {capture.source.name}."
-                )
-            captured_parse_paths.append(staged_input)
-        raw_active_records_by_path = read_reports_by_path(captured_parse_paths, config)
-    active_resolution = resolve_report_duplicates(raw_active_records_by_path)
-    active_records_by_path = active_resolution.records_by_path
-    _, active_week_end = active_week_for_paths(active_records_by_path)
-    active_records = flatten_report_records(active_records_by_path)
+    active_captures: tuple[CapturedActiveInput, ...] = ()
+    active_resolution = ReportResolution({}, (), ())
+    active_records_by_path: dict[Path, list[MetricRecord]] = {}
+    active_records: list[MetricRecord] = []
+    active_week_end: date | None = None
+    if rebuild_from_history:
+        record_run_stage(
+            args,
+            RunStage.READING_INPUTS,
+            "Reading only manifest-pinned history for a protected rebuild.",
+        )
+    else:
+        record_run_stage(
+            args,
+            RunStage.READING_INPUTS,
+            "Capturing and validating the active weekly input files.",
+        )
+        active_captures = tuple(capture_active_inputs(active_paths, input_dir))
+        with tempfile.TemporaryDirectory(
+            prefix=".weekly-input-", dir=str(integrity_manifest_dir(archive_dir))
+        ) as input_stage_name:
+            input_stage = Path(input_stage_name)
+            captured_parse_paths: list[Path] = []
+            for capture in active_captures:
+                staged_input = input_stage / capture.source.name
+                written_hash = verified_write_bytes(capture.content, staged_input)
+                if written_hash != capture.fingerprint.sha256:
+                    raise IntegrityError(
+                        f"Input staging verification failed for {capture.source.name}."
+                    )
+                captured_parse_paths.append(staged_input)
+            raw_active_records_by_path = read_reports_by_path(
+                captured_parse_paths, config
+            )
+        active_resolution = resolve_report_duplicates(raw_active_records_by_path)
+        active_records_by_path = active_resolution.records_by_path
+        _, active_week_end = active_week_for_paths(active_records_by_path)
+        active_records = flatten_report_records(active_records_by_path)
 
     if migration_plan is not None:
         historical_records_by_path = migration_plan.effective_records_by_path
@@ -10196,6 +11430,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     combined_records_by_path.update(active_records_by_path)
     combined_resolution = resolve_report_duplicates(combined_records_by_path)
     records = flatten_report_records(combined_resolution.records_by_path)
+    validate_daily_location_reconciliation(records, config)
 
     duplicate_paths = sorted(
         {
@@ -10213,29 +11448,89 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         "conflicts": 0,
     }
 
-    public_start, public_end = selected_public_dates(
-        active_records, args.week_start, args.week_end
-    )
-    validated_data_quality_coverage(records, public_start, public_end)
-    selected_records = [
+    if rebuild_from_history:
+        _, weekly_location_rows = weekly_rollups(records)
+        full_by_location, _ = full_week_ends_by_location(weekly_location_rows)
+        configured_locations = set(config["locations"])
+        missing_locations = sorted(
+            configured_locations - set(full_by_location),
+            key=str.casefold,
+        )
+        complete_week_ends = (
+            set.intersection(
+                *(full_by_location[location] for location in configured_locations)
+            )
+            if not missing_locations
+            else set()
+        )
+        if not complete_week_ends:
+            missing_detail = (
+                " Missing all history for: " + ", ".join(missing_locations) + "."
+                if missing_locations
+                else ""
+            )
+            raise ValueError(
+                "History rebuild requires at least one complete Tuesday-Sunday "
+                "week for every configured location."
+                f"{missing_detail} No files were changed."
+            )
+        active_week_end = max(complete_week_ends)
+        public_start, public_end = week_period_for(active_week_end)
+    else:
+        public_start, public_end = selected_public_dates(
+            active_records, args.week_start, args.week_end
+        )
+    output_history_records = [
         record
         for record in records
+        if not rebuild_from_history or record.report_date <= public_end
+    ]
+    validated_data_quality_coverage(
+        output_history_records, public_start, public_end
+    )
+    selected_records = [
+        record
+        for record in output_history_records
         if public_start <= record.report_date <= public_end and is_operating_day(record.report_date)
     ]
     if not selected_records:
         raise ValueError(f"No records found between {public_start} and {public_end}.")
 
+    assert active_week_end is not None
     required_staging_bytes = assert_staging_capacity(
         output_dir, archive_dir, active_captures
     )
     print("Preflight summary:")
     print(f"  Snapshot dates: {public_start:%Y-%m-%d} through {public_end:%Y-%m-%d}")
-    print(f"  Active input files: {len(active_captures)}")
+    print(
+        "  Active input files: "
+        + (
+            "0 (protected history rebuild)"
+            if rebuild_from_history
+            else str(len(active_captures))
+        )
+    )
     print(f"  Unique business days in history: {len(combined_resolution.business_dates)}")
     print(f"  Semantic duplicate files ignored: {len(duplicate_paths)}")
     print(
-        "  Latest-week readiness: "
-        + ("Ready" if latest_week_readiness(records, weekly_rollups(records)[1], config).ready else "Preliminary")
+        "  Selected-week readiness: "
+        + (
+            "Ready"
+            if latest_week_readiness(
+                [
+                    record
+                    for record in records
+                    if record.report_date <= public_end
+                ],
+                [
+                    row
+                    for row in weekly_rollups(records)[1]
+                    if row["week_end"] <= public_end
+                ],
+                config,
+            ).ready
+            else "Preliminary"
+        )
     )
     print(
         f"  Staging capacity reserved: {required_staging_bytes / (1024 ** 2):.0f} MiB minimum"
@@ -10308,10 +11603,14 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 expected_existing_hashes[current_master.name.casefold()] = None
             staged_paths.append(
                 write_master_workbook(
-                    records,
+                    output_history_records,
                     staged_master,
                     config,
-                    input_dir,
+                    (
+                        canonical_daily_archive_dir(archive_dir)
+                        if rebuild_from_history
+                        else input_dir
+                    ),
                     public_start,
                     public_end,
                 )
@@ -10324,7 +11623,8 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 RunStage.PUBLISHING,
                 "Staged workbooks validated; rechecking inputs and publishing exact bytes.",
             )
-            verify_captured_active_inputs(active_captures, input_dir)
+            if not rebuild_from_history:
+                verify_captured_active_inputs(active_captures, input_dir)
             assert_manifest_head(
                 archive_dir,
                 previous_manifest,
@@ -10343,9 +11643,10 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 migration_copied_hashes = history_migration_expected_hashes(
                     migration_plan, migration_copied
                 )
-            active_copies = copy_captured_active_files_verified(
-                active_captures, archive_dir, active_week_end
-            )
+            if not rebuild_from_history:
+                active_copies = copy_captured_active_files_verified(
+                    active_captures, archive_dir, active_week_end
+                )
             (
                 final_paths,
                 snapshot_run,
@@ -10362,7 +11663,8 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 expected_existing_hashes=expected_existing_hashes,
             )
 
-            verify_captured_active_inputs(active_captures, input_dir)
+            if not rebuild_from_history:
+                verify_captured_active_inputs(active_captures, input_dir)
             input_inventory = tuple(capture.fingerprint for capture in active_captures)
             raw_root = canonical_daily_archive_dir(archive_dir).resolve()
             archived_destinations = [
@@ -10408,19 +11710,28 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 output_dir=output_dir,
                 config_path=config_path,
                 config=config,
-                kind="weekly-run",
+                kind=(
+                    "history-rebuild"
+                    if rebuild_from_history
+                    else "weekly-run"
+                ),
                 run_id=run_id,
                 previous_manifest=previous_manifest,
                 expected_previous_sha256=previous_manifest_hash,
                 integrity_state=expected_state,
                 details={
                     "source_manifest_sha256": previous_manifest_hash,
+                    "rebuild_from_history": rebuild_from_history,
                     "active_input_inventory": inventory_dicts(input_inventory),
                     "archived_destinations": archived_destinations,
                     "history_migration_files": [path.name for path in migration_copied],
                     "public_snapshot_start": public_start.isoformat(),
                     "public_snapshot_end": public_end.isoformat(),
-                    "active_week_end": active_week_end.isoformat(),
+                    (
+                        "history_week_end"
+                        if rebuild_from_history
+                        else "active_week_end"
+                    ): active_week_end.isoformat(),
                     "published_workbooks": [path.name for path in final_paths],
                 },
             )
@@ -10436,9 +11747,10 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 anchor_dir,
             )
             manifest_committed = True
-            quarantine_and_delete_captured_inputs(
-                active_captures, active_copies, input_dir, run_id
-            )
+            if not rebuild_from_history:
+                quarantine_and_delete_captured_inputs(
+                    active_captures, active_copies, input_dir, run_id
+                )
             return final_paths
         except Exception as exc:
             if not manifest_committed:
@@ -10541,8 +11853,16 @@ def verified_evidence_source(
     validate_management_workbook(workbook_path, expected_digest)
     wb = load_workbook(workbook_path, data_only=False)
     try:
+        allowed_reviewers = (
+            active_owner_names(
+                owner_roster_from_sheet(wb["Management Setup"])
+            )
+            if "Management Setup" in wb.sheetnames
+            else None
+        )
         action_rows = validate_action_board_records(
-            records_from_sheet(wb["Action Board"], "Action ID")
+            records_from_sheet(wb["Action Board"], "Action ID"),
+            allowed_reviewers=allowed_reviewers,
         )
         evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
     finally:
@@ -10588,7 +11908,7 @@ def verified_evidence_source(
 
 def build_management_evidence_package(
     args: argparse.Namespace,
-) -> ManagementEvidencePackageV1:
+) -> ManagementEvidencePackageV2:
     source, rows, _ = verified_evidence_source(args)
     created_text = str(source.get("manifest_created_at_utc") or "")
     try:
@@ -10597,11 +11917,11 @@ def build_management_evidence_package(
         raise IntegrityError(
             "The trusted manifest has an invalid creation timestamp."
         ) from exc
-    records: list[EvidenceRecord] = []
+    records: list[EvidenceRecordV2] = []
     for row in rows:
         due_date = as_date(row.get("Due Date"))
         records.append(
-            EvidenceRecord(
+            EvidenceRecordV2(
                 action_id=str(row.get("Action ID") or ""),
                 evidence_id=str(row.get("Evidence ID") or ""),
                 action_code=str(row.get("Action Code") or ""),
@@ -10631,10 +11951,32 @@ def build_management_evidence_package(
                     row.get("Methodology Version")
                     or MANAGEMENT_METHODOLOGY_VERSION
                 ),
+                comparator_type=str(
+                    row.get("Comparator Type")
+                    or "Same-store prior-four-week median"
+                ),
+                peer_cohort_size=int(row.get("Peer Cohort Size") or 0),
+                peer_cohort_weeks=int(row.get("Peer Cohort Weeks") or 0),
+                threshold_version=str(
+                    row.get("Threshold Version")
+                    or MANAGEMENT_METHODOLOGY_VERSION
+                ),
+                evidence_status=str(row.get("Evidence Status") or ""),
+                recurring_drivers=str(row.get("Recurring Drivers") or ""),
+                stability_result=str(row.get("Stability Result") or ""),
+                review_disposition=str(
+                    row.get("Review Disposition") or "Pending Review"
+                ),
+                reviewed_by=str(row.get("Reviewed By") or ""),
+                review_date=(
+                    as_date(row.get("Review Date")).isoformat()
+                    if as_date(row.get("Review Date"))
+                    else None
+                ),
             )
         )
     records.sort(key=lambda item: (item.priority, item.location, item.action_id))
-    return ManagementEvidencePackageV1(
+    return ManagementEvidencePackageV2(
         source=source,
         records=tuple(records),
         retention_delete_after=(created + timedelta(days=365)).date().isoformat(),
@@ -10657,8 +11999,8 @@ def stage_management_evidence(
     candidate_sha256 = sha256_file(candidate_path)
     fingerprint_path = evidence_fingerprint_path(candidate_path)
     fingerprint = {
-        "schema_version": 1,
-        "contract": "ManagementEvidenceCandidateFingerprintV1",
+        "schema_version": 2,
+        "contract": "ManagementEvidenceCandidateFingerprintV2",
         "candidate_file": candidate_path.name,
         "candidate_sha256": candidate_sha256,
         "candidate_size": candidate_path.stat().st_size,
@@ -10675,7 +12017,7 @@ def stage_management_evidence(
     write_json_atomic(
         template_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "decision": "APPROVE",
             "candidate_sha256": candidate_sha256,
             "fingerprint_sha256": fingerprint_sha256,
@@ -10707,9 +12049,9 @@ def promote_approved_management_evidence(
     approval_sha256 = sha256_file(approval_path)
     fingerprint = read_json_manifest(fingerprint_path)
     approval = read_json_manifest(approval_path)
-    if approval.get("schema_version") != 1 or approval.get("decision") != "APPROVE":
+    if approval.get("schema_version") != 2 or approval.get("decision") != "APPROVE":
         raise IntegrityError(
-            "Approval must use schema_version 1 and the exact decision APPROVE."
+            "Approval must use schema_version 2 and the exact decision APPROVE."
         )
     for field, actual in (
         ("candidate_sha256", candidate_sha256),
@@ -10734,10 +12076,18 @@ def promote_approved_management_evidence(
         str(fingerprint.get("candidate_sha256") or ""), candidate_sha256
     ):
         raise IntegrityError("The fingerprint does not bind the candidate bytes.")
-    package = read_json_manifest(candidate_path)
     if (
-        package.get("contract") != "ManagementEvidencePackageV1"
-        or package.get("schema_version") != 1
+        fingerprint.get("schema_version") != 2
+        or fingerprint.get("contract")
+        != "ManagementEvidenceCandidateFingerprintV2"
+    ):
+        raise IntegrityError(
+            "The fingerprint must use ManagementEvidenceCandidateFingerprintV2."
+        )
+    package = read_json_manifest(candidate_path)
+    package_contract = (package.get("contract"), package.get("schema_version"))
+    if (
+        package_contract != ("ManagementEvidencePackageV2", 2)
         or package.get("retention", {}).get("days") != 365
         or package.get("distribution", {}).get("automatic_upload") is not False
         or package.get("distribution", {}).get("automatic_send") is not False
@@ -10779,8 +12129,8 @@ def promote_approved_management_evidence(
     write_json_atomic(
         receipt_path,
         {
-            "schema_version": 1,
-            "contract": "ManagementEvidenceApprovalReceiptV1",
+            "schema_version": 2,
+            "contract": "ManagementEvidenceApprovalReceiptV2",
             "candidate_sha256": candidate_sha256,
             "fingerprint_sha256": fingerprint_sha256,
             "approval_sha256": approval_sha256,
@@ -10983,6 +12333,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Perform the copy-only history migration without generating weekly workbooks.",
     )
     parser.add_argument(
+        "--rebuild-from-history",
+        action="store_true",
+        help=(
+            "Maintainer-only: rebuild and publish the latest complete week from "
+            "manifest-pinned history without reading, moving, or deleting active "
+            "drop-folder files. May be combined with --migrate-history-from."
+        ),
+    )
+    parser.add_argument(
         "--initialize-integrity-baseline",
         action="store_true",
         help=(
@@ -11018,7 +12377,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-management-evidence",
         metavar="CANDIDATE_JSON",
         help=(
-            "Stage a local ManagementEvidencePackageV1 candidate and exact fingerprint. "
+            "Stage a local ManagementEvidencePackageV2 candidate and exact fingerprint. "
             "With --approval-file, promote the already-reviewed exact bytes into the "
             "local approved-evidence archive."
         ),
@@ -11026,7 +12385,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--approval-file",
         help=(
-            "Explicit schema-v1 approval bound to the staged candidate and fingerprint. "
+            "Explicit schema-v2 approval bound to the staged candidate and fingerprint. "
             "This never uploads or sends the evidence."
         ),
     )
@@ -11035,6 +12394,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.rebuild_from_history:
+        incompatible_rebuild = (
+            args.validate_config
+            or args.health_check
+            or args.health_check_json
+            or args.initialize_integrity_baseline
+            or args.migrate_history_only
+            or bool(args.rebind_restored_integrity_anchor)
+            or bool(args.export_management_evidence)
+            or bool(args.approval_file)
+            or bool(args.week_start)
+            or bool(args.week_end)
+        )
+        if incompatible_rebuild:
+            raise SystemExit(
+                "ERROR: --rebuild-from-history may be combined only with "
+                "--migrate-history-from and normal path/config options."
+            )
     if args.rebind_restored_integrity_anchor:
         incompatible = (
             args.validate_config
@@ -11042,6 +12419,7 @@ def main() -> None:
             or args.health_check_json
             or args.initialize_integrity_baseline
             or args.migrate_history_only
+            or args.rebuild_from_history
             or bool(args.migrate_history_from)
             or bool(args.export_management_evidence)
             or bool(args.approval_file)
@@ -11119,6 +12497,10 @@ def main() -> None:
                 print(f"  {path}")
         else:
             print("History migration complete: the canonical archive is already up to date.")
+    elif args.rebuild_from_history:
+        print("History rebuilt and published:")
+        for path in generated:
+            print(f"  {path}")
     else:
         print("Generated:")
         for path in generated:

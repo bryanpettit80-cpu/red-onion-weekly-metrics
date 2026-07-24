@@ -127,8 +127,8 @@ def test_dashboard_is_one_screen_and_deduplicates_actions() -> None:
         for value in row
         if isinstance(value, str)
     }
-    assert {"Reports Received", "Traffic vs Benchmark", "High-Priority Actions"}.issubset(values)
-    assert {"TOP THREE ACTIONS", "STORE SNAPSHOT", "RECOGNITION / REPLICATE"}.issubset(values)
+    assert {"Reports Received", "Traffic vs Benchmark", "Review Items"}.issubset(values)
+    assert {"TOP THREE REVIEW ITEMS", "STORE SNAPSHOT", "RECOGNITION REVIEW"}.issubset(values)
     assert ws["A7"].value == "6 of 6"
     assert ws["I7"].value == 3
     assert ws["C13"].value == "Alex | RC Richmond"

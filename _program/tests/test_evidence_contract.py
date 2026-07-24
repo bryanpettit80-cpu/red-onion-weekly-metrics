@@ -15,19 +15,25 @@ from red_onion_runtime import write_json_atomic
 def sample_signal() -> dict:
     return {
         "Entity Key": "server|rc richmond|alex|coaching",
-        "Priority": "High",
-        "Status": "Open",
+        "Priority": "Medium",
+        "Status": "Review Needed",
         "Owner": "Pat Manager",
         "Due Date": date(2026, 7, 30),
         "Location": "RC Richmond",
         "Person / Area": "Alex",
-        "Action": "Coach Now",
-        "Signal": "Falling / Below Benchmark / 8-week Declining",
+        "Action": "Coaching Prompt",
+        "Signal": "Downward / Below Peer Reference / 8-week Downward",
         "Why It Matters": "Watch: check average",
         "Recommended Next Step": "Review recent shifts.",
-        "Performance Level": "Below Benchmark",
-        "Momentum": "Falling",
-        "Confidence": "High",
+        "Peer Comparison": "Below Peer Reference",
+        "Recent Movement": "Downward",
+        "Evidence Status": "Stable",
+        "Comparator Type": "Same-store prior-four-week median",
+        "Peer Cohort Size": 8,
+        "Peer Cohort Weeks": 4,
+        "Threshold Version": "2026.07-v2",
+        "Recurring Drivers": "check_average",
+        "Stability Result": "Stable under every active-day removal",
         "Last Seen": date(2026, 7, 19),
         "_evidence_week_ends": ["2026-07-12", "2026-07-19"],
         "_source_evidence": [
@@ -54,8 +60,11 @@ def current_action() -> dict:
             "Action ID": "ABC123",
             "First Seen": date(2026, 7, 19),
             "Weeks Open": 1,
-            "Manager Notes": "",
+            "Context Notes": "",
             "Signal State": "Current",
+            "Review Disposition": "Pending Review",
+            "Reviewed By": "",
+            "Review Date": None,
         }
     )
     return action
@@ -65,8 +74,8 @@ def test_stable_codes_and_evidence_id_are_deterministic() -> None:
     first = metrics.enrich_management_signal(sample_signal())
     second = metrics.enrich_management_signal(sample_signal())
 
-    assert first["Action Code"] == "COACH_NOW"
-    assert first["Reason Code"] == "SERVER_FALLING_BELOW_BENCHMARK"
+    assert first["Action Code"] == "COACHING_PROMPT"
+    assert first["Reason Code"] == "SERVER_TWO_WEEK_DOWNWARD_BELOW_PEER_STABLE"
     assert first["Evidence ID"] == second["Evidence ID"]
     assert first["Evidence Week Ends"] == "2026-07-12, 2026-07-19"
     sources = json.loads(first["Evidence Sources"])
@@ -93,8 +102,8 @@ def test_action_focus_links_to_editable_board_and_evidence_is_read_only() -> Non
 
     focus = wb["Action Focus"]
     evidence = wb["Evidence Detail"]
-    assert focus["A6"].value == "High"
-    assert focus["K6"].hyperlink.target == "#'Action Board'!C5"
+    assert focus["A6"].value == "Medium"
+    assert focus["M6"].hyperlink.target == "#'Action Board'!C5"
     assert evidence["A5"].value == action["Evidence ID"]
     assert evidence["A5"].hyperlink.target == "#'Action Board'!C5"
     assert json.loads(evidence["L5"].value)[0]["parser_engine"] == "openpyxl"
@@ -118,6 +127,9 @@ def test_verified_evidence_uses_live_editable_action_fields(
     board["D5"] = "Blocked"
     board["E5"] = "Current Manager"
     board["F5"] = date(2026, 8, 6)
+    board["U5"] = "Coaching Accepted"
+    board["V5"] = "Reviewing Manager"
+    board["W5"] = date(2026, 8, 1)
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     workbook_path = output_dir / "Red_Onion_Server_Master.xlsx"
@@ -175,9 +187,89 @@ def test_verified_evidence_uses_live_editable_action_fields(
     assert metrics.as_date(rows[0]["Due Date"]) == date(2026, 8, 6)
     assert rows[0]["Action Code"] == action["Action Code"]
     assert rows[0]["Evidence ID"] == action["Evidence ID"]
+    assert rows[0]["Review Disposition"] == "Coaching Accepted"
+    assert rows[0]["Reviewed By"] == "Reviewing Manager"
 
 
-def sample_package() -> metrics.ManagementEvidencePackageV1:
+def test_completed_disposition_requires_reviewer_and_review_date() -> None:
+    action = current_action()
+    action["Status"] = "Open"
+    action["Review Disposition"] = "Coaching Accepted"
+
+    with pytest.raises(ValueError, match="Reviewed By, and Review Date"):
+        metrics.validate_action_board_records([action])
+
+
+def test_completed_disposition_rejects_reviewer_outside_active_roster() -> None:
+    action = current_action()
+    action.update(
+        {
+            "Status": "Open",
+            "Review Disposition": "Coaching Accepted",
+            "Reviewed By": "Pasted Reviewer",
+            "Review Date": date(2026, 7, 23),
+        }
+    )
+
+    with pytest.raises(ValueError, match="active person from the Owner Roster"):
+        metrics.validate_action_board_records(
+            [action],
+            allowed_reviewers=["Authorized Manager"],
+        )
+
+
+def sample_package() -> metrics.ManagementEvidencePackageV2:
+    record = metrics.EvidenceRecordV2(
+        action_id="ABC123",
+        evidence_id="EVIDENCE1",
+        action_code="COACHING_PROMPT",
+        reason_code="SERVER_TWO_WEEK_DOWNWARD_BELOW_PEER_STABLE",
+        location="RC Richmond",
+        person_or_area="Alex",
+        priority="Medium",
+        status="In Progress",
+        owner="Pat Manager",
+        due_date="2026-07-30",
+        recommended_next_step="Review recent shifts.",
+        why_it_matters="Watch: check average",
+        evidence_week_ends="2026-07-12, 2026-07-19",
+        evidence_sources=(
+            {
+                "source_file": "Daily Report.xlsx",
+                "sha256": "a" * 64,
+            },
+        ),
+        metric_evidence={"guest_count": 42},
+        methodology_version=metrics.MANAGEMENT_METHODOLOGY_VERSION,
+        comparator_type="Same-store prior-four-week median",
+        peer_cohort_size=8,
+        peer_cohort_weeks=4,
+        threshold_version="2026.07-v2",
+        evidence_status="Stable",
+        recurring_drivers="check_average",
+        stability_result="Stable under every active-day removal",
+        review_disposition="Coaching Accepted",
+        reviewed_by="Authorized Manager",
+        review_date="2026-07-23",
+    )
+    return metrics.ManagementEvidencePackageV2(
+        source={
+            "manifest_path": "manifest.json",
+            "manifest_sha256": "b" * 64,
+            "manifest_run_id": "run-1",
+            "manifest_created_at_utc": "2026-07-23T12:00:00+00:00",
+            "workbook_file": "Red_Onion_Server_Master.xlsx",
+            "workbook_generated_content_sha256": "c" * 64,
+            "generator_commit": "d" * 40,
+            "effective_config_sha256": "e" * 64,
+            "methodology_version": metrics.MANAGEMENT_METHODOLOGY_VERSION,
+        },
+        records=(record,),
+        retention_delete_after="2027-07-23",
+    )
+
+
+def sample_legacy_package() -> metrics.ManagementEvidencePackageV1:
     record = metrics.EvidenceRecord(
         action_id="ABC123",
         evidence_id="EVIDENCE1",
@@ -192,27 +284,12 @@ def sample_package() -> metrics.ManagementEvidencePackageV1:
         recommended_next_step="Review recent shifts.",
         why_it_matters="Watch: check average",
         evidence_week_ends="2026-07-12, 2026-07-19",
-        evidence_sources=(
-            {
-                "source_file": "Daily Report.xlsx",
-                "sha256": "a" * 64,
-            },
-        ),
+        evidence_sources=(),
         metric_evidence={"guest_count": 42},
-        methodology_version=metrics.MANAGEMENT_METHODOLOGY_VERSION,
+        methodology_version="2026.07-v1",
     )
     return metrics.ManagementEvidencePackageV1(
-        source={
-            "manifest_path": "manifest.json",
-            "manifest_sha256": "b" * 64,
-            "manifest_run_id": "run-1",
-            "manifest_created_at_utc": "2026-07-23T12:00:00+00:00",
-            "workbook_file": "Red_Onion_Server_Master.xlsx",
-            "workbook_generated_content_sha256": "c" * 64,
-            "generator_commit": "d" * 40,
-            "effective_config_sha256": "e" * 64,
-            "methodology_version": metrics.MANAGEMENT_METHODOLOGY_VERSION,
-        },
+        source=sample_package().source,
         records=(record,),
         retention_delete_after="2027-07-23",
     )
@@ -286,6 +363,37 @@ def test_approval_hash_mismatch_is_rejected_before_archive_creation(
     write_json_atomic(approval_path, approval)
 
     with pytest.raises(metrics.IntegrityError, match="does not match"):
+        metrics.promote_approved_management_evidence(
+            args, candidate, approval_path
+        )
+
+    assert not (tmp_path / "archive").exists()
+
+
+def test_legacy_v1_candidate_cannot_be_promoted_as_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy_package = sample_legacy_package()
+    monkeypatch.setattr(
+        metrics,
+        "build_management_evidence_package",
+        lambda args: legacy_package,
+    )
+    args = Namespace(archive_dir=str(tmp_path / "archive"))
+    candidate = tmp_path / "legacy-candidate.json"
+    paths = metrics.stage_management_evidence(args, candidate)
+    approval = json.loads(paths[2].read_text(encoding="utf-8"))
+    approval.update(
+        {
+            "approved_by": "Authorized Manager",
+            "approved_at_utc": "2026-07-23T13:00:00+00:00",
+            "purpose": "Review",
+        }
+    )
+    approval_path = tmp_path / "legacy-approval.json"
+    write_json_atomic(approval_path, approval)
+
+    with pytest.raises(metrics.IntegrityError, match="approved evidence contract"):
         metrics.promote_approved_management_evidence(
             args, candidate, approval_path
         )
