@@ -40,7 +40,12 @@ def test_partial_config_is_deep_merged(tmp_path: Path) -> None:
     config = metrics.load_config(path)
 
     assert config["management_score_thresholds"]["wine_pct"]["neutral"] == 0.006
-    assert config["management_score_thresholds"]["check_average"]["neutral"] == 2.5
+    assert (
+        config["management_score_thresholds"]["check_average"]["neutral"]
+        == metrics.DEFAULT_CONFIG["management_score_thresholds"]["check_average"][
+            "neutral"
+        ]
+    )
 
 
 @pytest.mark.parametrize(
@@ -79,7 +84,19 @@ def test_partial_config_is_deep_merged(tmp_path: Path) -> None:
                     }
                 }
             },
-            "strong must be at least neutral",
+            "strong must be greater than neutral",
+        ),
+        (
+            {
+                "management_peer_score_thresholds": {
+                    "check_average": {
+                        "neutral": 5.0,
+                        "strong": 5.0,
+                        "lower_is_better": False,
+                    }
+                }
+            },
+            "strong must be greater than neutral",
         ),
         (
             {"dashboard_long_term_full_weeks": 7},

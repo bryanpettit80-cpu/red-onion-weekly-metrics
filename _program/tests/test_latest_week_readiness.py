@@ -253,18 +253,19 @@ def test_incomplete_week_carries_manual_active_action_as_paused() -> None:
     assert history[0]["Signal State"] == "Cleared"
     assert len(current) == 1
     assert current[0]["Action ID"] == prior["Action ID"]
-    assert current[0]["Status"] == "In Progress"
+    assert current[0]["Status"] == "Review Needed"
     assert current[0]["Owner"] == "Pat Manager"
     assert current[0]["Due Date"] == date(2026, 7, 15)
-    assert current[0]["Manager Notes"] == "Review Friday"
+    assert current[0]["Context Notes"] == "Review Friday"
     assert current[0]["Priority"] == "Paused"
     assert current[0]["Action"] == "Paused Carryover"
     assert current[0]["Signal"].startswith("PAUSED / CARRYOVER")
     assert current[0]["Why It Matters"].startswith("Prior action retained")
     assert "manual assignment on hold" in current[0]["Recommended Next Step"]
-    assert current[0]["Performance Level"] == "Preliminary"
-    assert current[0]["Momentum"] == "Not Scored"
-    assert current[0]["Confidence"] == "Paused"
+    assert current[0]["Peer Comparison"] == "Preliminary"
+    assert current[0]["Recent Movement"] == "Not Evaluated"
+    assert current[0]["Evidence Status"] == "Paused"
+    assert current[0]["Review Disposition"] == "Pending Review"
     assert current[0]["Signal State"] == "Paused / Carryover"
     assert current[0]["Action Code"] == "PAUSED_CARRYOVER"
     assert (
