@@ -886,8 +886,109 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["_Dashboard Chart Data"].sheet_state == "veryHidden"
     assert wb["Weekly Server Metrics"].sheet_state == "veryHidden"
     assert wb["Store Week Trends"].sheet_state == "veryHidden"
+    assert wb.active.title == "How to Use"
+    assert wb["How to Use"].sheet_state == "visible"
     assert wb["Dashboard"].sheet_state == "visible"
     assert wb["Action Board"].sheet_state == "visible"
+
+    guide = wb["How to Use"]
+    guide_values = {
+        value
+        for row in guide.iter_rows(values_only=True)
+        for value in row
+        if isinstance(value, str)
+    }
+    assert set(metrics.HOW_TO_USE_SECTION_HEADINGS).issubset(guide_values)
+    assert all(
+        cell.protection.locked is not False for cell in guide._cells.values()
+    )
+    assert not guide._charts
+    assert not guide._images
+    assert guide.freeze_panes == "A3"
+    assert guide.sheet_view.zoomScale == 85
+    assert guide.sheet_properties.tabColor.rgb[-6:] == "FFD966"
+    assert all(
+        guide.column_dimensions[metrics.get_column_letter(column)].width == 13
+        for column in range(1, 13)
+    )
+    assert guide.row_dimensions[1].height == 54
+    assert guide.row_dimensions[2].height == 24
+    assert guide.row_dimensions[3].height == 24
+    assert guide.row_dimensions[4].height == 54
+    assert guide.row_dimensions[30].height == 42
+    assert guide.row_dimensions[58].height == 24
+    assert guide.row_dimensions[59].height == 42
+    assert metrics.MANAGEMENT_METHODOLOGY_VERSION in "\n".join(guide_values)
+    for phrase in (
+        "never be the sole or determinative basis",
+        "Do not infer protected characteristics from names.",
+        "ExternalCheckRequired",
+        "Rate of Sale currently assumes lower is better.",
+        "Ticket Time is guest-weighted",
+    ):
+        assert phrase in "\n".join(guide_values)
+    for field in (
+        "D — Status",
+        "E — Owner",
+        "F — Due Date",
+        "N — Context Notes",
+        "U — Review Disposition",
+        "V — Reviewed By",
+        "W — Review Date",
+    ):
+        assert field in guide_values
+    for choice in (*metrics.ACTION_STATUS_CHOICES, *metrics.REVIEW_DISPOSITION_CHOICES):
+        assert choice in "\n".join(guide_values)
+    assert {
+        guide.cell(row=row, column=1).value for row in range(46, 58)
+    } == set(metrics.VISIBLE_MANAGEMENT_SHEETS)
+
+    expected_navigation = list(metrics.MANAGEMENT_NAVIGATION_LINKS)
+    for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
+        worksheet = wb[sheet_name]
+        navigation_columns = metrics.management_navigation_columns(worksheet)
+        assert worksheet.row_dimensions[2].height == 24
+        assert all(
+            worksheet.column_dimensions[
+                metrics.get_column_letter(column)
+            ].hidden is not True
+            for column in navigation_columns
+        )
+        assert [
+            worksheet.cell(row=2, column=column).value
+            for column in navigation_columns
+        ] == [label for label, _ in expected_navigation]
+        assert [
+            worksheet.cell(row=2, column=column).hyperlink.target
+            for column in navigation_columns
+        ] == [f"#'{target}'!A1" for _, target in expected_navigation]
+        active_navigation_cells = [
+            worksheet.cell(row=2, column=column)
+            for column, (_, target) in zip(
+                navigation_columns, expected_navigation, strict=True
+            )
+            if target == sheet_name
+        ]
+        assert len(active_navigation_cells) == 1
+        assert metrics.workbook_color_suffix(
+            active_navigation_cells[0].fill.fgColor
+        ) == "7A1E1E"
+        assert any(
+            merged.min_row == merged.max_row == 1
+            and merged.min_col == 1
+            and merged.max_col >= 12
+            for merged in worksheet.merged_cells.ranges
+        )
+        frozen_at = worksheet.freeze_panes
+        assert frozen_at is not None
+        assert int("".join(character for character in str(frozen_at) if character.isdigit())) >= 3
+    assert metrics.management_navigation_columns(wb["Action Board"]) == tuple(
+        range(3, 15)
+    )
+    assert metrics.management_navigation_columns(wb["Evidence Detail"]) == (
+        *range(1, 12),
+        14,
+    )
 
     dashboard_values = {
         value
@@ -923,6 +1024,40 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Action Board"]["Q5"].number_format == "m/d/yyyy"
     assert wb["Action Board"]["W5"].number_format == "m/d/yyyy"
     assert wb["Action History"].row_dimensions[4].height == 30
+    evidence = wb["Evidence Detail"]
+    assert evidence.row_dimensions[3].height == 36
+    assert "exact raw Evidence Sources and Metric Evidence columns are hidden" in (
+        evidence["A3"].value
+    )
+    assert evidence.row_dimensions[4].height == 42
+    assert evidence.column_dimensions["L"].hidden is True
+    assert evidence.column_dimensions["M"].hidden is True
+    assert all(
+        evidence.row_dimensions[row].height in {75, 90}
+        for row in range(5, evidence.max_row + 1)
+    )
+    evidence_headers = {
+        evidence.cell(row=4, column=column).value: column
+        for column in range(1, evidence.max_column + 1)
+    }
+    for row in range(5, evidence.max_row + 1):
+        assert str(
+            evidence.cell(
+                row=row,
+                column=evidence_headers["Evidence Sources"],
+            ).value
+        ).startswith("[")
+        assert str(
+            evidence.cell(
+                row=row,
+                column=evidence_headers["Metric Evidence"],
+            ).value
+        ).startswith("{")
+    run_notes = wb["Run Notes"]
+    assert run_notes["A25"].value == "Peer Comparison"
+    assert run_notes.row_dimensions[25].height == 45
+    assert run_notes["A27"].value == "Signal Scoring"
+    assert run_notes.row_dimensions[27].height == 45
     assert wb["Dashboard"].row_dimensions[13].height == 66
     assert wb["Dashboard"].row_dimensions[14].height == 66
     assert wb["Dashboard"].row_dimensions[15].height == 66
@@ -931,6 +1066,18 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Recent Movement Signals"].row_dimensions[3].height == 30
     assert wb["Recent Movement Signals"].max_row == 3
     assert wb["Data Quality"].row_dimensions[3].height == 36
+    for sheet_name, widths in {
+        "Action Focus": {"B": 15, "M": 21},
+        "Server Scorecard": {"E": 21, "F": 23, "G": 23, "H": 22},
+        "Recent Movement Signals": {"A": 26, "F": 23},
+        "Data Quality": {"D": 13, "F": 69},
+        "Management Setup": {"D": 25, "E": 48},
+    }.items():
+        for column, expected_width in widths.items():
+            assert (
+                wb[sheet_name].column_dimensions[column].width
+                == expected_width
+            )
     assert "ManagementTargets" in wb["Management Setup"].tables
     assert "Alex Rising" in {
         cell.value for row in wb["Server Scorecard"].iter_rows() for cell in row

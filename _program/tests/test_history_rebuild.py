@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from datetime import date, timedelta
 from pathlib import Path
@@ -160,6 +161,24 @@ def test_history_rebuild_ignores_active_intake_and_commits_one_manifest(
     assert payload["details"]["history_week_end"] == week_end.isoformat()
     assert max(master_record_dates) == week_end
     assert partial_date not in master_record_dates
+    attempt_payloads = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            archive_dir / metrics.RUN_ATTEMPT_FOLDER
+        ).glob("*.json")
+    ]
+    rebuild_attempt = next(
+        item for item in attempt_payloads if item["operation"] == "history-rebuild"
+    )
+    assert rebuild_attempt["readiness"]["workbook"] == "Ready"
+    assert rebuild_attempt["readiness"]["distribution"] == "Ready"
+    assert (
+        rebuild_attempt["readiness"]["recovery"]
+        == "ExternalCheckRequired"
+    )
+    status = (output_dir / metrics.LAST_RUN_STATUS_FILE).read_text(encoding="utf-8")
+    assert "Workbook: Ready" in status
+    assert "Local publication: Ready" in status
 
 
 def test_history_rebuild_requires_history_for_every_configured_location(

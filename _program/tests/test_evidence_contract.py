@@ -106,7 +106,13 @@ def test_action_focus_links_to_editable_board_and_evidence_is_read_only() -> Non
     assert focus["M6"].hyperlink.target == "#'Action Board'!C5"
     assert evidence["A5"].value == action["Evidence ID"]
     assert evidence["A5"].hyperlink.target == "#'Action Board'!C5"
+    assert evidence.column_dimensions["L"].hidden is True
+    assert evidence.column_dimensions["M"].hidden is True
+    assert evidence.row_dimensions[5].height in {75, 90}
+    assert evidence["L5"].value == action["Evidence Sources"]
+    assert evidence["M5"].value == action["Metric Evidence"]
     assert json.loads(evidence["L5"].value)[0]["parser_engine"] == "openpyxl"
+    assert "protected values remain unchanged" in evidence["A3"].value
     assert all(
         cell.protection.locked is not False
         for cell in evidence._cells.values()
@@ -172,7 +178,9 @@ def test_verified_evidence_uses_live_editable_action_fields(
         metrics, "managed_master_workbook_path", lambda output: workbook_path
     )
     monkeypatch.setattr(
-        metrics, "validate_management_workbook", lambda workbook, digest: None
+        metrics,
+        "validate_v2_management_evidence_workbook",
+        lambda workbook, expected_digest: None,
     )
     args = Namespace(
         output_dir=str(output_dir),

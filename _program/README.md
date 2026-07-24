@@ -203,8 +203,13 @@ python red_onion_weekly_metrics.py --health-check-json
 ```
 
 The command does not create folders, acquire the workflow lock, install
-packages, generate reports, or claim that independent backup freshness is
-known. Recovery remains `NotChecked` until separately verified.
+packages, generate reports, or access Google Drive. It verifies exact local
+publication through the integrity manifest: exact managed per-location
+workbook bytes plus the protected generated content of the master workbook.
+Approved editable master values, `LAST RUN STATUS.txt`, Dropbox sync, and
+recipient access remain outside that claim. Independent recovery is reported
+as `ExternalCheckRequired` until the current private backup and restore-test
+evidence are verified separately.
 
 ## Maintenance Notes
 

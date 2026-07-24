@@ -101,6 +101,8 @@ def downgrade_master_to_pre_protection_contract(path: Path) -> str:
     """Model the protected owner-roster workbook deployed before PR #10."""
 
     workbook = load_workbook(path, data_only=False)
+    if "How to Use" in workbook.sheetnames:
+        workbook.remove(workbook["How to Use"])
     run_notes = workbook["Run Notes"]
     marker_row = next(
         (
@@ -131,6 +133,8 @@ def downgrade_master_to_v1_action_focus(path: Path) -> str:
 
     workbook = load_workbook(path, data_only=False)
     try:
+        if "How to Use" in workbook.sheetnames:
+            workbook.remove(workbook["How to Use"])
         workbook["Recent Movement Signals"].title = "Rising & Falling Stars"
         action_board = workbook["Action Board"]
         table = action_board.tables["ActionBoardTable"]
@@ -213,6 +217,19 @@ def downgrade_master_to_v1_action_focus(path: Path) -> str:
                 table_column.name = header
             if history_table.autoFilter is not None:
                 history_table.autoFilter.ref = history_table.ref
+        workbook.save(path)
+    finally:
+        workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
+def downgrade_master_to_pre_guide_v031(path: Path) -> str:
+    """Model the protected v0.3.1 workbook immediately before the guide."""
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        workbook.remove(workbook["How to Use"])
+        workbook.active = workbook.sheetnames.index("Dashboard")
         workbook.save(path)
     finally:
         workbook.close()
@@ -589,6 +606,205 @@ def test_protected_v1_action_focus_master_accepts_only_legacy_status_contract(
         assert f'"{",".join(metrics.ACTION_STATUS_CHOICES)}"' not in formulas
     finally:
         workbook.close()
+
+
+def test_protected_v031_pre_guide_master_uses_exact_compatibility_contract(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    pre_guide_digest = downgrade_master_to_pre_guide_v031(master)
+
+    assert metrics.validate_pre_guide_management_workbook(
+        master, pre_guide_digest
+    ) == pre_guide_digest
+    assert metrics.verify_existing_management_workbook_integrity(
+        master,
+        expected_digest=pre_guide_digest,
+    ) == pre_guide_digest
+
+
+def test_evidence_source_accepts_manifest_pinned_pre_guide_v031_master(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "02 Finished Reports"
+    archive_dir = tmp_path / "03 Archive"
+    output_dir.mkdir()
+    archive_dir.mkdir()
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    pre_guide_digest = downgrade_master_to_pre_guide_v031(master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        expected_evidence = {
+            str(row["Action ID"]): (
+                row["Evidence Sources"],
+                row["Metric Evidence"],
+            )
+            for row in metrics.records_from_sheet(
+                workbook["Evidence Detail"], "Evidence ID"
+            )
+            if row.get("Action ID")
+        }
+    finally:
+        workbook.close()
+    manifest = archive_dir / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    manifest_sha256 = "a" * 64
+    manifest_payload = {
+        "run_id": "pre-guide-run",
+        "created_at_utc": "2026-07-23T12:00:00+00:00",
+        "master_generated_content_sha256": pre_guide_digest,
+        "provenance": {
+            "git": {"commit": "b" * 40},
+            "effective_config_sha256": "c" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        metrics,
+        "latest_integrity_manifest_path",
+        lambda archive: manifest,
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_anchor",
+        lambda archive, anchor: (manifest.resolve(), manifest_sha256),
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_state",
+        lambda archive, output, selected_manifest: (
+            manifest_payload,
+            manifest_sha256,
+        ),
+    )
+
+    source, rows, workbook_path = metrics.verified_evidence_source(
+        Namespace(
+            output_dir=str(output_dir),
+            archive_dir=str(archive_dir),
+            integrity_anchor_dir=str(tmp_path / "anchors"),
+        )
+    )
+
+    assert workbook_path == master
+    assert source["workbook_generated_content_sha256"] == pre_guide_digest
+    actual_evidence = {
+        str(row["Action ID"]): (
+            row["Evidence Sources"],
+            row["Metric Evidence"],
+        )
+        for row in rows
+    }
+    assert actual_evidence
+    assert actual_evidence == {
+        action_id: expected_evidence[action_id]
+        for action_id in actual_evidence
+    }
+
+
+def test_v2_evidence_export_rejects_legacy_action_schema(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "legacy-v1-action-focus.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = downgrade_master_to_v1_action_focus(master)
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="legacy workbook evidence cannot be relabeled or promoted as V2",
+    ):
+        metrics.validate_v2_management_evidence_workbook(master, legacy_digest)
+
+
+@pytest.mark.parametrize(
+    ("tamper_kind", "message"),
+    [
+        ("missing", "missing required sheets"),
+        ("hidden", "expected 'visible'"),
+        ("reordered", "must be the first worksheet"),
+        ("unlocked", "editable-cell protection"),
+        ("navigation_target", "invalid navigation target"),
+        ("navigation_style", "navigation style"),
+        ("guide_text", "missing required operating guidance"),
+        ("title_merge", "title band must extend through column L"),
+    ],
+)
+def test_current_workbook_rejects_guide_and_navigation_contract_tampering(
+    tmp_path: Path,
+    valid_master_template: Path,
+    tamper_kind: str,
+    message: str,
+) -> None:
+    master = tmp_path / f"tampered-{tamper_kind}.xlsx"
+    shutil.copy2(valid_master_template, master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        guide = workbook["How to Use"]
+        if tamper_kind == "missing":
+            workbook.remove(guide)
+        elif tamper_kind == "hidden":
+            guide.sheet_state = "hidden"
+        elif tamper_kind == "reordered":
+            workbook._sheets = [
+                workbook["Dashboard"],
+                *[
+                    worksheet
+                    for worksheet in workbook.worksheets
+                    if worksheet.title != "Dashboard"
+                ],
+            ]
+        elif tamper_kind == "unlocked":
+            guide["A4"].protection = metrics.Protection(locked=False)
+        elif tamper_kind == "navigation_target":
+            guide["A2"].hyperlink = "#'Dashboard'!A1"
+        elif tamper_kind == "navigation_style":
+            guide["A2"].fill = metrics.PatternFill("solid", fgColor="00FF00")
+        elif tamper_kind == "guide_text":
+            guide["A59"] = "Unsupported assumptions removed"
+        else:
+            guide.unmerge_cells("A1:L1")
+            guide.merge_cells("A1:K1")
+        workbook.save(master)
+    finally:
+        workbook.close()
+    tampered_digest = metrics.stamp_generated_content_digest(master)
+
+    with pytest.raises(integrity.IntegrityError, match=message):
+        metrics.validate_management_workbook(master, tampered_digest)
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ["guide_text", "navigation_target", "navigation_height", "guide_width"],
+)
+def test_generated_content_digest_covers_workbook_usability_contract(
+    tmp_path: Path,
+    valid_master_template: Path,
+    tamper_kind: str,
+) -> None:
+    master = tmp_path / f"digest-{tamper_kind}.xlsx"
+    shutil.copy2(valid_master_template, master)
+    original_digest = metrics.workbook_generated_content_sha256(master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        if tamper_kind == "guide_text":
+            workbook["How to Use"]["A4"] = "Changed scope"
+        elif tamper_kind == "navigation_target":
+            workbook["Dashboard"]["A2"].hyperlink = "#'Action Board'!A1"
+        elif tamper_kind == "navigation_height":
+            workbook["Action History"].row_dimensions[2].height = 30
+        else:
+            workbook["How to Use"].column_dimensions["L"].width = 14
+        workbook.save(master)
+    finally:
+        workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(master) != original_digest
 
 
 def test_protected_previous_action_master_accepts_legacy_status_contract(
@@ -1035,6 +1251,7 @@ def test_master_preflight_allows_management_inputs_but_rejects_generated_tamperi
     workbook["Management Setup"]["B6"] = 1234.0
     workbook["Management Setup"]["A21"] = "Pat Manager"
     workbook["Management Setup"]["B21"] = "Yes"
+    workbook.active = workbook.sheetnames.index("Action Board")
     workbook.save(master)
     workbook.close()
 
