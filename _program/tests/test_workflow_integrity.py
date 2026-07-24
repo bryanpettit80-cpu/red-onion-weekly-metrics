@@ -1073,7 +1073,7 @@ def test_successful_staged_run_chains_manifest_snapshots_outputs_and_deletes_sou
     archive_dir = Path(args.archive_dir)
     input_dir.mkdir(parents=True)
     source = input_dir / "Daily Report - TM - 07-21-2026.xlsx"
-    source_bytes = b"unaltered-toast-source"
+    source_bytes = b"unaltered-red-onion-source"
     source.write_bytes(source_bytes)
     install_synthetic_parser(monkeypatch)
 

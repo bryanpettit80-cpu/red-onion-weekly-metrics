@@ -69,6 +69,10 @@ def weekly_row(
         "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
         "rate_of_sale_by_guest_count": rate,
         "average_ticket_time_seconds": ticket_seconds,
+        "rate_available": True,
+        "ticket_time_available": True,
+        "check_count": guest_count,
+        "check_count_available": True,
         "active_days": active_days,
         "source_days": active_days,
         "source_files": "synthetic.xls",
@@ -391,7 +395,7 @@ def test_launchers_route_to_named_operator_workspace() -> None:
     assert "exit $ReportExitCode" in powershell_runner
 
 
-def test_star_scoring_uses_all_metric_families_and_rank_movement(tmp_path: Path) -> None:
+def test_star_scoring_uses_only_person_action_metrics(tmp_path: Path) -> None:
     config = metrics.load_config(tmp_path / "missing-config.json")
     prior_week = date(2026, 6, 7)
     latest_week = date(2026, 6, 14)
@@ -443,16 +447,16 @@ def test_star_scoring_uses_all_metric_families_and_rank_movement(tmp_path: Path)
 
     rising = by_name["Alex Rising"]
     assert rising["category"] == "Rising Star"
-    assert rising["composite_score"] == 9
+    assert rising["composite_score"] == 4
     assert rising["average_rank_movement"] == 4
-    assert "Check avg +$8.00" in rising["why"]
+    assert "Sales / Guest +$8.00" in rising["why"]
     assert "Wine +4.0 pts" in rising["why"]
-    assert "Rate -0.50" in rising["why"]
-    assert "Ticket -7.0 min" in rising["why"]
+    assert "Rate" not in rising["why"]
+    assert "Ticket" not in rising["why"]
 
     falling = by_name["Jordan Falling"]
     assert falling["category"] == "Falling Star"
-    assert falling["composite_score"] == -10
+    assert falling["composite_score"] == -4
     assert falling["average_rank_movement"] == -5
 
 
@@ -835,8 +839,11 @@ def test_all_stores_group_aggregation_and_trend_deltas() -> None:
     assert prior["guest_count"] == 75
     assert prior["check_average"] == 20
     assert prior["wine_pct"] == pytest.approx(0.1)
-    assert prior["rate_of_sale_by_guest_count"] == pytest.approx((2 * 50 + 4 * 25) / 75)
-    assert prior["average_ticket_time_seconds"] == pytest.approx((600 * 50 + 1200 * 25) / 75)
+    assert prior["rate_of_sale_by_guest_count"] == pytest.approx(
+        75 / (50 / 2 + 25 / 4)
+    )
+    assert prior["ticket_time_available"] is False
+    assert prior["average_ticket_time_seconds"] == 0
     assert prior["active_days"] == 1
 
     trend_rows = metrics.weekly_metric_trend_rows(group_rows, ("group",))
@@ -911,20 +918,20 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         guide.column_dimensions[metrics.get_column_letter(column)].width == 13
         for column in range(1, 13)
     )
-    assert guide.row_dimensions[1].height == 54
+    assert guide.row_dimensions[1].height == 32
     assert guide.row_dimensions[2].height == 24
     assert guide.row_dimensions[3].height == 24
     assert guide.row_dimensions[4].height == 54
     assert guide.row_dimensions[30].height == 42
     assert guide.row_dimensions[58].height == 24
-    assert guide.row_dimensions[59].height == 42
+    assert guide.row_dimensions[59].height == 72
     assert metrics.MANAGEMENT_METHODOLOGY_VERSION in "\n".join(guide_values)
     for phrase in (
         "never be the sole or determinative basis",
         "Do not infer protected characteristics from names.",
         "ExternalCheckRequired",
-        "Rate of Sale currently assumes lower is better.",
-        "Ticket Time is guest-weighted",
+        "Rate of Sale is opportunities divided by qualifying sales",
+        "Ticket Time is weighted only by complete Check Count coverage",
     ):
         assert phrase in "\n".join(guide_values)
     for field in (
@@ -962,6 +969,25 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             worksheet.cell(row=2, column=column).hyperlink.target
             for column in navigation_columns
         ] == [f"#'{target}'!A1" for _, target in expected_navigation]
+        assert all(
+            worksheet.column_dimensions[
+                metrics.get_column_letter(column)
+            ].width
+            >= 10
+            for column in navigation_columns
+        )
+        assert (
+            worksheet.page_setup.fitToWidth
+            == metrics.MANAGEMENT_PRINT_WIDTHS[sheet_name]
+        )
+        if sheet_name == "Data Quality":
+            assert (
+                str(worksheet.page_setup.paperSize)
+                == str(worksheet.PAPERSIZE_TABLOID)
+            )
+        assert worksheet.page_setup.orientation == "landscape"
+        assert worksheet.print_area
+        assert worksheet.print_title_rows
         active_navigation_cells = [
             worksheet.cell(row=2, column=column)
             for column, (_, target) in zip(
@@ -970,9 +996,29 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             if target == sheet_name
         ]
         assert len(active_navigation_cells) == 1
-        assert metrics.workbook_color_suffix(
-            active_navigation_cells[0].fill.fgColor
-        ) == "7A1E1E"
+        assert active_navigation_cells[0].font.underline == "single"
+        assert all(
+            metrics.workbook_color_suffix(
+                worksheet.cell(row=2, column=column).fill.fgColor
+            )
+            == "F2F2F2"
+            for column in navigation_columns
+        )
+        assert all(
+            getattr(
+                worksheet.cell(row=2, column=column).border.left,
+                "style",
+                None,
+            )
+            is None
+            and getattr(
+                worksheet.cell(row=2, column=column).border.right,
+                "style",
+                None,
+            )
+            is None
+            for column in navigation_columns
+        )
         assert any(
             merged.min_row == merged.max_row == 1
             and merged.min_col == 1
@@ -1002,6 +1048,9 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert any("READY FOR HUMAN REVIEW" in value for value in dashboard_values)
     assert len(wb["Dashboard"]._charts) == 0
     assert len(wb["Store & Group Scorecards"]._charts) == 2
+    assert wb["Store & Group Scorecards"]._charts[0].legend.position == "b"
+    assert wb["Store & Group Scorecards"]._charts[0].anchor._from.row == 3
+    assert wb["Store & Group Scorecards"]._charts[1].anchor._from.row == 16
 
     action_values = {
         value
@@ -1025,7 +1074,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Action Board"]["W5"].number_format == "m/d/yyyy"
     assert wb["Action History"].row_dimensions[4].height == 30
     evidence = wb["Evidence Detail"]
-    assert evidence.row_dimensions[3].height == 36
+    assert evidence.row_dimensions[3].height == 54
     assert "exact raw Evidence Sources and Metric Evidence columns are hidden" in (
         evidence["A3"].value
     )
@@ -1054,18 +1103,30 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             ).value
         ).startswith("{")
     run_notes = wb["Run Notes"]
-    assert run_notes["A25"].value == "Peer Comparison"
-    assert run_notes.row_dimensions[25].height == 45
-    assert run_notes["A27"].value == "Signal Scoring"
-    assert run_notes.row_dimensions[27].height == 45
+    run_note_rows = {
+        run_notes.cell(row=row, column=1).value: row
+        for row in range(1, run_notes.max_row + 1)
+    }
+    assert run_notes.row_dimensions[run_note_rows["Peer Comparison"]].height == 54
+    assert run_notes.row_dimensions[run_note_rows["Signal Scoring"]].height == 54
+    assert "Check Count Coverage" in run_note_rows
     assert wb["Dashboard"].row_dimensions[13].height == 66
     assert wb["Dashboard"].row_dimensions[14].height == 66
     assert wb["Dashboard"].row_dimensions[15].height == 66
+    assert wb["Dashboard"].row_dimensions[9].height == 32
+    assert wb["Action Focus"].row_dimensions[3].height == 48
+    assert wb["Action Focus"].page_setup.fitToWidth == 2
     assert wb["Server Scorecard"].row_dimensions[3].height == 30
-    assert wb["Server Scorecard"].row_dimensions[4].height == 48
+    assert wb["Server Scorecard"].row_dimensions[4].height == 66
     assert wb["Recent Movement Signals"].row_dimensions[3].height == 30
     assert wb["Recent Movement Signals"].max_row == 3
-    assert wb["Data Quality"].row_dimensions[3].height == 36
+    assert wb["Data Quality"].row_dimensions[3].height == 48
+    assert "$A$1:$L$" in str(wb["Data Quality"].print_area)
+    assert len(wb["Store & Group Scorecards"].row_breaks.brk) == 3
+    assert [
+        page_break.id
+        for page_break in wb["Store & Group Scorecards"].row_breaks.brk
+    ] == [16, 29, 42]
     for sheet_name, widths in {
         "Action Focus": {"B": 15, "M": 21},
         "Server Scorecard": {"E": 21, "F": 23, "G": 23, "H": 22},

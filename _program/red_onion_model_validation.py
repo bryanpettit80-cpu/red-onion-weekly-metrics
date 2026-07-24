@@ -32,16 +32,6 @@ METRIC_SPECS: dict[str, dict[str, float]] = {
         "business_strong": 0.01,
         "increment": 0.001,
     },
-    "rate_of_sale_by_guest_count": {
-        "business_neutral": 0.005,
-        "business_strong": 0.01,
-        "increment": 0.001,
-    },
-    "average_ticket_time_seconds": {
-        "business_neutral": 150.0,
-        "business_strong": 300.0,
-        "increment": 60.0,
-    },
 }
 
 QUALIFIED_EVIDENCE_STATUSES = frozenset({"Eligible", "Stable", "Sensitive"})

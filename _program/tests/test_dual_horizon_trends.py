@@ -253,6 +253,6 @@ def test_server_scorecard_uses_decision_first_12_columns() -> None:
         "History Used",
         "Positive Drivers",
         "Watch Drivers",
-        "Recommended Next Step",
+        "Manager Question",
     ]
     assert "Score" not in headers

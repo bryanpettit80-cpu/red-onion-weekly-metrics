@@ -14,7 +14,7 @@ Red Onion Metrics\
   Run Weekly Snapshot.cmd
 ```
 
-- `01 Daily Reports - Drop Here`: drop the current Toast daily `.xls` or `.xlsx` files here.
+- `01 Daily Reports - Drop Here`: drop the current Red Onion daily `.xls` or `.xlsx` files here.
 - `02 Finished Reports`: generated weekly workbooks appear here.
 - `03 Archive`: processed reports, prior layouts, and historical workbooks are preserved here.
 - `Red Onion Weekly Metrics Automation`: Git repository, code, config, tests, and technical documentation. Operators should not edit this folder.
@@ -22,7 +22,7 @@ Red Onion Metrics\
 
 ## Weekly Run
 
-1. Save the current Toast/Marketing Vitals files into `01 Daily Reports - Drop Here`.
+1. Save the current Red Onion Marketing Vitals files into `01 Daily Reports - Drop Here`.
 2. Double-click `Run Weekly Snapshot.cmd`.
 3. Open the generated workbooks in `02 Finished Reports`.
 
@@ -101,9 +101,48 @@ Before the first protected weekly run, a maintainer must explicitly confirm the 
 
 An ordinary run fails closed if that baseline, its manifest history, or the machine-local trusted head is missing; it never silently establishes a replacement baseline. On the first run after upgrading an older deployment that already has manifests but no local anchor, the same explicit initialization command verifies the complete current state and adopts that existing head once. A manifest-pinned owner-roster workbook from the immediately preceding protection contract is accepted only through that explicit adoption; it is not rewritten during adoption, history-only migration remains blocked, and the next ordinary weekly run regenerates it with the current strict controls. Each later run verifies the trusted head, full manifest chain, canonical raw archive, generated-workbook archive, published public workbooks, and the master workbook's generated-content digest before reading prior management state. Approved scalar values in blue cells and the Action Board remain editable, while their styles, validation, hyperlinks, and protection metadata stay covered; formulas or external links in editable cells and changes to generated content stop the run.
 
+## Workbook Layers And Metric Use
+
+Methodology `2026.07-v3` separates useful operating context from the narrower
+person-review signal:
+
+- **Operations layer:** shows volume, trends, store and person comparisons, and
+  descriptive context. Check Count supports total checks, Sales/Check, and
+  Guests/Check. Rate of Sale and Ticket Time remain visible here.
+- **People-review layer:** may create a Context Review, Coaching Prompt, or
+  Recognition Prompt using only Sales/Guest (the existing internal
+  `check_average` field) and Wine Percentage. Rate of Sale, Ticket Time, Check
+  Count, and the derived per-check measures cannot create, strengthen, persist,
+  or escalate a person-level action.
+
+Rate of Sale is Red Onion's inverse conversion measure:
+`opportunities / qualifying sales`, so a lower positive value is better. When
+the current field is Rate of Sale by Guest Count, Guests are the opportunity
+count. When positive row-level rates are combined, the workbook uses the
+opportunity-weighted harmonic calculation, equivalent to total opportunities
+divided by reconstructed total qualifying sales. A zero, negative, malformed,
+or missing rate cannot be safely reconstructed from the ratio alone and is
+unavailable for the combined context value.
+
+Ticket Time is check-weighted only when every contributing row has a valid
+Check Count and the total Check Count is positive:
+`sum(Ticket Time × Check Count) / sum(Check Count)`. If Check Count coverage is
+incomplete, the workbook does not substitute guest weighting; the combined
+Ticket Time is unavailable. With complete coverage and a positive total Check
+Count, it also reports `Sales/Check = total sales / total checks` and
+`Guests/Check = total guests / total checks`.
+
+The operational layer is intended to help a manager ask:
+
+- What changed, and is it isolated or store-wide?
+- Did check volume, Guests/Check, or another observable operating condition
+  move at the same time?
+- Is the source complete and the work reasonably comparable?
+- What should be verified before a coaching or recognition conversation?
+
 ## Coaching-Signal Interpretation
 
-The v0.3.0 methodology is a deterministic, rule-based screening aid. It does
+Methodology `2026.07-v3` is a deterministic, rule-based screening aid. It does
 not estimate statistical confidence, predict future performance, establish
 causality, or determine whether a person is performing fairly relative to
 unobserved shift conditions. Its output is limited to coaching and recognition
@@ -183,15 +222,17 @@ python _program\red_onion_weekly_metrics.py `
 
 ### One-Time Gmail Backfill
 
-The initial v0.3.0 calibration may use a one-time, read-only retrieval of
+The 16-week candidate calibration uses a one-time, read-only retrieval of 24
 original `Daily Report - TM` attachments from the Marketing Vitals sender.
-This is a controlled backfill, not an ongoing Gmail integration:
+They add four complete Tuesday-Sunday weeks before the canonical archive. This
+is a controlled backfill, not an ongoing Gmail integration:
 
 - Select reports by their embedded business date; the attachment filename and
   email date may be one day later.
-- Accept only the original TM report family. Exclude Store reports, forwarded
-  duplicates, Monday reports, unrelated messages, and conflicting same-date
-  files.
+- Accept only the original TM report family. Exclude derived `Check_Wine`
+  workbooks, Store reports, forwarded duplicates, Monday reports, unrelated
+  messages, `No Data Available` workbooks, legacy incompatible schemas, and
+  conflicting same-date files.
 - Stage attachments outside the Git repository and live Dropbox operator
   folders. Do not retain email bodies or message identifiers.
 - Validate the expected workbook schema, six Tuesday-Sunday dates per week,
@@ -210,7 +251,7 @@ without writing files:
 python _program\red_onion_model_validation.py `
   "C:\approved\canonical-history" `
   "C:\approved\temporary-backfill" `
-  --start 2026-04-28 `
+  --start 2026-03-24 `
   --end 2026-07-19
 ```
 
@@ -222,7 +263,7 @@ emit person-level rows.
 
 If parsing or workbook creation fails, the source files stay in `01 Daily Reports - Drop Here` so they can be fixed and rerun.
 
-If the window identifies a file containing `No Data Available`, replace that file with a complete Toast Daily Report export. The program does not create a partial workbook or archive any current files when an input report is invalid.
+If the window identifies a file containing `No Data Available`, replace that file with a complete Red Onion Daily Report export. The program does not create a partial workbook or archive any current files when an input report is invalid.
 
 Close any open output workbook before rerunning. Excel can block replacement while a workbook is open.
 
@@ -256,18 +297,18 @@ once and mark departed managers inactive instead of deleting history. The
 Excel; the next successful run carries the roster forward and flags assignments
 that are inactive or no longer listed.
 
-The frozen scoring thresholds identify their calibration dataset, date,
-quantile method, rounding rules, and methodology version. v0.3.0 uses the
-larger of the business minimum and the R-7 75th percentile of absolute
-qualified deviations for a neutral band, and the larger of the business
-minimum and R-7 90th percentile for a strong band. Values are rounded half-up
-to $0.50 for check average, 0.001 for percentage/rate metrics, and 60 seconds
-for ticket time. Thresholds are frozen for a methodology release and are not
-recomputed during an ordinary weekly run.
+The frozen people-review thresholds identify their calibration dataset, date,
+quantile method, rounding rules, and methodology version. `2026.07-v3` uses
+only Sales/Guest and Wine Percentage. It uses the larger of the business
+minimum and the R-7 75th percentile of absolute qualified deviations for a
+neutral band, and the larger of the business minimum and the R-7 90th
+percentile for a strong band. Values are rounded half-up to $0.50 for
+Sales/Guest and 0.001 for Wine Percentage. Thresholds are frozen for a
+methodology release and are not recomputed during an ordinary weekly run.
 
-Rate of Sale is assumed to be lower-is-better. Average Ticket Time is pooled by
-guest count because the source does not provide ticket counts. These are
-business assumptions pending validation with Toast or the source owner.
+Rate of Sale, Ticket Time, Check Count, Sales/Check, and Guests/Check have no
+people-review scoring thresholds. They remain descriptive operating context
+under the aggregation and completeness rules above.
 
 ## Protected Edit Surface
 

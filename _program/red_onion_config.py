@@ -33,7 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dashboard_exclude_name_contains": ["Banquet", "Server"],
     "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout"],
     "management_score_thresholds": {
-        "check_average": {"neutral": 11.5, "strong": 18.5, "lower_is_better": False},
+        "check_average": {"neutral": 11.5, "strong": 17.5, "lower_is_better": False},
         "wine_pct": {"neutral": 0.041, "strong": 0.057, "lower_is_better": False},
         "rate_of_sale_by_guest_count": {
             "neutral": 0.019,
@@ -48,7 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "management_peer_score_thresholds": {
         "check_average": {"neutral": 11.0, "strong": 16.5, "lower_is_better": False},
-        "wine_pct": {"neutral": 0.041, "strong": 0.058, "lower_is_better": False},
+        "wine_pct": {"neutral": 0.039, "strong": 0.054, "lower_is_better": False},
         "rate_of_sale_by_guest_count": {
             "neutral": 0.019,
             "strong": 0.028,
@@ -77,11 +77,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "method": "r7-absolute-deviation",
         "neutral_quantile": 0.75,
         "strong_quantile": 0.9,
-        "calibration_start": "2026-04-28",
+        "calibration_start": "2026-03-24",
         "calibration_end": "2026-07-19",
-        "movement_observation_count": 676,
-        "peer_observation_count": 612,
-        "version": "2026.07-v2",
+        "movement_observation_count": 454,
+        "peer_observation_count": 404,
+        "version": "2026.07-v3",
     },
     "management_min_entity_baseline_weeks": 2,
     "management_materiality": {
@@ -366,7 +366,7 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if effective_peer["leave_one_person_out"] is not True:
             raise ConfigError(
                 "management_peer_reference.leave_one_person_out must be true for "
-                "methodology 2026.07-v2."
+                "methodology 2026.07-v3."
             )
 
     if "management_signal_persistence" in payload:
@@ -388,7 +388,7 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if effective_persistence["qualified_weeks"] != 2:
             raise ConfigError(
                 "management_signal_persistence.qualified_weeks must be 2 for "
-                "methodology 2026.07-v2."
+                "methodology 2026.07-v3."
             )
         for field in (
             "require_recurring_driver",
@@ -401,7 +401,7 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if effective_persistence[field] is not True:
                 raise ConfigError(
                     f"management_signal_persistence.{field} must be true for "
-                    "methodology 2026.07-v2."
+                    "methodology 2026.07-v3."
                 )
 
     if "management_threshold_calibration" in payload:

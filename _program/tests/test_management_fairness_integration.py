@@ -202,6 +202,36 @@ def test_person_targets_do_not_replace_leave_one_out_peer_reference() -> None:
     assert targeted["peer_cohort_size"] == 6
 
 
+def test_context_only_metrics_cannot_change_a_person_action() -> None:
+    rows, locations, config = synthetic_history()
+    baseline = focal_result(rows, locations, config)
+    changed_rows = deepcopy(rows)
+    for row in changed_rows:
+        if row["raw_user_name"] == "entity-focus":
+            row["rate_of_sale_by_guest_count"] = 99_999.0
+            row["average_ticket_time_seconds"] = 999_999.0
+            row["rate_available"] = False
+            row["ticket_time_available"] = False
+            row["check_count"] = 1.0
+            row["check_count_available"] = True
+    changed = focal_result(changed_rows, locations, config)
+
+    for field in (
+        "action",
+        "momentum",
+        "performance_level",
+        "candidate_polarity",
+        "composite_score",
+        "peer_composite_score",
+        "persistence_reason",
+    ):
+        assert changed[field] == baseline[field]
+    assert tuple(metrics.SERVER_TREND_FIELDS) == (
+        "check_average",
+        "wine_pct",
+    )
+
+
 @pytest.mark.parametrize(
     "value",
     [None, "", "not-a-number", float("nan"), float("inf")],

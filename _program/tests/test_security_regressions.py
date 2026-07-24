@@ -315,6 +315,19 @@ def test_duplicate_signature_distinguishes_unavailable_metrics_from_real_zero() 
     )
 
 
+def test_duplicate_signature_distinguishes_check_count_value_and_availability() -> None:
+    base = make_record(date(2026, 7, 18))
+    zero_checks = replace(base, check_count=0.0, check_count_available=True)
+    ten_checks = replace(base, check_count=10.0, check_count_available=True)
+
+    signatures = {
+        metrics.semantic_report_signature([record])
+        for record in (base, zero_checks, ten_checks)
+    }
+
+    assert len(signatures) == 3
+
+
 def test_run_rejects_excessive_history_span_before_writes_or_moves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

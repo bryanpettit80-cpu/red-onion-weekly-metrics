@@ -93,11 +93,13 @@ they contain V2 review evidence.
 The one-time Gmail history backfill is restricted to original Marketing Vitals
 TM report attachments needed for the approved historical window. Retrieve them
 read-only, stage them outside the repository and live Dropbox folders, and
-retain no email body or message identifier. Exclude forwarded duplicates and
-other report families. Remove temporary staging copies after the canonical
-history migration and rebuild verify. No recurring Gmail connector,
-credentials, or mailbox metadata belong in this repository or normal weekly
-workflow.
+retain no email body or message identifier. Exclude forwarded duplicates,
+derived `Check_Wine` workbooks, `No Data Available` workbooks, legacy
+incompatible schemas, conflicting same-date files, and other report families.
+Only complete Tuesday-Sunday weeks from the original TM reports may enter the
+calibration cohort. Remove temporary staging copies after the canonical history
+migration and rebuild verify. No recurring Gmail connector, credentials, or
+mailbox metadata belong in this repository or normal weekly workflow.
 
 ## Corrections, Disputes, and Access Changes
 

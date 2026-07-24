@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, time
 from pathlib import Path
 
@@ -79,6 +80,184 @@ def test_valid_xlsx_uses_internal_business_date(tmp_path: Path) -> None:
     assert records[0].source_format == ".xlsx"
     assert records[0].parser_engine == "openpyxl"
     assert records[0].report_date_source == "Workbook Date(s) field"
+    assert records[0].check_count == 0.0
+    assert records[0].check_count_available is False
+
+
+def test_optional_check_count_header_is_parsed(tmp_path: Path) -> None:
+    path = tmp_path / "Daily Report - TM - 07-12-2026.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Report(All)"
+    worksheet.append(["Date(s): 07/11/2026"])
+    worksheet.append(
+        [
+            "Store",
+            "User",
+            "Gross Sales",
+            "Guest Count",
+            "Check Average",
+            "Wine Sales",
+            "Rate of Sale by Guest Count",
+            "Average Ticket Time",
+            "Check Count",
+        ]
+    )
+    worksheet.append(
+        [
+            "RC Richmond",
+            "Server One",
+            100.0,
+            10.0,
+            10.0,
+            20.0,
+            0.2,
+            time(0, 20),
+            7,
+        ]
+    )
+    workbook.save(path)
+    workbook.close()
+
+    records = metrics.parse_daily_report(
+        path, metrics.load_config(tmp_path / "missing.json")
+    )
+
+    assert len(records) == 1
+    assert records[0].check_count == 7.0
+    assert records[0].check_count_available is True
+
+
+@pytest.mark.parametrize("invalid_check_count", ["not a count", -1, 1.5])
+def test_invalid_check_count_is_unavailable(
+    tmp_path: Path, invalid_check_count: object
+) -> None:
+    path = tmp_path / "Daily Report - TM - 07-12-2026.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Report(All)"
+    worksheet.append(["Date(s): 07/11/2026"])
+    worksheet.append(
+        [
+            "Store",
+            "User",
+            "Gross Sales",
+            "Guest Count",
+            "Check Average",
+            "Wine Sales",
+            "Rate of Sale by Guest Count",
+            "Average Ticket Time",
+            "Check Count",
+        ]
+    )
+    worksheet.append(
+        [
+            "RC Richmond",
+            "Server One",
+            100.0,
+            10.0,
+            10.0,
+            20.0,
+            0.2,
+            time(0, 20),
+            invalid_check_count,
+        ]
+    )
+    workbook.save(path)
+    workbook.close()
+
+    records = metrics.parse_daily_report(
+        path, metrics.load_config(tmp_path / "missing.json")
+    )
+
+    assert len(records) == 1
+    assert records[0].check_count == 0.0
+    assert records[0].check_count_available is False
+
+
+def test_check_only_server_row_is_retained(tmp_path: Path) -> None:
+    path = tmp_path / "Daily Report - TM - 07-12-2026.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Report(All)"
+    worksheet.append(["Date(s): 07/11/2026"])
+    worksheet.append(
+        [
+            "Store",
+            "User",
+            "Gross Sales",
+            "Guest Count",
+            "Check Average",
+            "Wine Sales",
+            "Rate of Sale by Guest Count",
+            "Average Ticket Time",
+            "Check Count",
+        ]
+    )
+    worksheet.append(
+        [
+            "RC Richmond",
+            "Server One",
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            4,
+        ]
+    )
+    workbook.save(path)
+    workbook.close()
+
+    records = metrics.parse_daily_report(
+        path, metrics.load_config(tmp_path / "missing.json")
+    )
+
+    assert len(records) == 1
+    assert records[0].raw_user_name == "Server One"
+    assert records[0].check_count == 4.0
+    assert records[0].check_count_available is True
+
+
+def test_duplicate_resolution_prefers_richer_report_with_check_only_row(
+    tmp_path: Path,
+) -> None:
+    day = date(2026, 7, 23)
+    legacy_path = tmp_path / "Daily Report legacy.xls"
+    richer_path = tmp_path / "Daily Report richer.xlsx"
+    legacy = make_record(legacy_path, day)
+    richer_base = replace(
+        legacy,
+        source_file=richer_path.name,
+        check_count=10.0,
+        check_count_available=True,
+    )
+    check_only = replace(
+        richer_base,
+        raw_user_name="Check Only",
+        display_name="Check Only",
+        gross_sales=0.0,
+        guest_count=0.0,
+        check_average=0.0,
+        wine_sales=0.0,
+        wine_pct=0.0,
+        rate_of_sale_by_guest_count=0.0,
+        average_ticket_time_seconds=0.0,
+        rate_available=False,
+        ticket_time_available=False,
+        check_count=4.0,
+    )
+
+    resolution = metrics.resolve_report_duplicates(
+        {
+            legacy_path: [legacy],
+            richer_path: [richer_base, check_only],
+        }
+    )
+
+    assert tuple(resolution.records_by_path) == (richer_path,)
+    assert resolution.duplicate_paths == (legacy_path,)
 
 
 def test_archived_history_is_limited_to_canonical_processed_folder(tmp_path: Path) -> None:

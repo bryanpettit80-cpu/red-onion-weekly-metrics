@@ -187,11 +187,11 @@ def test_missing_configured_store_suppresses_actions_and_blanks_stale_scorecard(
 
     scorecards = wb["Store & Group Scorecards"]
     assert "Preliminary" in scorecards["A4"].value
-    assert "Preliminary" in scorecards["A14"].value
-    assert scorecards["A24"].value.startswith("RC Virginia Beach | Missing")
-    assert scorecards["B26"].value is None
-    assert scorecards["F26"].value == "No current-week data"
-    assert scorecards["G26"].value == "Missing"
+    assert "Preliminary" in scorecards["A17"].value
+    assert scorecards["A30"].value.startswith("RC Virginia Beach | Missing")
+    assert scorecards["B32"].value is None
+    assert scorecards["F32"].value == "No current-week data"
+    assert scorecards["G32"].value == "Missing"
     assert 999999.0 not in {
         cell.value for row in scorecards.iter_rows() for cell in row
     }
