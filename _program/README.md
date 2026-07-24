@@ -242,7 +242,7 @@ JSON:
 python red_onion_model_validation.py `
   "C:\approved\canonical-history" `
   "C:\approved\temporary-backfill" `
-  --start 2026-04-28 `
+  --start 2026-03-24 `
   --end 2026-07-19
 ```
 

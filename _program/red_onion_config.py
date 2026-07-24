@@ -33,7 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dashboard_exclude_name_contains": ["Banquet", "Server"],
     "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout"],
     "management_score_thresholds": {
-        "check_average": {"neutral": 11.5, "strong": 18.5, "lower_is_better": False},
+        "check_average": {"neutral": 11.5, "strong": 17.5, "lower_is_better": False},
         "wine_pct": {"neutral": 0.041, "strong": 0.057, "lower_is_better": False},
         "rate_of_sale_by_guest_count": {
             "neutral": 0.019,
@@ -48,7 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "management_peer_score_thresholds": {
         "check_average": {"neutral": 11.0, "strong": 16.5, "lower_is_better": False},
-        "wine_pct": {"neutral": 0.041, "strong": 0.058, "lower_is_better": False},
+        "wine_pct": {"neutral": 0.039, "strong": 0.054, "lower_is_better": False},
         "rate_of_sale_by_guest_count": {
             "neutral": 0.019,
             "strong": 0.028,
@@ -77,10 +77,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "method": "r7-absolute-deviation",
         "neutral_quantile": 0.75,
         "strong_quantile": 0.9,
-        "calibration_start": "2026-04-28",
+        "calibration_start": "2026-03-24",
         "calibration_end": "2026-07-19",
-        "movement_observation_count": 338,
-        "peer_observation_count": 306,
+        "movement_observation_count": 454,
+        "peer_observation_count": 404,
         "version": "2026.07-v3",
     },
     "management_min_entity_baseline_weeks": 2,

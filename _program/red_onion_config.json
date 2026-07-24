@@ -36,7 +36,7 @@
   "management_score_thresholds": {
     "check_average": {
       "neutral": 11.5,
-      "strong": 18.5,
+      "strong": 17.5,
       "lower_is_better": false
     },
     "wine_pct": {
@@ -62,8 +62,8 @@
       "lower_is_better": false
     },
     "wine_pct": {
-      "neutral": 0.041,
-      "strong": 0.058,
+      "neutral": 0.039,
+      "strong": 0.054,
       "lower_is_better": false
     },
     "rate_of_sale_by_guest_count": {
@@ -94,10 +94,10 @@
     "method": "r7-absolute-deviation",
     "neutral_quantile": 0.75,
     "strong_quantile": 0.9,
-    "calibration_start": "2026-04-28",
+    "calibration_start": "2026-03-24",
     "calibration_end": "2026-07-19",
-    "movement_observation_count": 338,
-    "peer_observation_count": 306,
+    "movement_observation_count": 454,
+    "peer_observation_count": 404,
     "version": "2026.07-v3"
   },
   "management_min_entity_baseline_weeks": 2,

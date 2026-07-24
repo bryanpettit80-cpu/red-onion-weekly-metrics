@@ -4,7 +4,8 @@
 
 - **System:** Red Onion Weekly Metrics
 - **Release contract:** `v0.4.0` (methodology changed from `v0.3.2`);
-  publication requires the v3 validation and business-owner approval below
+  publication requires protected backfill migration, final replay readback,
+  and business-owner approval below
 - **Methodology:** `2026.07-v3`
 - **System type:** deterministic, rule-based observational coaching signal
 - **Owners:** Red Onion business owner and designated technical maintainer
@@ -112,8 +113,8 @@ change a composite, become a recurring driver, or affect persistence or
 escalation.
 
 The action-metric thresholds are frozen in configuration for each methodology
-release. For `2026.07-v3`, the Sales/Guest and Wine Percentage bands retain the
-verified 12-week calibration:
+release. For `2026.07-v3`, the Sales/Guest and Wine Percentage bands use the
+verified 16-week calibration:
 
 - **Neutral:** the larger of the documented business minimum and the R-7 75th
   percentile of absolute qualified deviations.
@@ -127,13 +128,13 @@ The frozen `2026.07-v3` people-review bands are:
 
 | Metric | Movement neutral / strong | Peer neutral / strong |
 |---|---:|---:|
-| Sales/Guest | $11.50 / $18.50 | $11.00 / $16.50 |
-| Wine Percentage | 4.1 / 5.7 percentage points | 4.1 / 5.8 percentage points |
+| Sales/Guest | $11.50 / $17.50 | $11.00 / $16.50 |
+| Wine Percentage | 4.1 / 5.7 percentage points | 3.9 / 5.4 percentage points |
 
-Movement calibration used 169 self-history-qualified person-weeks, or 338
-action-driving metric deviations; peer calibration used 153
-peer-reference-qualified person-weeks, or 306 action-driving metric deviations.
-The 12 complete weeks span April 28 through July 19, 2026, and the two
+Movement calibration used 227 self-history-qualified person-weeks, or 454
+action-driving metric deviations; peer calibration used 202
+peer-reference-qualified person-weeks, or 404 action-driving metric deviations.
+The 16 complete weeks span March 24 through July 19, 2026, and the two
 comparator families were calibrated independently.
 
 Calibration runs only as a maintainer-controlled release activity. An ordinary
@@ -256,7 +257,7 @@ package is uploaded, emailed, or transmitted automatically.
 ## Validation And Acceptance
 
 Release validation includes unit, workbook-contract, integrity, migration, and
-historical backtests. The initial 12-week pilot must demonstrate:
+historical backtests. The candidate historical replay must demonstrate:
 
 - 100% person-action invariance when only Rate of Sale, Ticket Time, Check
   Count, Sales/Check, or Guests/Check changes;
@@ -268,14 +269,21 @@ historical backtests. The initial 12-week pilot must demonstrate:
 - less than 25% category reversal between consecutive qualified weeks; and
 - exact guest reconciliation and sales/wine reconciliation within $0.01.
 
-The `2026.07-v2` historical baseline covered 153 qualified person-weeks. Eleven
-generated a review item (7.19% overall); the highest store-week rate was 25%.
-There were no reversals in the one consecutive candidate transition, and no
-escalated prompt failed the leave-one-active-day requirement. Zero Coaching or
-Recognition Prompts were escalated. Those figures describe the prior four-
-metric methodology and do not validate `2026.07-v3`. A separate v3 historical
-replay is required before the next protected release; neither methodology
-imposes a minimum prompt quota.
+The read-only `2026.07-v3` candidate replay covered 16 complete weeks, 96
+business-date reports, 202 qualified person-weeks, and 25 store-week groups.
+Nine qualified person-weeks generated a Context Review and none escalated to a
+Coaching or Recognition Prompt. The overall review/action rate was 4.46%, and
+the highest store-week rate was 25%. There were no consecutive candidate
+pairs, so a reversal rate was not estimable. Prompt stability was also not
+estimable because there were zero prompts; the methodology intentionally has
+no minimum prompt quota. Automated regressions separately prove that
+context-only metrics cannot change a person action.
+
+Those results meet the observable numerical acceptance limits for the
+candidate. Publication remains blocked until the 24 validated backfill files
+are migrated through the protected history transaction, the exact post-
+migration replay agrees with these aggregate results, and the business owner
+approves the release.
 
 These are operational stability and alert-quality tests, not proof of
 statistical, causal, or demographic fairness. No minimum prompt quota is
@@ -289,11 +297,13 @@ independently defined outcome and appropriate validation data.
 
 ## Historical Backfill
 
-The initial 12-week calibration may incorporate five older Tuesday-Sunday
-weeks retrieved once from original Marketing Vitals TM attachments. Selection
-uses the embedded business date, not the filename or email date. Forwarded
-duplicates, Store reports, Monday reports, and unrelated attachments are
-excluded.
+The 16-week candidate calibration incorporates four older complete
+Tuesday-Sunday weeks retrieved once from 24 original Marketing Vitals TM
+attachments: March 24-29, April 7-12, April 14-19, and April 21-26, 2026.
+Selection uses the embedded business date, not the filename or email date.
+Forwarded duplicates, derived `Check_Wine` workbooks, Store reports, Monday
+reports, `No Data Available` workbooks, legacy incompatible schemas, and
+conflicting same-date files are excluded.
 
 The retrieval is read-only and temporary. Attachments are staged outside the
 repository and live Dropbox folders, validated, migrated through the protected

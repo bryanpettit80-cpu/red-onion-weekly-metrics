@@ -222,15 +222,17 @@ python _program\red_onion_weekly_metrics.py `
 
 ### One-Time Gmail Backfill
 
-The initial 12-week calibration may use a one-time, read-only retrieval of
+The 16-week candidate calibration uses a one-time, read-only retrieval of 24
 original `Daily Report - TM` attachments from the Marketing Vitals sender.
-This is a controlled backfill, not an ongoing Gmail integration:
+They add four complete Tuesday-Sunday weeks before the canonical archive. This
+is a controlled backfill, not an ongoing Gmail integration:
 
 - Select reports by their embedded business date; the attachment filename and
   email date may be one day later.
-- Accept only the original TM report family. Exclude Store reports, forwarded
-  duplicates, Monday reports, unrelated messages, and conflicting same-date
-  files.
+- Accept only the original TM report family. Exclude derived `Check_Wine`
+  workbooks, Store reports, forwarded duplicates, Monday reports, unrelated
+  messages, `No Data Available` workbooks, legacy incompatible schemas, and
+  conflicting same-date files.
 - Stage attachments outside the Git repository and live Dropbox operator
   folders. Do not retain email bodies or message identifiers.
 - Validate the expected workbook schema, six Tuesday-Sunday dates per week,
@@ -249,7 +251,7 @@ without writing files:
 python _program\red_onion_model_validation.py `
   "C:\approved\canonical-history" `
   "C:\approved\temporary-backfill" `
-  --start 2026-04-28 `
+  --start 2026-03-24 `
   --end 2026-07-19
 ```
 
