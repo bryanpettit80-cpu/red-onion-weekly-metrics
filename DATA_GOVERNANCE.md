@@ -4,10 +4,10 @@ Server scorecards, named signals, coaching/recognition prompts, review
 dispositions, owner assignments, evidence details, and approved evidence
 exports are Restricted Employee Performance Information.
 
-The v0.3.0 rules are deterministic observational screening rules. They are not
-a statistical, predictive, causal, or employment-decision model. Data
-integrity and reproducibility do not establish that a signal fairly attributes
-performance to one person.
+The current `2026.07-v3` methodology uses deterministic observational
+screening rules. They are not a statistical, predictive, causal, or
+employment-decision model. Data integrity and reproducibility do not establish
+that a signal fairly attributes performance to one person.
 
 ## Allowed Use
 
