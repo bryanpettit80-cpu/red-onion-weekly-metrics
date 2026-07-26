@@ -105,7 +105,8 @@ public static class ReparsePointHelper {
     private const uint FileFlagBackupSem    = 0x02000000u; // FILE_FLAG_BACKUP_SEMANTICS
     private const uint FileFlagOpenReparse  = 0x00200000u; // FILE_FLAG_OPEN_REPARSE_POINT
     private const uint FsctlGetReparsePoint = 0x000900A8u; // FSCTL_GET_REPARSE_POINT
-    private const int  MaxReparseBuffer     = 16384;       // MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+    private const uint MaxReparseBuffer     = 16384u;      // MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+    private const uint ReparseTagSize       = 4u;          // sizeof(DWORD) reparse tag field
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFile(
@@ -132,7 +133,7 @@ public static class ReparsePointHelper {
             if (!DeviceIoControl(handle, FsctlGetReparsePoint,
                     IntPtr.Zero, 0u, buffer, (uint)buffer.Length,
                     out bytesReturned, IntPtr.Zero)) return null;
-            if (bytesReturned < 4u) return null;
+            if (bytesReturned < ReparseTagSize) return null;
             return BitConverter.ToUInt32(buffer, 0);
         }
     }
