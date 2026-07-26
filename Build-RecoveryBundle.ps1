@@ -64,7 +64,7 @@ function Get-TextSha256 {
     }
 }
 
-function Test-RedirectingReparsePoint {
+function Test-SafeCloudReparsePoint {
     param([Parameter(Mandatory = $true)]$Entry)
 
     if (
@@ -72,10 +72,11 @@ function Test-RedirectingReparsePoint {
     ) {
         return $false
     }
-    # Dropbox cloud placeholders report the generic ReparsePoint attribute to
-    # PowerShell even after their bytes are locally readable. They have neither
-    # a LinkType nor a Target. Junctions and symbolic links expose one or both,
-    # so reject redirectors while allowing normal Dropbox-backed files.
+
+    # PowerShell's LinkType/Target convenience properties are not exhaustive for
+    # all reparse providers. Fail closed for recognized links, then allow only
+    # Microsoft cloud-placeholder tags (0x9000001A through 0x9000F01A), which do
+    # not set the name-surrogate bit used by redirecting links.
     $LinkType = $Entry.PSObject.Properties["LinkType"]
     $Target = $Entry.PSObject.Properties["Target"]
     $HasLinkType = $null -ne $LinkType -and -not [string]::IsNullOrWhiteSpace(
@@ -86,7 +87,36 @@ function Test-RedirectingReparsePoint {
             -not [string]::IsNullOrWhiteSpace([string]$_)
         }
     ).Count -gt 0
-    return $HasLinkType -or $HasTarget
+    if ($HasLinkType -or $HasTarget) {
+        return $false
+    }
+
+    $Query = @(& fsutil reparsepoint query $Entry.FullName 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+    $TagLine = $Query | Where-Object { $_ -match "Reparse Tag Value" } |
+        Select-Object -First 1
+    if (-not $TagLine -or $TagLine -notmatch "0x([0-9A-Fa-f]+)") {
+        return $false
+    }
+    $Tag = [Convert]::ToUInt32($Matches[1], 16)
+    $NameSurrogateBit = [uint32]0x20000000
+    if (($Tag -band $NameSurrogateBit) -ne 0) {
+        return $false
+    }
+    return ($Tag -band [uint32]0xFFFF0FFF) -eq [uint32]0x9000001A
+}
+
+function Test-UnsafeReparsePoint {
+    param([Parameter(Mandatory = $true)]$Entry)
+
+    if (
+        ($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0
+    ) {
+        return $false
+    }
+    return -not (Test-SafeCloudReparsePoint -Entry $Entry)
 }
 
 function Assert-NormalTree {
@@ -99,12 +129,12 @@ function Assert-NormalTree {
         throw "$Label is missing: $Path"
     }
     $RootEntry = Get-Item -LiteralPath $Path -Force
-    if (Test-RedirectingReparsePoint -Entry $RootEntry) {
+    if (Test-UnsafeReparsePoint -Entry $RootEntry) {
         throw "$Label is a link or reparse point: $Path"
     }
     $Entries = @(Get-ChildItem -LiteralPath $Path -Recurse -Force)
     foreach ($Entry in $Entries) {
-        if (Test-RedirectingReparsePoint -Entry $Entry) {
+        if (Test-UnsafeReparsePoint -Entry $Entry) {
             throw "$Label contains a link or reparse point: $($Entry.FullName)"
         }
     }
@@ -292,7 +322,7 @@ try {
             throw "The weekly workflow lock is missing: $WorkflowLockPath"
         }
         $WorkflowLockEntry = Get-Item -LiteralPath $WorkflowLockPath -Force
-        if (Test-RedirectingReparsePoint -Entry $WorkflowLockEntry) {
+        if (Test-UnsafeReparsePoint -Entry $WorkflowLockEntry) {
             throw "The weekly workflow lock is a link or reparse point."
         }
         $OperationalLockStream = [System.IO.File]::Open(
