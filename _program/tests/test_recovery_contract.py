@@ -31,10 +31,13 @@ def test_recovery_bundle_defaults_to_released_source_only() -> None:
     assert ".weekly-snapshot.lock" in script
     assert "Get-OperationalSourceFingerprint" in script
     assert "Operational source state changed during recovery capture" in script
-    assert "Test-RedirectingReparsePoint" in script
+    assert "Test-UnsafeReparsePoint" in script
+    assert "Test-SafeCloudReparsePoint" in script
     assert '$Entry.PSObject.Properties["LinkType"]' in script
     assert '$Entry.PSObject.Properties["Target"]' in script
-    assert "Dropbox cloud placeholders" in script
+    assert "GetFileInformationByHandleEx" in script
+    assert "0x9000001A" in script
+    assert "NameSurrogateBit" in script
 
 
 def test_recovery_and_governance_contracts_are_explicit() -> None:

@@ -64,7 +64,67 @@ function Get-TextSha256 {
     }
 }
 
-function Test-RedirectingReparsePoint {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class ReparseTag {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileAttributeTagInfo {
+        public uint FileAttributes;
+        public uint ReparseTag;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle hFile,
+        int fileInformationClass,
+        out FileAttributeTagInfo lpFileInformation,
+        uint dwBufferSize);
+
+    private const uint FILE_READ_ATTRIBUTES    = 0x00000080;
+    private const uint FILE_SHARE_ALL          = 0x00000007;
+    private const uint OPEN_EXISTING           = 3;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS  = 0x02000000;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const int  FileAttributeTagInfoClass    = 0x0A;
+
+    public static uint? GetTag(string path) {
+        using (SafeFileHandle handle = CreateFile(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero)) {
+            if (handle.IsInvalid) { return null; }
+            FileAttributeTagInfo info;
+            if (!GetFileInformationByHandleEx(
+                    handle,
+                    FileAttributeTagInfoClass,
+                    out info,
+                    (uint)Marshal.SizeOf(typeof(FileAttributeTagInfo)))) {
+                return null;
+            }
+            return info.ReparseTag;
+        }
+    }
+}
+"@
+
+function Test-SafeCloudReparsePoint {
     param([Parameter(Mandatory = $true)]$Entry)
 
     if (
@@ -72,10 +132,11 @@ function Test-RedirectingReparsePoint {
     ) {
         return $false
     }
-    # Dropbox cloud placeholders report the generic ReparsePoint attribute to
-    # PowerShell even after their bytes are locally readable. They have neither
-    # a LinkType nor a Target. Junctions and symbolic links expose one or both,
-    # so reject redirectors while allowing normal Dropbox-backed files.
+
+    # PowerShell's LinkType/Target convenience properties are not exhaustive for
+    # all reparse providers. Fail closed for recognized links, then allow only
+    # Microsoft cloud-placeholder tags (0x9000001A through 0x9000F01A), which do
+    # not set the name-surrogate bit used by redirecting links.
     $LinkType = $Entry.PSObject.Properties["LinkType"]
     $Target = $Entry.PSObject.Properties["Target"]
     $HasLinkType = $null -ne $LinkType -and -not [string]::IsNullOrWhiteSpace(
@@ -86,7 +147,34 @@ function Test-RedirectingReparsePoint {
             -not [string]::IsNullOrWhiteSpace([string]$_)
         }
     ).Count -gt 0
-    return $HasLinkType -or $HasTarget
+    if ($HasLinkType -or $HasTarget) {
+        return $false
+    }
+
+    # Read the reparse tag via the Windows API (locale-independent; does not
+    # require elevated rights). Return false whenever the tag cannot be read.
+    $Tag = [ReparseTag]::GetTag($Entry.FullName)
+    if ($null -eq $Tag) {
+        return $false
+    }
+    $NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
+    if (($Tag -band $NameSurrogateBit) -ne 0) {
+        return $false
+    }
+    $CloudTagBase = [Convert]::ToUInt32("9000001A", 16)
+    $CloudTagMask = [Convert]::ToUInt32("FFFF0FFF", 16)
+    return ($Tag -band $CloudTagMask) -eq $CloudTagBase
+}
+
+function Test-UnsafeReparsePoint {
+    param([Parameter(Mandatory = $true)]$Entry)
+
+    if (
+        ($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0
+    ) {
+        return $false
+    }
+    return -not (Test-SafeCloudReparsePoint -Entry $Entry)
 }
 
 function Assert-NormalTree {
@@ -99,12 +187,12 @@ function Assert-NormalTree {
         throw "$Label is missing: $Path"
     }
     $RootEntry = Get-Item -LiteralPath $Path -Force
-    if (Test-RedirectingReparsePoint -Entry $RootEntry) {
+    if (Test-UnsafeReparsePoint -Entry $RootEntry) {
         throw "$Label is a link or reparse point: $Path"
     }
     $Entries = @(Get-ChildItem -LiteralPath $Path -Recurse -Force)
     foreach ($Entry in $Entries) {
-        if (Test-RedirectingReparsePoint -Entry $Entry) {
+        if (Test-UnsafeReparsePoint -Entry $Entry) {
             throw "$Label contains a link or reparse point: $($Entry.FullName)"
         }
     }
@@ -292,7 +380,7 @@ try {
             throw "The weekly workflow lock is missing: $WorkflowLockPath"
         }
         $WorkflowLockEntry = Get-Item -LiteralPath $WorkflowLockPath -Force
-        if (Test-RedirectingReparsePoint -Entry $WorkflowLockEntry) {
+        if (Test-UnsafeReparsePoint -Entry $WorkflowLockEntry) {
             throw "The weekly workflow lock is a link or reparse point."
         }
         $OperationalLockStream = [System.IO.File]::Open(
