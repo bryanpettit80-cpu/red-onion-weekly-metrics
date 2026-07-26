@@ -64,8 +64,6 @@ function Get-TextSha256 {
     }
 }
 
-<<<<<<< HEAD
-=======
 $NativeReparsePointCode = @'
 using System;
 using System.Runtime.InteropServices;
@@ -123,7 +121,6 @@ $Script:NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
 $Script:CloudTagBase = [Convert]::ToUInt32("9000001A", 16)
 $Script:CloudTagMask = [Convert]::ToUInt32("FFFF0FFF", 16)
 
->>>>>>> origin/main
 function Test-SafeCloudReparsePoint {
     param([Parameter(Mandatory = $true)]$Entry)
 
@@ -132,16 +129,8 @@ function Test-SafeCloudReparsePoint {
     ) {
         return $false
     }
-<<<<<<< HEAD
-
-    # PowerShell's LinkType/Target convenience properties are not exhaustive for
-    # all reparse providers. Fail closed for recognized links, then allow only
-    # Microsoft cloud-placeholder tags (0x9000001A through 0x9000F01A), which do
-    # not set the name-surrogate bit used by redirecting links.
-=======
     # PowerShell's LinkType/Target convenience properties cover junctions and
     # symbolic links. Reject those regardless of tag.
->>>>>>> origin/main
     $LinkType = $Entry.PSObject.Properties["LinkType"]
     $Target = $Entry.PSObject.Properties["Target"]
     $HasLinkType = $null -ne $LinkType -and -not [string]::IsNullOrWhiteSpace(
@@ -156,68 +145,6 @@ function Test-SafeCloudReparsePoint {
         return $false
     }
 
-<<<<<<< HEAD
-    # Read the reparse tag via DeviceIoControl (GENERIC_READ, no elevation required).
-    if (-not ("ReparsePointHelper" -as [type])) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-
-public static class ReparsePointHelper {
-    private const uint GenericRead          = 0x80000000u; // GENERIC_READ
-    private const uint FileShareAll         = 0x00000007u; // FILE_SHARE_READ|WRITE|DELETE
-    private const uint OpenExisting         = 3u;          // OPEN_EXISTING
-    private const uint FileFlagBackupSem    = 0x02000000u; // FILE_FLAG_BACKUP_SEMANTICS
-    private const uint FileFlagOpenReparse  = 0x00200000u; // FILE_FLAG_OPEN_REPARSE_POINT
-    private const uint FsctlGetReparsePoint = 0x000900A8u; // FSCTL_GET_REPARSE_POINT
-    private const uint MaxReparseBuffer     = 16384u;      // MAXIMUM_REPARSE_DATA_BUFFER_SIZE
-    private const uint ReparseTagSize       = 4u;          // sizeof(DWORD) reparse tag field
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern SafeFileHandle CreateFile(
-        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
-        IntPtr lpSecurityAttributes, uint dwCreationDisposition,
-        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool DeviceIoControl(
-        SafeFileHandle hDevice, uint dwIoControlCode,
-        IntPtr lpInBuffer, uint nInBufferSize,
-        byte[] lpOutBuffer, uint nOutBufferSize,
-        out uint lpBytesReturned, IntPtr lpOverlapped);
-
-    public static uint? GetTag(string path) {
-        using (SafeFileHandle handle = CreateFile(
-                path, GenericRead, FileShareAll,
-                IntPtr.Zero, OpenExisting,
-                FileFlagBackupSem | FileFlagOpenReparse,
-                IntPtr.Zero)) {
-            if (handle.IsInvalid) return null;
-            byte[] buffer = new byte[MaxReparseBuffer];
-            uint bytesReturned;
-            if (!DeviceIoControl(handle, FsctlGetReparsePoint,
-                    IntPtr.Zero, 0u, buffer, (uint)buffer.Length,
-                    out bytesReturned, IntPtr.Zero)) return null;
-            if (bytesReturned < ReparseTagSize) return null;
-            return BitConverter.ToUInt32(buffer, 0);
-        }
-    }
-}
-'@
-    }
-    $Tag = [ReparsePointHelper]::GetTag($Entry.FullName)
-    if ($null -eq $Tag) {
-        return $false
-    }
-    $NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
-    if (($Tag -band $NameSurrogateBit) -ne 0) {
-        return $false
-    }
-    $TagMask = [Convert]::ToUInt32("FFFF0FFF", 16)
-    $CloudBase = [Convert]::ToUInt32("9000001A", 16)
-    return ($Tag -band $TagMask) -eq $CloudBase
-=======
     # Read the reparse tag via GetFileInformationByHandleEx so that no
     # administrator privilege is required. Allow only Microsoft cloud-filter
     # placeholder tags (family 0x9000001A): they do not set the name-surrogate
@@ -230,7 +157,6 @@ public static class ReparsePointHelper {
         return $false
     }
     return ($Tag -band $Script:CloudTagMask) -eq $Script:CloudTagBase
->>>>>>> origin/main
 }
 
 function Test-UnsafeReparsePoint {
