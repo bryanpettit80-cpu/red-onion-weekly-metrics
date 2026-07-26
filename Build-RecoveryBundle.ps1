@@ -94,8 +94,7 @@ function Test-SafeCloudReparsePoint {
     $Principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     $IsElevated = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $IsElevated) {
-        throw "fsutil reparsepoint query requires an elevated (Administrator) shell. " +
-              "Re-run Build-RecoveryBundle.ps1 from an elevated prompt to validate reparse points."
+        throw "fsutil reparsepoint query requires an elevated (Administrator) shell. Re-run Build-RecoveryBundle.ps1 from an elevated prompt to validate reparse points."
     }
     $FsutilStderr = $null
     $Query = @(& fsutil reparsepoint query $Entry.FullName 2>&1 | ForEach-Object {
@@ -106,8 +105,8 @@ function Test-SafeCloudReparsePoint {
         }
     })
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("fsutil reparsepoint query failed for '$($Entry.FullName)'" +
-            $(if ($FsutilStderr) { ": $FsutilStderr" } else { "" }))
+        $WarningDetail = if ($FsutilStderr) { ": $FsutilStderr" } else { "" }
+        Write-Warning "fsutil reparsepoint query failed for '$($Entry.FullName)'$WarningDetail"
         return $false
     }
     $TagLine = $Query | Where-Object { $_ -match "Reparse Tag Value" } |
