@@ -91,36 +91,66 @@ function Test-SafeCloudReparsePoint {
         return $false
     }
 
-    $Principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    $IsElevated = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $IsElevated) {
-        throw "fsutil reparsepoint query requires an elevated (Administrator) shell. Re-run Build-RecoveryBundle.ps1 from an elevated prompt to validate reparse points."
-    }
-    $FsutilStderr = $null
-    $Query = @(& fsutil reparsepoint query $Entry.FullName 2>&1 | ForEach-Object {
-        if ($_ -is [System.Management.Automation.ErrorRecord]) {
-            $FsutilStderr = $_.ToString()
-        } else {
-            $_
+    # Read the reparse tag via DeviceIoControl (GENERIC_READ, no elevation required).
+    if (-not ("ReparsePointHelper" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class ReparsePointHelper {
+    private const uint GenericRead          = 0x80000000u; // GENERIC_READ
+    private const uint FileShareAll         = 0x00000007u; // FILE_SHARE_READ|WRITE|DELETE
+    private const uint OpenExisting         = 3u;          // OPEN_EXISTING
+    private const uint FileFlagBackupSem    = 0x02000000u; // FILE_FLAG_BACKUP_SEMANTICS
+    private const uint FileFlagOpenReparse  = 0x00200000u; // FILE_FLAG_OPEN_REPARSE_POINT
+    private const uint FsctlGetReparsePoint = 0x000900A8u; // FSCTL_GET_REPARSE_POINT
+    private const uint MaxReparseBuffer     = 16384u;      // MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+    private const uint ReparseTagSize       = 4u;          // sizeof(DWORD) reparse tag field
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle hDevice, uint dwIoControlCode,
+        IntPtr lpInBuffer, uint nInBufferSize,
+        byte[] lpOutBuffer, uint nOutBufferSize,
+        out uint lpBytesReturned, IntPtr lpOverlapped);
+
+    public static uint? GetTag(string path) {
+        using (SafeFileHandle handle = CreateFile(
+                path, GenericRead, FileShareAll,
+                IntPtr.Zero, OpenExisting,
+                FileFlagBackupSem | FileFlagOpenReparse,
+                IntPtr.Zero)) {
+            if (handle.IsInvalid) return null;
+            byte[] buffer = new byte[MaxReparseBuffer];
+            uint bytesReturned;
+            if (!DeviceIoControl(handle, FsctlGetReparsePoint,
+                    IntPtr.Zero, 0u, buffer, (uint)buffer.Length,
+                    out bytesReturned, IntPtr.Zero)) return null;
+            if (bytesReturned < ReparseTagSize) return null;
+            return BitConverter.ToUInt32(buffer, 0);
         }
-    })
-    if ($LASTEXITCODE -ne 0) {
-        $WarningDetail = if ($FsutilStderr) { ": $FsutilStderr" } else { "" }
-        Write-Warning "fsutil reparsepoint query failed for '$($Entry.FullName)'$WarningDetail"
+    }
+}
+'@
+    }
+    $Tag = [ReparsePointHelper]::GetTag($Entry.FullName)
+    if ($null -eq $Tag) {
         return $false
     }
-    $TagLine = $Query | Where-Object { $_ -match "Reparse Tag Value" } |
-        Select-Object -First 1
-    $TagMatch = [regex]::Match([string]$TagLine, "0x([0-9A-Fa-f]+)")
-    if (-not $TagLine -or -not $TagMatch.Success) {
-        return $false
-    }
-    $Tag = [Convert]::ToUInt32($TagMatch.Groups[1].Value, 16)
-    $NameSurrogateBit = [uint32]0x20000000
+    $NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
     if (($Tag -band $NameSurrogateBit) -ne 0) {
         return $false
     }
-    return ($Tag -band [uint32]0xFFFF0FFF) -eq [uint32]0x9000001A
+    $TagMask = [Convert]::ToUInt32("FFFF0FFF", 16)
+    $CloudBase = [Convert]::ToUInt32("9000001A", 16)
+    return ($Tag -band $TagMask) -eq $CloudBase
 }
 
 function Test-UnsafeReparsePoint {
