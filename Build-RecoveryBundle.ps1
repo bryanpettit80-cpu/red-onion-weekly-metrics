@@ -115,7 +115,7 @@ if (-not ([System.Management.Automation.PSTypeName]'NativeReparsePoint').Type) {
 # have this bit set; any entry that does is treated as unsafe.
 $Script:NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
 # Microsoft cloud-filter placeholder tag family (IO_REPARSE_TAG_CLOUD et al.).
-# The bottom 12 bits encode a provider sub-type; the top nibble and bits 12-27
+# Bits 12-15 encode a provider sub-type; the upper 16 bits and bottom 12 bits
 # are fixed. Dropbox, OneDrive, and other Windows cloud-filter providers all
 # share this family base with varying sub-type nibbles (0x9000001A..0x9000F01A).
 $Script:CloudTagBase = [Convert]::ToUInt32("9000001A", 16)
