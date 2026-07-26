@@ -3,9 +3,11 @@
 ## Identity And Status
 
 - **System:** Red Onion Weekly Metrics
-- **Release contract:** `v0.4.0` (methodology changed from `v0.3.2`);
-  publication requires protected backfill migration, final replay readback,
-  and business-owner approval below
+- **Release contract:** `v0.4.1` (recovery hardening; people-review
+  methodology remains `2026.07-v3`)
+- **Operational status:** protected backfill migration, exact post-migration
+  replay, and managed local publication are complete; no separate
+  business-owner approval record has been verified
 - **Methodology:** `2026.07-v3`
 - **System type:** deterministic, rule-based observational coaching signal
 - **Owners:** Red Onion business owner and designated technical maintainer
@@ -280,10 +282,11 @@ no minimum prompt quota. Automated regressions separately prove that
 context-only metrics cannot change a person action.
 
 Those results meet the observable numerical acceptance limits for the
-candidate. Publication remains blocked until the 24 validated backfill files
-are migrated through the protected history transaction, the exact post-
-migration replay agrees with these aggregate results, and the business owner
-approves the release.
+candidate. The 24 validated backfill files were migrated through the protected
+history transaction, and the exact post-migration replay matched these
+aggregate results before managed workbooks were published. No separate
+business-owner approval record has been verified; operational publication must
+not be represented as confirmed business-owner approval.
 
 These are operational stability and alert-quality tests, not proof of
 statistical, causal, or demographic fairness. No minimum prompt quota is
