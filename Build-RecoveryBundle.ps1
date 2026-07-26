@@ -64,7 +64,8 @@ function Get-TextSha256 {
     }
 }
 
-Add-Type -TypeDefinition @"
+if (-not ([System.Management.Automation.PSTypeName]"ReparseTag").Type) {
+    Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
@@ -123,6 +124,7 @@ public static class ReparseTag {
     }
 }
 "@
+}
 
 function Test-SafeCloudReparsePoint {
     param([Parameter(Mandatory = $true)]$Entry)
