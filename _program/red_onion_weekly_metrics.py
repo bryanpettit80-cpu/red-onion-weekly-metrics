@@ -2072,19 +2072,29 @@ def build_history_migration_plan(
     # input so an unarchived staging file cannot influence rebuilt outputs.
     canonical_resolution = resolve_report_duplicates(canonical_records_by_path)
     effective_records_by_path = dict(resolution.records_by_path)
+    effective_paths_by_date = {
+        report_date_for_records(path, records): path
+        for path, records in effective_records_by_path.items()
+    }
     for canonical_path, canonical_records in canonical_resolution.records_by_path.items():
         canonical_date = report_date_for_records(canonical_path, canonical_records)
-        effective_records_by_path = {
-            path: records
-            for path, records in effective_records_by_path.items()
-            if report_date_for_records(path, records) != canonical_date
-        }
+        effective_path = effective_paths_by_date[canonical_date]
+        effective_records_by_path.pop(effective_path)
         effective_records_by_path[canonical_path] = canonical_records
+        effective_paths_by_date[canonical_date] = canonical_path
 
     duplicate_paths = tuple(
-        path
-        for path in combined_records_by_path
-        if path not in effective_records_by_path
+        sorted(
+            (
+                path
+                for path in combined_records_by_path
+                if path not in effective_records_by_path
+            ),
+            key=lambda path: (
+                report_date_for_records(path, combined_records_by_path[path]),
+                str(path).casefold(),
+            ),
+        )
     )
 
     canonical_dates = {

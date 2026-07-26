@@ -320,21 +320,32 @@ def test_migration_existing_date_keeps_canonical_report_as_effective_input(
 ) -> None:
     source_dir = tmp_path / "migration-staging"
     archive_root = tmp_path / "archive"
-    canonical_path = (
+    canonical_dir = (
         archive_root
         / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
         / "week-ending-2026-07-12"
-        / "Daily Report canonical.xlsx"
     )
-    migration_path = source_dir / "Daily Report richer.xlsx"
-    canonical_path.parent.mkdir(parents=True)
+    earlier_canonical_path = canonical_dir / "Daily Report z-canonical-earlier.xlsx"
+    later_canonical_path = canonical_dir / "Daily Report a-canonical-later.xlsx"
+    earlier_migration_path = source_dir / "Daily Report z-richer-earlier.xlsx"
+    later_migration_path = source_dir / "Daily Report a-richer-later.xlsx"
+    canonical_dir.mkdir(parents=True)
     source_dir.mkdir()
-    canonical_path.write_text("canonical", encoding="utf-8")
-    migration_path.write_text("richer staging input", encoding="utf-8")
+    for path in (earlier_canonical_path, later_canonical_path):
+        path.write_text("canonical", encoding="utf-8")
+    for path in (earlier_migration_path, later_migration_path):
+        path.write_text("richer staging input", encoding="utf-8")
+
+    report_dates = {
+        earlier_canonical_path.name: date(2026, 7, 10),
+        earlier_migration_path.name: date(2026, 7, 10),
+        later_canonical_path.name: date(2026, 7, 11),
+        later_migration_path.name: date(2026, 7, 11),
+    }
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        record = make_record(path, date(2026, 7, 11))
-        if path.name == migration_path.name:
+        record = make_record(path, report_dates[path.name])
+        if path in {earlier_migration_path, later_migration_path}:
             record = replace(
                 record,
                 check_count=7.0,
@@ -349,9 +360,76 @@ def test_migration_existing_date_keeps_canonical_report_as_effective_input(
     )
 
     assert plan.copy_pairs == ()
-    assert tuple(plan.effective_records_by_path) == (canonical_path,)
-    assert plan.effective_records_by_path[canonical_path][0].check_count_available is False
-    assert plan.duplicate_paths == (migration_path,)
+    assert tuple(plan.effective_records_by_path) == (
+        earlier_canonical_path,
+        later_canonical_path,
+    )
+    assert all(
+        records[0].check_count_available is False
+        for records in plan.effective_records_by_path.values()
+    )
+    assert plan.duplicate_paths == (
+        earlier_migration_path,
+        later_migration_path,
+    )
+
+
+def test_migration_canonical_override_date_lookups_scale_linearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_dir = tmp_path / "migration-staging"
+    archive_root = tmp_path / "archive"
+    source_dir.mkdir()
+    report_count = 20
+    report_dates: dict[str, date] = {}
+
+    for index in range(report_count):
+        report_day = date(2026, 1, index + 1)
+        _, week_end = metrics.week_period_for(report_day)
+        canonical_path = (
+            archive_root
+            / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
+            / f"week-ending-{week_end.isoformat()}"
+            / f"Daily Report canonical {index:02d}.xlsx"
+        )
+        migration_path = source_dir / f"Daily Report staged {index:02d}.xlsx"
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
+        canonical_path.write_text("canonical", encoding="utf-8")
+        migration_path.write_text("richer staging input", encoding="utf-8")
+        report_dates[canonical_path.name] = report_day
+        report_dates[migration_path.name] = report_day
+
+    def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
+        record = make_record(path, report_dates[path.name])
+        if "staged" in path.name:
+            record = replace(
+                record,
+                check_count=7.0,
+                check_count_available=True,
+            )
+        return [record]
+
+    monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)
+    original_report_date_for_records = metrics.report_date_for_records
+    date_lookup_count = 0
+
+    def counted_report_date_for_records(
+        path: Path, records: list[metrics.MetricRecord]
+    ) -> date:
+        nonlocal date_lookup_count
+        date_lookup_count += 1
+        return original_report_date_for_records(path, records)
+
+    monkeypatch.setattr(
+        metrics, "report_date_for_records", counted_report_date_for_records
+    )
+
+    plan = metrics.build_history_migration_plan(
+        [source_dir], archive_root, metrics.DEFAULT_CONFIG
+    )
+
+    assert len(plan.effective_records_by_path) == report_count
+    assert date_lookup_count < report_count**2
 
 
 def test_migration_conflict_blocks_before_copying(
