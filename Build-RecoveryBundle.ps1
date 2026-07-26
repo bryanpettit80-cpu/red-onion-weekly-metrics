@@ -91,8 +91,7 @@ function Test-SafeCloudReparsePoint {
         return $false
     }
 
-    # Read the reparse tag via DeviceIoControl (GENERIC_READ, no elevation
-    # required) so the check works for any user and any Windows locale.
+    # Read the reparse tag via DeviceIoControl (GENERIC_READ, no elevation required).
     if (-not ("ReparsePointHelper" -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -100,12 +99,13 @@ using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
 public static class ReparsePointHelper {
-    private const uint GenericRead = 0x80000000u;
-    private const uint FileShareAll = 0x00000007u;
-    private const uint OpenExisting = 3u;
-    private const uint FileFlagBackupSemantics = 0x02000000u;
-    private const uint FileFlagOpenReparsePoint = 0x00200000u;
-    private const uint FsctlGetReparsePoint = 0x000900A8u;
+    private const uint GenericRead          = 0x80000000u; // GENERIC_READ
+    private const uint FileShareAll         = 0x00000007u; // FILE_SHARE_READ|WRITE|DELETE
+    private const uint OpenExisting         = 3u;          // OPEN_EXISTING
+    private const uint FileFlagBackupSem    = 0x02000000u; // FILE_FLAG_BACKUP_SEMANTICS
+    private const uint FileFlagOpenReparse  = 0x00200000u; // FILE_FLAG_OPEN_REPARSE_POINT
+    private const uint FsctlGetReparsePoint = 0x000900A8u; // FSCTL_GET_REPARSE_POINT
+    private const int  MaxReparseBuffer     = 16384;       // MAXIMUM_REPARSE_DATA_BUFFER_SIZE
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFile(
@@ -124,10 +124,10 @@ public static class ReparsePointHelper {
         using (SafeFileHandle handle = CreateFile(
                 path, GenericRead, FileShareAll,
                 IntPtr.Zero, OpenExisting,
-                FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                FileFlagBackupSem | FileFlagOpenReparse,
                 IntPtr.Zero)) {
             if (handle.IsInvalid) return null;
-            byte[] buffer = new byte[16384];
+            byte[] buffer = new byte[MaxReparseBuffer];
             uint bytesReturned;
             if (!DeviceIoControl(handle, FsctlGetReparsePoint,
                     IntPtr.Zero, 0u, buffer, (uint)buffer.Length,
