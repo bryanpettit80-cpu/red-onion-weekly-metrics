@@ -91,23 +91,27 @@ function Test-SafeCloudReparsePoint {
         return $false
     }
 
-    $Query = @(& fsutil reparsepoint query $Entry.FullName 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    try {
+        $Query = @(& fsutil reparsepoint query $Entry.FullName 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+        $TagLine = $Query | Where-Object { $_ -match "Reparse Tag Value" } |
+            Select-Object -First 1
+        if (-not $TagLine -or $TagLine -notmatch "0x([0-9A-Fa-f]+)") {
+            return $false
+        }
+        $Tag = [Convert]::ToUInt32($Matches[1], 16)
+        $NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
+        if (($Tag -band $NameSurrogateBit) -ne 0) {
+            return $false
+        }
+        $TagMask = [Convert]::ToUInt32("FFFF0FFF", 16)
+        $CloudBase = [Convert]::ToUInt32("9000001A", 16)
+        return ($Tag -band $TagMask) -eq $CloudBase
+    } catch {
         return $false
     }
-    $TagLine = $Query | Where-Object { $_ -match "Reparse Tag Value" } |
-        Select-Object -First 1
-    if (-not $TagLine -or $TagLine -notmatch "0x([0-9A-Fa-f]+)") {
-        return $false
-    }
-    $Tag = [Convert]::ToUInt32($Matches[1], 16)
-    $NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
-    if (($Tag -band $NameSurrogateBit) -ne 0) {
-        return $false
-    }
-    $TagMask = [Convert]::ToUInt32("FFFF0FFF", 16)
-    $CloudBase = [Convert]::ToUInt32("9000001A", 16)
-    return ($Tag -band $TagMask) -eq $CloudBase
 }
 
 function Test-UnsafeReparsePoint {
