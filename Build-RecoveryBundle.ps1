@@ -98,7 +98,7 @@ public static class ReparseTag {
     private const uint OPEN_EXISTING           = 3;
     private const uint FILE_FLAG_BACKUP_SEMANTICS  = 0x02000000;
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
-    private const int  FileAttributeTagInfoClass    = 0x0A;
+    private const int  FileAttributeTagInfoClass    = 0x09;
 
     public static uint? GetTag(string path) {
         using (SafeFileHandle handle = CreateFile(
