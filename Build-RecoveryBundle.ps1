@@ -91,16 +91,32 @@ function Test-SafeCloudReparsePoint {
         return $false
     }
 
-    $Query = @(& fsutil reparsepoint query $Entry.FullName 2>$null)
+    $Principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    $IsElevated = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $IsElevated) {
+        throw "fsutil reparsepoint query requires an elevated (Administrator) shell. " +
+              "Re-run Build-RecoveryBundle.ps1 from an elevated prompt to validate reparse points."
+    }
+    $FsutilStderr = $null
+    $Query = @(& fsutil reparsepoint query $Entry.FullName 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $FsutilStderr = $_.ToString()
+        } else {
+            $_
+        }
+    })
     if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("fsutil reparsepoint query failed for '$($Entry.FullName)'" +
+            $(if ($FsutilStderr) { ": $FsutilStderr" } else { "" }))
         return $false
     }
     $TagLine = $Query | Where-Object { $_ -match "Reparse Tag Value" } |
         Select-Object -First 1
-    if (-not $TagLine -or $TagLine -notmatch "0x([0-9A-Fa-f]+)") {
+    $TagMatch = [regex]::Match([string]$TagLine, "0x([0-9A-Fa-f]+)")
+    if (-not $TagLine -or -not $TagMatch.Success) {
         return $false
     }
-    $Tag = [Convert]::ToUInt32($Matches[1], 16)
+    $Tag = [Convert]::ToUInt32($TagMatch.Groups[1].Value, 16)
     $NameSurrogateBit = [uint32]0x20000000
     if (($Tag -band $NameSurrogateBit) -ne 0) {
         return $false
