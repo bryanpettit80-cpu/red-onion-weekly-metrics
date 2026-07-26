@@ -91,21 +91,65 @@ function Test-SafeCloudReparsePoint {
         return $false
     }
 
-    $Query = @(& fsutil reparsepoint query $Entry.FullName 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    # Read the reparse tag via DeviceIoControl (GENERIC_READ, no elevation
+    # required) so the check works for any user and any Windows locale.
+    if (-not ("ReparsePointHelper" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class ReparsePointHelper {
+    private const uint GenericRead = 0x80000000u;
+    private const uint FileShareAll = 0x00000007u;
+    private const uint OpenExisting = 3u;
+    private const uint FileFlagBackupSemantics = 0x02000000u;
+    private const uint FileFlagOpenReparsePoint = 0x00200000u;
+    private const uint FsctlGetReparsePoint = 0x000900A8u;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle hDevice, uint dwIoControlCode,
+        IntPtr lpInBuffer, uint nInBufferSize,
+        byte[] lpOutBuffer, uint nOutBufferSize,
+        out uint lpBytesReturned, IntPtr lpOverlapped);
+
+    public static uint? GetTag(string path) {
+        using (SafeFileHandle handle = CreateFile(
+                path, GenericRead, FileShareAll,
+                IntPtr.Zero, OpenExisting,
+                FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                IntPtr.Zero)) {
+            if (handle.IsInvalid) return null;
+            byte[] buffer = new byte[16384];
+            uint bytesReturned;
+            if (!DeviceIoControl(handle, FsctlGetReparsePoint,
+                    IntPtr.Zero, 0u, buffer, (uint)buffer.Length,
+                    out bytesReturned, IntPtr.Zero)) return null;
+            if (bytesReturned < 4u) return null;
+            return BitConverter.ToUInt32(buffer, 0);
+        }
+    }
+}
+'@
+    }
+    $Tag = [ReparsePointHelper]::GetTag($Entry.FullName)
+    if ($null -eq $Tag) {
         return $false
     }
-    $TagLine = $Query | Where-Object { $_ -match "Reparse Tag Value" } |
-        Select-Object -First 1
-    if (-not $TagLine -or $TagLine -notmatch "0x([0-9A-Fa-f]+)") {
-        return $false
-    }
-    $Tag = [Convert]::ToUInt32($Matches[1], 16)
-    $NameSurrogateBit = [uint32]0x20000000
+    $NameSurrogateBit = [Convert]::ToUInt32("20000000", 16)
     if (($Tag -band $NameSurrogateBit) -ne 0) {
         return $false
     }
-    return ($Tag -band [uint32]0xFFFF0FFF) -eq [uint32]0x9000001A
+    $TagMask = [Convert]::ToUInt32("FFFF0FFF", 16)
+    $CloudBase = [Convert]::ToUInt32("9000001A", 16)
+    return ($Tag -band $TagMask) -eq $CloudBase
 }
 
 function Test-UnsafeReparsePoint {

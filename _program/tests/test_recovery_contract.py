@@ -35,7 +35,8 @@ def test_recovery_bundle_defaults_to_released_source_only() -> None:
     assert "Test-SafeCloudReparsePoint" in script
     assert '$Entry.PSObject.Properties["LinkType"]' in script
     assert '$Entry.PSObject.Properties["Target"]' in script
-    assert "Reparse Tag Value" in script
+    assert "ReparsePointHelper" in script
+    assert "DeviceIoControl" in script
     assert "0x9000001A" in script
     assert "NameSurrogateBit" in script
 
