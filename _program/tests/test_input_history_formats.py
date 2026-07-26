@@ -315,6 +315,45 @@ def test_copy_only_migration_is_semantic_and_idempotent(
     assert len(metrics.archived_daily_report_paths(archive_root)) == 1
 
 
+def test_migration_existing_date_keeps_canonical_report_as_effective_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_dir = tmp_path / "migration-staging"
+    archive_root = tmp_path / "archive"
+    canonical_path = (
+        archive_root
+        / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
+        / "week-ending-2026-07-12"
+        / "Daily Report canonical.xlsx"
+    )
+    migration_path = source_dir / "Daily Report richer.xlsx"
+    canonical_path.parent.mkdir(parents=True)
+    source_dir.mkdir()
+    canonical_path.write_text("canonical", encoding="utf-8")
+    migration_path.write_text("richer staging input", encoding="utf-8")
+
+    def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
+        record = make_record(path, date(2026, 7, 11))
+        if path.name == migration_path.name:
+            record = replace(
+                record,
+                check_count=7.0,
+                check_count_available=True,
+            )
+        return [record]
+
+    monkeypatch.setattr(metrics, "parse_daily_report", fake_parse)
+
+    plan = metrics.build_history_migration_plan(
+        [source_dir], archive_root, metrics.DEFAULT_CONFIG
+    )
+
+    assert plan.copy_pairs == ()
+    assert tuple(plan.effective_records_by_path) == (canonical_path,)
+    assert plan.effective_records_by_path[canonical_path][0].check_count_available is False
+    assert plan.duplicate_paths == (migration_path,)
+
+
 def test_migration_conflict_blocks_before_copying(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
