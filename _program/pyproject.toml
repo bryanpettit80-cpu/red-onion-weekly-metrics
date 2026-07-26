@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "red-onion-weekly-metrics"
-version = "0.2.1"
-description = "Red Onion weekly Toast metrics workbook builder"
+version = "0.4.0"
+description = "Red Onion weekly metrics workbook builder"
 requires-python = ">=3.10"
 dependencies = [
     "pandas==2.3.3",
@@ -21,7 +21,9 @@ dev = [
 [tool.setuptools]
 py-modules = [
     "red_onion_config",
+    "red_onion_fairness",
     "red_onion_integrity",
+    "red_onion_model_validation",
     "red_onion_runtime",
     "red_onion_weekly_metrics",
 ]

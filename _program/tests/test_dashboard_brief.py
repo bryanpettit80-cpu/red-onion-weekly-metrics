@@ -127,9 +127,10 @@ def test_dashboard_is_one_screen_and_deduplicates_actions() -> None:
         for value in row
         if isinstance(value, str)
     }
-    assert {"Reports Received", "Traffic vs Benchmark", "High-Priority Actions"}.issubset(values)
-    assert {"TOP THREE ACTIONS", "STORE SNAPSHOT", "RECOGNITION / REPLICATE"}.issubset(values)
-    assert ws["A7"].value == "6 of 6"
+    assert {"Sales vs Benchmark", "Guests vs Benchmark", "Review Items"}.issubset(values)
+    assert {"TOP THREE REVIEW ITEMS", "STORE SNAPSHOT", "RECOGNITION REVIEW"}.issubset(values)
+    assert ws["A7"].value == "+9.1%"
+    assert ws["E7"].value == "+4.2%"
     assert ws["I7"].value == 3
     assert ws["C13"].value == "Alex | RC Richmond"
     assert ws["C14"].value == "Blair | RC Richmond"
@@ -141,6 +142,11 @@ def test_dashboard_is_one_screen_and_deduplicates_actions() -> None:
     assert "$A$1:$L$24" in str(ws.print_area)
     assert ws.freeze_panes == "A5"
     assert ws.sheet_view.zoomScale == 90
+    assert ws.row_dimensions[9].height == 32
+    for row in (19, 20):
+        assert ws.cell(row=row, column=6).alignment.horizontal == "center"
+        assert ws.cell(row=row, column=7).alignment.horizontal == "center"
+        assert ws.cell(row=row, column=6).border.right.style == "thin"
 
 
 def test_incomplete_week_pauses_comparisons_actions_and_recognition() -> None:
@@ -152,7 +158,7 @@ def test_incomplete_week_pauses_comparisons_actions_and_recognition() -> None:
     )
 
     ws = wb["Dashboard"]
-    assert ws["A7"].value == "5 of 6"
+    assert ws["A7"].value == "PAUSED"
     assert ws["E7"].value == "PAUSED"
     assert ws["I7"].value == "PAUSED"
     assert "Jul 11" in ws["A4"].value
@@ -185,7 +191,7 @@ def test_missing_configured_location_pauses_dashboard_without_stale_metrics() ->
     )
 
     dashboard = wb["Dashboard"]
-    assert dashboard["A7"].value == "6 of 6"
+    assert dashboard["A7"].value == "PAUSED"
     assert dashboard["E7"].value == "PAUSED"
     assert dashboard["I7"].value == "PAUSED"
     assert "PRELIMINARY" in dashboard["A4"].value
@@ -203,7 +209,7 @@ def test_missing_configured_location_pauses_dashboard_without_stale_metrics() ->
     data_quality = wb["Data Quality"]
     assert "incomplete" in data_quality["A3"].value.lower()
     assert data_quality["B7"].value == "RC Virginia Beach"
-    assert data_quality["E7"].value == "Missing"
+    assert data_quality["G7"].value == "Missing"
 
 
 def test_scorecard_charts_use_latest_eight_complete_weeks() -> None:

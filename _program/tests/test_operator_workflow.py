@@ -4,10 +4,55 @@ from argparse import Namespace
 from datetime import date, timedelta
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 import pytest
 
 import red_onion_weekly_metrics as metrics
+
+
+@pytest.mark.parametrize(
+    ("hidden_columns", "expected_bounds"),
+    [
+        (frozenset(), (1, 12)),
+        (frozenset({1, 2}), (3, 14)),
+        (frozenset({12, 13}), (1, 14)),
+    ],
+)
+def test_management_menu_preserves_column_widths_and_visibility(
+    hidden_columns: frozenset[int],
+    expected_bounds: tuple[int, int],
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data Quality"
+    for index, width in enumerate((11, 96, 13, 22, 48, 69, 12, 14, 18, 50, 9, 10, 7, 16), start=1):
+        dimension = worksheet.column_dimensions[
+            metrics.get_column_letter(index)
+        ]
+        dimension.width = width
+        dimension.hidden = index in hidden_columns
+    before = {
+        column: (
+            worksheet.column_dimensions[column].width,
+            worksheet.column_dimensions[column].hidden,
+        )
+        for column in (
+            metrics.get_column_letter(index)
+            for index in range(1, 15)
+        )
+    }
+
+    metrics.add_management_navigation(worksheet)
+
+    after = {
+        column: (
+            worksheet.column_dimensions[column].width,
+            worksheet.column_dimensions[column].hidden,
+        )
+        for column in before
+    }
+    assert after == before
+    assert metrics.management_menu_bounds(worksheet) == expected_bounds
 
 
 def make_record(
@@ -69,6 +114,10 @@ def weekly_row(
         "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
         "rate_of_sale_by_guest_count": rate,
         "average_ticket_time_seconds": ticket_seconds,
+        "rate_available": True,
+        "ticket_time_available": True,
+        "check_count": guest_count,
+        "check_count_available": True,
         "active_days": active_days,
         "source_days": active_days,
         "source_files": "synthetic.xls",
@@ -240,8 +289,15 @@ def test_successful_run_archives_active_files_and_keeps_master_history(
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
         if path.name == archived_source.name:
-            return [make_record(date(2026, 6, 7), "RC Virginia Beach")]
-        return [make_record(date(2026, 6, 14), "RC Richmond")]
+            day = date(2026, 6, 7)
+            location = "RC Virginia Beach"
+        else:
+            day = date(2026, 6, 14)
+            location = "RC Richmond"
+        return [
+            make_record(day, location, is_location_total=True),
+            make_record(day, location),
+        ]
 
     def fake_public(location, records, output_path, config, start, end):
         output_file = output_path / f"public-{location}.xlsx"
@@ -286,7 +342,11 @@ def test_failed_run_leaves_active_files_in_place(
     active_source.write_text("active", encoding="utf-8")
 
     def fake_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
-        return [make_record(date(2026, 6, 14))]
+        day = date(2026, 6, 14)
+        return [
+            make_record(day, is_location_total=True),
+            make_record(day),
+        ]
 
     def fake_public(location, records, output_path, config, start, end):
         output_path.mkdir(parents=True, exist_ok=True)
@@ -380,7 +440,7 @@ def test_launchers_route_to_named_operator_workspace() -> None:
     assert "exit $ReportExitCode" in powershell_runner
 
 
-def test_star_scoring_uses_all_metric_families_and_rank_movement(tmp_path: Path) -> None:
+def test_star_scoring_uses_only_person_action_metrics(tmp_path: Path) -> None:
     config = metrics.load_config(tmp_path / "missing-config.json")
     prior_week = date(2026, 6, 7)
     latest_week = date(2026, 6, 14)
@@ -432,16 +492,16 @@ def test_star_scoring_uses_all_metric_families_and_rank_movement(tmp_path: Path)
 
     rising = by_name["Alex Rising"]
     assert rising["category"] == "Rising Star"
-    assert rising["composite_score"] == 9
+    assert rising["composite_score"] == 4
     assert rising["average_rank_movement"] == 4
-    assert "Check avg +$8.00" in rising["why"]
+    assert "Sales / Guest +$8.00" in rising["why"]
     assert "Wine +4.0 pts" in rising["why"]
-    assert "Rate -0.50" in rising["why"]
-    assert "Ticket -7.0 min" in rising["why"]
+    assert "Rate" not in rising["why"]
+    assert "Ticket" not in rising["why"]
 
     falling = by_name["Jordan Falling"]
     assert falling["category"] == "Falling Star"
-    assert falling["composite_score"] == -10
+    assert falling["composite_score"] == -4
     assert falling["average_rank_movement"] == -5
 
 
@@ -487,36 +547,90 @@ def test_star_rows_exclude_low_volume_admin_takeout_and_placeholders(tmp_path: P
     assert [row["display_name"] for row in stars] == ["Real Person"]
 
 
-def test_management_scoring_uses_full_baseline_level_and_capped_rank(tmp_path: Path) -> None:
+def test_management_scoring_uses_peer_reference_and_ignores_rank(tmp_path: Path) -> None:
     config = metrics.load_config(tmp_path / "missing-config.json")
-    weeks = [date(2026, 6, 7), date(2026, 6, 14), date(2026, 6, 21)]
-    weekly_servers = [
-        weekly_row(weeks[0], display_name="Alex Rising", gross_sales=1000, guest_count=50, wine_sales=100, rate=0.20, ticket_seconds=80 * 60, active_days=6),
-        weekly_row(weeks[1], display_name="Alex Rising", gross_sales=1000, guest_count=50, wine_sales=100, rate=0.20, ticket_seconds=80 * 60, active_days=6),
-        weekly_row(weeks[2], display_name="Alex Rising", gross_sales=1500, guest_count=50, wine_sales=180, rate=0.18, ticket_seconds=70 * 60, active_days=6),
-    ]
-    weekly_locations = [dict(row) for row in weekly_servers]
+    for family in ("management_score_thresholds", "management_peer_score_thresholds"):
+        config[family] = {
+            "check_average": {"neutral": 2.5, "strong": 5.0, "lower_is_better": False},
+            "wine_pct": {"neutral": 0.005, "strong": 0.01, "lower_is_better": False},
+            "rate_of_sale_by_guest_count": {"neutral": 0.005, "strong": 0.01, "lower_is_better": True},
+            "average_ticket_time_seconds": {"neutral": 150.0, "strong": 300.0, "lower_is_better": True},
+        }
+    weeks = [date(2026, 5, 17) + timedelta(days=7 * index) for index in range(6)]
+    weekly_servers: list[dict] = []
+    weekly_locations: list[dict] = []
+    for index, week_end in enumerate(weeks):
+        improved = index >= 4
+        weekly_servers.append(
+            weekly_row(
+                week_end,
+                display_name="Alex Rising",
+                gross_sales=3500 if improved else 1000,
+                guest_count=100,
+                wine_sales=700 if improved else 10,
+                rate=0.10 if improved else 0.40,
+                ticket_seconds=50 * 60 if improved else 120 * 60,
+                active_days=6,
+            )
+        )
+        for peer_index in range(6):
+            weekly_servers.append(
+                weekly_row(
+                    week_end,
+                    display_name=f"Peer {peer_index}",
+                    gross_sales=2000,
+                    guest_count=100,
+                    wine_sales=160,
+                    rate=0.25,
+                    ticket_seconds=5000,
+                    active_days=6,
+                )
+            )
+        weekly_locations.append(
+            weekly_row(
+                week_end,
+                display_name="",
+                gross_sales=14000,
+                guest_count=700,
+                wine_sales=1120,
+                rate=0.25,
+                ticket_seconds=5000,
+                active_days=6,
+            )
+        )
     ranked = [
-        {**weekly_servers[0], "check_average_rank": 5, "wine_pct_rank": 5, "rate_rank": 5, "ticket_time_rank": 5},
-        {**weekly_servers[1], "check_average_rank": 5, "wine_pct_rank": 5, "rate_rank": 5, "ticket_time_rank": 5},
-        {**weekly_servers[2], "check_average_rank": 1, "wine_pct_rank": 1, "rate_rank": 1, "ticket_time_rank": 1},
+        {
+            **row,
+            "check_average_rank": 999,
+            "wine_pct_rank": 999,
+            "rate_rank": 999,
+            "ticket_time_rank": 999,
+        }
+        for row in weekly_servers
     ]
 
     rows = metrics.management_server_rows(
-        weekly_servers, weekly_locations, ranked, {}, config
+        weekly_servers,
+        weekly_locations,
+        ranked,
+        {"RC Richmond": {"check_average": -999999.0}},
+        config,
     )
 
-    assert len(rows) == 1
-    result = rows[0]
+    result = next(row for row in rows if row["display_name"] == "Alex Rising")
     assert result["prominent"] is True
-    assert result["momentum"] == "Rising"
-    assert result["performance_level"] == "Above Benchmark"
-    assert result["rank_modifier"] == 1
-    assert result["composite_score"] == 9
-    assert result["action"] == "Recognize & Replicate"
+    assert result["momentum"] == "Upward"
+    assert result["performance_level"] == "Above Peer Reference"
+    assert result["rank_modifier"] == 0
+    assert result["average_rank_movement"] is None
+    assert result["peer_cohort_size"] == 6
+    assert set(result["benchmark_sources"].values()) == {
+        "Same-store prior-four-week median"
+    }
+    assert result["action"] == "Context Review"
 
 
-def test_management_confidence_requires_both_thresholds_and_excludes_service_areas(
+def test_management_confidence_fails_closed_and_excludes_service_areas(
     tmp_path: Path,
 ) -> None:
     config = metrics.load_config(tmp_path / "missing-config.json")
@@ -552,7 +666,10 @@ def test_management_confidence_requires_both_thresholds_and_excludes_service_are
     assert "Patio" not in by_name
     assert by_name["Low Sample"]["prominent"] is False
     assert by_name["Low Sample"]["action"] == "Monitor"
-    assert by_name["Real Person"]["prominent"] is True
+    assert by_name["Low Sample"]["confidence"] == "Limited Volume"
+    assert by_name["Real Person"]["prominent"] is False
+    assert by_name["Real Person"]["performance_level"] == "Reference Unavailable"
+    assert by_name["Real Person"]["confidence"] == "Reference Unavailable"
 
 
 def test_management_baseline_excludes_short_weeks_and_target_takes_precedence(
@@ -600,7 +717,10 @@ def test_action_tracking_carries_manual_fields_and_moves_cleared_items_to_histor
     current[0]["Status"] = "In Progress"
     current[0]["Owner"] = "Pat Manager"
     current[0]["Due Date"] = date(2026, 6, 30)
-    current[0]["Manager Notes"] = "Review Friday"
+    current[0]["Context Notes"] = "Review Friday"
+    current[0]["Review Disposition"] = "Coaching Accepted"
+    current[0]["Reviewed By"] = "Pat Manager"
+    current[0]["Review Date"] = date(2026, 6, 23)
     next_signal = {**signal, "Last Seen": date(2026, 6, 28)}
 
     carried, history = metrics.merge_management_actions(
@@ -611,13 +731,61 @@ def test_action_tracking_carries_manual_fields_and_moves_cleared_items_to_histor
     assert carried[0]["Status"] == "In Progress"
     assert carried[0]["Owner"] == "Pat Manager"
     assert carried[0]["Due Date"] == date(2026, 6, 30)
-    assert carried[0]["Manager Notes"] == "Review Friday"
+    assert carried[0]["Context Notes"] == "Review Friday"
+    assert carried[0]["Review Disposition"] == "Coaching Accepted"
+    assert carried[0]["Reviewed By"] == "Pat Manager"
+    assert carried[0]["Review Date"] == date(2026, 6, 23)
     assert carried[0]["Weeks Open"] == 2
     cleared, history = metrics.merge_management_actions(
         [], {"active_actions": carried, "action_history": []}
     )
     assert cleared == []
     assert history[0]["Signal State"] == "Cleared"
+
+
+def test_new_evidence_resets_a_recurring_action_to_review_needed() -> None:
+    signal = {
+        "Entity Key": "server|richmond|server one|coaching",
+        "Evidence ID": "EVIDENCE-ONE",
+        "Priority": "Medium",
+        "Location": "RC Richmond",
+        "Person / Area": "Server One",
+        "Action": "Coaching Prompt",
+        "Signal": "Downward / Below Peer Reference",
+        "Why It Matters": "Watch: check average",
+        "Recommended Next Step": "Review comparable work context.",
+        "Peer Comparison": "Below Peer Reference",
+        "Recent Movement": "Downward",
+        "Evidence Status": "Stable",
+        "Last Seen": date(2026, 6, 21),
+    }
+    current, _ = metrics.merge_management_actions([signal], {})
+    current[0].update(
+        {
+            "Status": "In Progress",
+            "Owner": "Pat Manager",
+            "Review Disposition": "Coaching Accepted",
+            "Reviewed By": "Pat Manager",
+            "Review Date": date(2026, 6, 23),
+        }
+    )
+    changed_signal = {
+        **signal,
+        "Evidence ID": "EVIDENCE-TWO",
+        "Last Seen": date(2026, 6, 28),
+    }
+
+    carried, _ = metrics.merge_management_actions(
+        [changed_signal],
+        {"active_actions": current, "action_history": []},
+    )
+
+    assert carried[0]["Action ID"] == current[0]["Action ID"]
+    assert carried[0]["Status"] == "Review Needed"
+    assert carried[0]["Owner"] == "Pat Manager"
+    assert carried[0]["Review Disposition"] == "Pending Review"
+    assert carried[0]["Reviewed By"] == ""
+    assert carried[0]["Review Date"] is None
 
 
 def test_action_episode_id_uses_stable_sha256_identifier() -> None:
@@ -716,8 +884,11 @@ def test_all_stores_group_aggregation_and_trend_deltas() -> None:
     assert prior["guest_count"] == 75
     assert prior["check_average"] == 20
     assert prior["wine_pct"] == pytest.approx(0.1)
-    assert prior["rate_of_sale_by_guest_count"] == pytest.approx((2 * 50 + 4 * 25) / 75)
-    assert prior["average_ticket_time_seconds"] == pytest.approx((600 * 50 + 1200 * 25) / 75)
+    assert prior["rate_of_sale_by_guest_count"] == pytest.approx(
+        75 / (50 / 2 + 25 / 4)
+    )
+    assert prior["ticket_time_available"] is False
+    assert prior["average_ticket_time_seconds"] == 0
     assert prior["active_days"] == 1
 
     trend_rows = metrics.weekly_metric_trend_rows(group_rows, ("group",))
@@ -734,7 +905,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     for week_end, gross, wine, rate, ticket_seconds in (
         (date(2026, 6, 7), 1000, 100, 0.20, 80 * 60),
         (date(2026, 6, 14), 1100, 110, 0.20, 80 * 60),
-        (date(2026, 6, 21), 1600, 200, 0.18, 70 * 60),
+        (date(2026, 6, 21), 600, 20, 0.30, 95 * 60),
     ):
         for location in ("RC Richmond", "RC Virginia Beach"):
             records.extend(
@@ -767,8 +938,146 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["_Dashboard Chart Data"].sheet_state == "veryHidden"
     assert wb["Weekly Server Metrics"].sheet_state == "veryHidden"
     assert wb["Store Week Trends"].sheet_state == "veryHidden"
+    assert wb.active.title == "How to Use"
+    assert wb["How to Use"].sheet_state == "visible"
     assert wb["Dashboard"].sheet_state == "visible"
     assert wb["Action Board"].sheet_state == "visible"
+
+    guide = wb["How to Use"]
+    guide_values = {
+        value
+        for row in guide.iter_rows(values_only=True)
+        for value in row
+        if isinstance(value, str)
+    }
+    assert set(metrics.HOW_TO_USE_SECTION_HEADINGS).issubset(guide_values)
+    assert all(
+        cell.protection.locked is not False for cell in guide._cells.values()
+    )
+    assert not guide._charts
+    assert not guide._images
+    assert guide.freeze_panes == "A3"
+    assert guide.sheet_view.zoomScale == 85
+    assert guide.sheet_properties.tabColor.rgb[-6:] == "FFD966"
+    assert all(
+        guide.column_dimensions[metrics.get_column_letter(column)].width == 13
+        for column in range(1, 13)
+    )
+    assert guide.row_dimensions[1].height == 32
+    assert guide.row_dimensions[2].height == 24
+    assert guide.row_dimensions[3].height == 24
+    assert guide.row_dimensions[4].height == 54
+    assert guide.row_dimensions[30].height == 42
+    assert guide.row_dimensions[58].height == 24
+    assert guide.row_dimensions[59].height == 72
+    assert guide["A44"].value == metrics.HOW_TO_USE_SECTION_HEADINGS[6]
+    assert metrics.MANAGEMENT_METHODOLOGY_VERSION in "\n".join(guide_values)
+    for phrase in (
+        "never be the sole or determinative basis",
+        "Do not infer protected characteristics from names.",
+        "ExternalCheckRequired",
+        "Rate of Sale is opportunities divided by qualifying sales",
+        "Ticket Time is weighted only by complete Check Count coverage",
+    ):
+        assert phrase in "\n".join(guide_values)
+    for field in (
+        "D — Status",
+        "E — Owner",
+        "F — Due Date",
+        "N — Context Notes",
+        "U — Review Disposition",
+        "V — Reviewed By",
+        "W — Review Date",
+    ):
+        assert field in guide_values
+    for choice in (*metrics.ACTION_STATUS_CHOICES, *metrics.REVIEW_DISPOSITION_CHOICES):
+        assert choice in "\n".join(guide_values)
+    assert guide["A45"].value == "Sheet - click to open"
+    assert [
+        guide.cell(row=row, column=1).value for row in range(46, 58)
+    ] == list(metrics.VISIBLE_MANAGEMENT_SHEETS)
+    assert [
+        guide.cell(row=row, column=1).hyperlink.target
+        for row in range(46, 58)
+    ] == [
+        f"#'{sheet_name}'!A1"
+        for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS
+    ]
+    assert all(
+        guide.cell(row=row, column=1).font.underline == "single"
+        and guide.cell(row=row, column=1).protection.locked is True
+        for row in range(46, 58)
+    )
+
+    for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
+        worksheet = wb[sheet_name]
+        start_column, end_column = metrics.management_menu_bounds(worksheet)
+        expected_merge = (
+            f"{metrics.get_column_letter(start_column)}2:"
+            f"{metrics.get_column_letter(end_column)}2"
+        )
+        menu_cell = worksheet.cell(row=2, column=start_column)
+        assert worksheet.row_dimensions[2].height == 24
+        assert {
+            str(merged)
+            for merged in worksheet.merged_cells.ranges
+            if merged.min_row <= 2 <= merged.max_row
+        } == {expected_merge}
+        assert menu_cell.value == metrics.MANAGEMENT_MENU_LABEL
+        assert menu_cell.hyperlink.target == metrics.MANAGEMENT_MENU_TARGET
+        assert menu_cell.font.underline == "single"
+        assert menu_cell.font.bold is True
+        assert menu_cell.font.size == 9
+        assert metrics.workbook_color_suffix(menu_cell.font.color) == "7A1E1E"
+        assert menu_cell.protection.locked is True
+        assert menu_cell.alignment.horizontal == "left"
+        assert menu_cell.alignment.vertical == "center"
+        assert menu_cell.alignment.shrink_to_fit is True
+        assert menu_cell.alignment.indent == 1
+        assert (
+            metrics.workbook_color_suffix(menu_cell.fill.fgColor)
+            == "F2F2F2"
+        )
+        assert getattr(menu_cell.border.left, "style", None) is None
+        assert getattr(menu_cell.border.right, "style", None) is None
+        assert menu_cell.border.top.style == "thin"
+        assert menu_cell.border.bottom.style == "thin"
+        assert (
+            worksheet.column_dimensions[
+                metrics.get_column_letter(start_column)
+            ].hidden
+            is not True
+        )
+        assert (
+            worksheet.column_dimensions[
+                metrics.get_column_letter(end_column)
+            ].hidden
+            is not True
+        )
+        assert (
+            worksheet.page_setup.fitToWidth
+            == metrics.MANAGEMENT_PRINT_WIDTHS[sheet_name]
+        )
+        if sheet_name == "Data Quality":
+            assert (
+                str(worksheet.page_setup.paperSize)
+                == str(worksheet.PAPERSIZE_TABLOID)
+            )
+        assert worksheet.page_setup.orientation == "landscape"
+        assert worksheet.print_area
+        assert worksheet.print_title_rows
+        assert any(
+            merged.min_row == merged.max_row == 1
+            and merged.min_col == 1
+            and merged.max_col >= 12
+            for merged in worksheet.merged_cells.ranges
+        )
+        frozen_at = worksheet.freeze_panes
+        assert frozen_at is not None
+        assert int("".join(character for character in str(frozen_at) if character.isdigit())) >= 3
+    assert metrics.management_menu_bounds(wb["Action Board"]) == (3, 14)
+    assert metrics.management_menu_bounds(wb["Action History"]) == (3, 14)
+    assert metrics.management_menu_bounds(wb["Evidence Detail"]) == (1, 14)
 
     dashboard_values = {
         value
@@ -776,12 +1085,15 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for value in row
         if isinstance(value, str)
     }
-    assert "TOP THREE ACTIONS" in dashboard_values
-    assert "RECOGNITION / REPLICATE" in dashboard_values
+    assert "TOP THREE REVIEW ITEMS" in dashboard_values
+    assert "RECOGNITION REVIEW" in dashboard_values
     assert "STORE SNAPSHOT" in dashboard_values
-    assert any("READY FOR MANAGEMENT REVIEW" in value for value in dashboard_values)
+    assert any("READY FOR HUMAN REVIEW" in value for value in dashboard_values)
     assert len(wb["Dashboard"]._charts) == 0
     assert len(wb["Store & Group Scorecards"]._charts) == 2
+    assert wb["Store & Group Scorecards"]._charts[0].legend.position == "b"
+    assert wb["Store & Group Scorecards"]._charts[0].anchor._from.row == 3
+    assert wb["Store & Group Scorecards"]._charts[1].anchor._from.row == 16
 
     action_values = {
         value
@@ -793,7 +1105,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert "Due Date" in action_values
     assert "Status" in action_values
     assert "Recommended Next Step" in action_values
-    assert len(wb["Action Board"].data_validations.dataValidation) == 2
+    assert len(wb["Action Board"].data_validations.dataValidation) == 3
     assert len(wb["Action Board"].conditional_formatting) >= 3
     assert wb["Action Board"].row_dimensions[4].height == 30
     assert wb["Action Board"].row_dimensions[5].height == 60
@@ -802,21 +1114,107 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Action Board"]["F5"].number_format == "m/d/yyyy"
     assert wb["Action Board"]["M5"].number_format == "m/d/yyyy"
     assert wb["Action Board"]["Q5"].number_format == "m/d/yyyy"
+    assert wb["Action Board"]["W5"].number_format == "m/d/yyyy"
     assert wb["Action History"].row_dimensions[4].height == 30
+    evidence = wb["Evidence Detail"]
+    assert evidence.row_dimensions[3].height == 54
+    assert "exact raw Evidence Sources and Metric Evidence columns are hidden" in (
+        evidence["A3"].value
+    )
+    assert evidence.row_dimensions[4].height == 42
+    assert evidence.column_dimensions["D"].width == 46
+    assert evidence.column_dimensions["L"].hidden is True
+    assert evidence.column_dimensions["M"].hidden is True
+    assert all(
+        evidence.row_dimensions[row].height in {75, 90}
+        for row in range(5, evidence.max_row + 1)
+    )
+    evidence_headers = {
+        evidence.cell(row=4, column=column).value: column
+        for column in range(1, evidence.max_column + 1)
+    }
+    for row in range(5, evidence.max_row + 1):
+        assert str(
+            evidence.cell(
+                row=row,
+                column=evidence_headers["Evidence Sources"],
+            ).value
+        ).startswith("[")
+        assert str(
+            evidence.cell(
+                row=row,
+                column=evidence_headers["Metric Evidence"],
+            ).value
+        ).startswith("{")
+    run_notes = wb["Run Notes"]
+    run_note_rows = {
+        run_notes.cell(row=row, column=1).value: row
+        for row in range(1, run_notes.max_row + 1)
+    }
+    for label in (
+        "8-Week Direction",
+        "Peer Comparison",
+        "Signal Scoring",
+        "Metric Caveat",
+    ):
+        assert run_notes.row_dimensions[run_note_rows[label]].height == 60
+        assert run_notes.cell(
+            row=run_note_rows[label],
+            column=2,
+        ).alignment.wrap_text is True
+    assert "Check Count Coverage" in run_note_rows
+    assert wb["Management Setup"].row_dimensions[5].height == 30
+    assert wb["Management Setup"]["C5"].alignment.wrap_text is True
+    assert all(
+        wb["Store & Group Scorecards"].row_dimensions[row].height == 30
+        for row in range(18, 30)
+    )
+    assert "A18:G23" in {
+        str(merged)
+        for merged in wb["Store & Group Scorecards"].merged_cells.ranges
+    }
+    assert wb["Store & Group Scorecards"]["A18"].alignment.wrap_text is True
     assert wb["Dashboard"].row_dimensions[13].height == 66
     assert wb["Dashboard"].row_dimensions[14].height == 66
     assert wb["Dashboard"].row_dimensions[15].height == 66
+    assert wb["Dashboard"].row_dimensions[19].height == 60
+    assert wb["Dashboard"].row_dimensions[20].height == 60
+    assert wb["Dashboard"]["K19"].alignment.wrap_text is True
+    assert wb["Dashboard"]["K20"].alignment.wrap_text is True
+    assert wb["Dashboard"].row_dimensions[9].height == 32
+    assert wb["Action Focus"].row_dimensions[3].height == 48
+    assert wb["Action Focus"].page_setup.fitToWidth == 2
     assert wb["Server Scorecard"].row_dimensions[3].height == 30
-    assert wb["Server Scorecard"].row_dimensions[4].height == 48
-    assert wb["Rising & Falling Stars"].row_dimensions[3].height == 30
-    assert wb["Rising & Falling Stars"].row_dimensions[4].height == 48
-    assert wb["Data Quality"].row_dimensions[3].height == 36
+    assert wb["Server Scorecard"].row_dimensions[4].height == 66
+    assert wb["Recent Movement Signals"].row_dimensions[3].height == 30
+    assert wb["Recent Movement Signals"].max_row == 3
+    assert wb["Data Quality"].row_dimensions[3].height == 48
+    assert "$A$1:$L$" in str(wb["Data Quality"].print_area)
+    assert len(wb["Store & Group Scorecards"].row_breaks.brk) == 3
+    assert [
+        page_break.id
+        for page_break in wb["Store & Group Scorecards"].row_breaks.brk
+    ] == [16, 29, 42]
+    for sheet_name, widths in {
+        "Action Focus": {"B": 15, "J": 50, "M": 21},
+        "Server Scorecard": {"E": 21, "F": 23, "G": 23, "H": 22},
+        "Recent Movement Signals": {"A": 26, "F": 23},
+        "Data Quality": {"D": 13, "F": 69},
+        "Management Setup": {"D": 25, "E": 48},
+        "Run Notes": {"A": 30, "B": 96},
+        "Evidence Detail": {"D": 46},
+    }.items():
+        for column, expected_width in widths.items():
+            assert (
+                wb[sheet_name].column_dimensions[column].width
+                == expected_width
+            )
     assert "ManagementTargets" in wb["Management Setup"].tables
     assert "Alex Rising" in {
         cell.value for row in wb["Server Scorecard"].iter_rows() for cell in row
     }
-    assert "Alex Rising" in {
-        cell.value for row in wb["Rising & Falling Stars"].iter_rows() for cell in row
+    assert "Reference Unavailable" in {
+        cell.value for row in wb["Server Scorecard"].iter_rows() for cell in row
     }
 
 
@@ -856,7 +1254,7 @@ def test_incomplete_latest_week_hides_server_scorecards_and_stars(tmp_path: Path
 
     workbook = load_workbook(output_path, data_only=False)
     assert workbook["Server Scorecard"].max_row == 3
-    assert workbook["Rising & Falling Stars"].max_row == 3
+    assert workbook["Recent Movement Signals"].max_row == 3
     dashboard_values = {
         cell.value for row in workbook["Dashboard"].iter_rows() for cell in row
     }
@@ -875,7 +1273,7 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
     for week_end, gross, wine in (
         (date(2026, 6, 7), 1000, 100),
         (date(2026, 6, 14), 1100, 110),
-        (date(2026, 6, 21), 1600, 200),
+        (date(2026, 6, 21), 600, 20),
     ):
         for location in ("RC Richmond", "RC Virginia Beach"):
             records.extend(
@@ -885,8 +1283,8 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
                     weekly_gross=gross,
                     weekly_guests=60,
                     weekly_wine=wine,
-                    rate=0.18 if week_end == date(2026, 6, 21) else 0.20,
-                    ticket_seconds=(70 if week_end == date(2026, 6, 21) else 80) * 60,
+                    rate=0.30 if week_end == date(2026, 6, 21) else 0.20,
+                    ticket_seconds=(95 if week_end == date(2026, 6, 21) else 80) * 60,
                     server="Alex Rising",
                 )
             )
@@ -906,6 +1304,9 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
     actions["E5"] = "Pat Manager"
     actions["F5"] = date(2026, 6, 30)
     actions["N5"] = "Follow up Friday"
+    actions["U5"] = "Coaching Accepted"
+    actions["V5"] = "Pat Manager"
+    actions["W5"] = date(2026, 6, 23)
     action_id = actions["A5"].value
     wb.save(output_path)
     wb.close()
@@ -926,7 +1327,10 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
     assert carried["Status"] == "In Progress"
     assert carried["Owner"] == "Pat Manager"
     assert carried["Due Date"].date() == date(2026, 6, 30)
-    assert carried["Manager Notes"] == "Follow up Friday"
+    assert carried["Context Notes"] == "Follow up Friday"
+    assert carried["Review Disposition"] == "Coaching Accepted"
+    assert carried["Reviewed By"] == "Pat Manager"
+    assert carried["Review Date"].date() == date(2026, 6, 23)
     regenerated.close()
 
 

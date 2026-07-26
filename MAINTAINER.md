@@ -95,8 +95,12 @@ The local health check is read-only:
 python _program\red_onion_weekly_metrics.py --health-check-json
 ```
 
-It never claims that independent recovery is healthy; that remains
-`NotChecked` until separately verified.
+It verifies exact managed per-location workbook bytes plus the protected
+generated content of the master workbook through the integrity manifest.
+Approved editable master values, `LAST RUN STATUS.txt`, Dropbox sync, and
+recipient access are outside that claim. It never claims that independent
+recovery is healthy; recovery remains `ExternalCheckRequired` until the current
+private backup and restore-test evidence are verified separately.
 
 Replacement-machine recovery uses
 `-RebindRestoredIntegrityAnchor <SOURCE_ANCHOR_JSON>`. The recovery-only command

@@ -187,11 +187,11 @@ def test_missing_configured_store_suppresses_actions_and_blanks_stale_scorecard(
 
     scorecards = wb["Store & Group Scorecards"]
     assert "Preliminary" in scorecards["A4"].value
-    assert "Preliminary" in scorecards["A14"].value
-    assert scorecards["A24"].value.startswith("RC Virginia Beach | Missing")
-    assert scorecards["B26"].value is None
-    assert scorecards["F26"].value == "No current-week data"
-    assert scorecards["G26"].value == "Missing"
+    assert "Preliminary" in scorecards["A17"].value
+    assert scorecards["A30"].value.startswith("RC Virginia Beach | Missing")
+    assert scorecards["B32"].value is None
+    assert scorecards["F32"].value == "No current-week data"
+    assert scorecards["G32"].value == "Missing"
     assert 999999.0 not in {
         cell.value for row in scorecards.iter_rows() for cell in row
     }
@@ -253,18 +253,19 @@ def test_incomplete_week_carries_manual_active_action_as_paused() -> None:
     assert history[0]["Signal State"] == "Cleared"
     assert len(current) == 1
     assert current[0]["Action ID"] == prior["Action ID"]
-    assert current[0]["Status"] == "In Progress"
+    assert current[0]["Status"] == "Review Needed"
     assert current[0]["Owner"] == "Pat Manager"
     assert current[0]["Due Date"] == date(2026, 7, 15)
-    assert current[0]["Manager Notes"] == "Review Friday"
+    assert current[0]["Context Notes"] == "Review Friday"
     assert current[0]["Priority"] == "Paused"
     assert current[0]["Action"] == "Paused Carryover"
     assert current[0]["Signal"].startswith("PAUSED / CARRYOVER")
     assert current[0]["Why It Matters"].startswith("Prior action retained")
     assert "manual assignment on hold" in current[0]["Recommended Next Step"]
-    assert current[0]["Performance Level"] == "Preliminary"
-    assert current[0]["Momentum"] == "Not Scored"
-    assert current[0]["Confidence"] == "Paused"
+    assert current[0]["Peer Comparison"] == "Preliminary"
+    assert current[0]["Recent Movement"] == "Not Evaluated"
+    assert current[0]["Evidence Status"] == "Paused"
+    assert current[0]["Review Disposition"] == "Pending Review"
     assert current[0]["Signal State"] == "Paused / Carryover"
     assert current[0]["Action Code"] == "PAUSED_CARRYOVER"
     assert (

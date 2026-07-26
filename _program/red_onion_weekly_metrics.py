@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Iterable
 
 import pandas as pd
@@ -31,6 +32,7 @@ from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.workbook.protection import WorkbookProtection
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from red_onion_integrity import (
@@ -55,6 +57,21 @@ from red_onion_runtime import (
     safe_message,
     write_json_atomic,
 )
+from red_onion_fairness import (
+    CandidatePolarity,
+    MetricBand,
+    PeerComparison,
+    PeerObservation,
+    PromptAction,
+    RecentMovement,
+    WeeklyCandidateSignal,
+    assess_common_store_shock,
+    classify_candidate,
+    evaluate_two_week_persistence,
+    leave_one_day_stability,
+    leave_one_out_same_store_peer_reference,
+    score_metric,
+)
 
 
 METRICS = [
@@ -69,7 +86,19 @@ METRICS = [
 MANAGEMENT_METRICS: tuple[tuple[str, str, str], ...] = (
     ("gross_sales", "Gross Sales", "currency"),
     ("guest_count", "Guest Count", "count"),
-    ("check_average", "Check Average", "currency"),
+    ("check_average", "Sales / Guest", "currency"),
+    ("wine_pct", "Wine %", "percent"),
+    ("rate_of_sale_by_guest_count", "Rate of Sale", "rate"),
+    ("average_ticket_time_seconds", "Ticket Time", "duration"),
+)
+
+STORE_GROUP_DISPLAY_METRICS: tuple[tuple[str, str, str], ...] = (
+    ("gross_sales", "Gross Sales", "currency"),
+    ("guest_count", "Guests", "count"),
+    ("check_count", "Checks", "count"),
+    ("check_average", "Sales / Guest", "currency"),
+    ("sales_per_check", "Sales / Check", "currency"),
+    ("guests_per_check", "Guests / Check", "ratio"),
     ("wine_pct", "Wine %", "percent"),
     ("rate_of_sale_by_guest_count", "Rate of Sale", "rate"),
     ("average_ticket_time_seconds", "Ticket Time", "duration"),
@@ -84,14 +113,47 @@ TARGET_FIELDS: tuple[tuple[str, str], ...] = (
     ("average_ticket_time_seconds", "Ticket Time Target (Min)"),
 )
 
-SERVER_TREND_FIELDS: tuple[str, ...] = (
+SERVER_PERSON_ACTION_FIELDS: tuple[str, ...] = (
     "check_average",
     "wine_pct",
+)
+
+SERVER_CONTEXT_FIELDS: tuple[str, ...] = (
     "rate_of_sale_by_guest_count",
     "average_ticket_time_seconds",
 )
 
+# Retain the established name for compatibility with callers and tests while
+# making its decision scope explicit. Rate of Sale and Ticket Time remain
+# visible operational context but cannot create person-level signals.
+SERVER_TREND_FIELDS: tuple[str, ...] = SERVER_PERSON_ACTION_FIELDS
+
 ACTION_HEADERS = [
+    "Action ID",
+    "Entity Key",
+    "Priority",
+    "Status",
+    "Owner",
+    "Due Date",
+    "Location",
+    "Person / Area",
+    "Action",
+    "Signal",
+    "Why It Matters",
+    "Recommended Next Step",
+    "Last Seen",
+    "Context Notes",
+    "Peer Comparison",
+    "Recent Movement",
+    "First Seen",
+    "Weeks Open",
+    "Evidence Status",
+    "Signal State",
+    "Review Disposition",
+    "Reviewed By",
+    "Review Date",
+]
+LEGACY_ACTION_HEADERS_V1 = [
     "Action ID",
     "Entity Key",
     "Priority",
@@ -114,14 +176,35 @@ ACTION_HEADERS = [
     "Signal State",
 ]
 
-ACTION_STATUS_CHOICES: tuple[str, ...] = (
+LEGACY_ACTION_STATUS_CHOICES: tuple[str, ...] = (
     "Open",
     "In Progress",
     "Blocked",
     "Complete",
     "Dismissed",
 )
-MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v1"
+ACTION_STATUS_CHOICES: tuple[str, ...] = (
+    "Review Needed",
+    *LEGACY_ACTION_STATUS_CHOICES,
+)
+REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
+    "Pending Review",
+    "Coaching Accepted",
+    "Recognition Accepted",
+    "Context Explains",
+    "Data Issue",
+    "Monitor",
+)
+MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v3"
+PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v2"
+PREVIOUS_RATE_OF_SALE_GUIDANCE = (
+    "Rate of Sale currently assumes lower is better."
+)
+PREVIOUS_TICKET_TIME_GUIDANCE = "Ticket Time is guest-weighted"
+MANAGEMENT_SIGNAL_DISCLAIMER = (
+    "Rule-based observational coaching signal—not a statistical, causal, or "
+    "employment decision. Verify comparable work context and source accuracy."
+)
 EVIDENCE_DETAIL_HEADERS: tuple[str, ...] = (
     "Evidence ID",
     "Action ID",
@@ -136,6 +219,16 @@ EVIDENCE_DETAIL_HEADERS: tuple[str, ...] = (
     "Evidence Week Ends",
     "Evidence Sources",
     "Metric Evidence",
+    "Comparator Type",
+    "Peer Cohort Size",
+    "Peer Cohort Weeks",
+    "Threshold Version",
+    "Evidence Status",
+    "Recurring Drivers",
+    "Stability Result",
+    "Review Disposition",
+    "Reviewed By",
+    "Review Date",
     "Methodology Version",
     "Last Seen",
 )
@@ -146,6 +239,13 @@ ACTION_EVIDENCE_FIELDS: tuple[str, ...] = (
     "Evidence Week Ends",
     "Evidence Sources",
     "Metric Evidence",
+    "Comparator Type",
+    "Peer Cohort Size",
+    "Peer Cohort Weeks",
+    "Threshold Version",
+    "Evidence Status",
+    "Recurring Drivers",
+    "Stability Result",
     "Methodology Version",
 )
 
@@ -160,7 +260,7 @@ PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS = [
     "Management Setup",
     "Run Notes",
 ]
-VISIBLE_MANAGEMENT_SHEETS = [
+LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS = [
     "Dashboard",
     "Action Focus",
     "Action Board",
@@ -173,6 +273,63 @@ VISIBLE_MANAGEMENT_SHEETS = [
     "Management Setup",
     "Run Notes",
 ]
+PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS = [
+    "Dashboard",
+    "Action Focus",
+    "Action Board",
+    "Server Scorecard",
+    "Store & Group Scorecards",
+    "Recent Movement Signals",
+    "Evidence Detail",
+    "Action History",
+    "Data Quality",
+    "Management Setup",
+    "Run Notes",
+]
+VISIBLE_MANAGEMENT_SHEETS = [
+    "How to Use",
+    *PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS,
+]
+MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
+    ("Guide", "How to Use"),
+    ("Dashboard", "Dashboard"),
+    ("Focus", "Action Focus"),
+    ("Actions", "Action Board"),
+    ("Servers", "Server Scorecard"),
+    ("Stores", "Store & Group Scorecards"),
+    ("Movement", "Recent Movement Signals"),
+    ("Evidence", "Evidence Detail"),
+    ("History", "Action History"),
+    ("Quality", "Data Quality"),
+    ("Setup", "Management Setup"),
+    ("Run", "Run Notes"),
+)
+MANAGEMENT_MENU_LABEL = "Workbook Menu - click to choose a sheet on How to Use"
+MANAGEMENT_MENU_TARGET = "#'How to Use'!A44"
+MANAGEMENT_PRINT_WIDTHS: dict[str, int] = {
+    "How to Use": 1,
+    "Dashboard": 1,
+    "Action Focus": 2,
+    "Action Board": 3,
+    "Server Scorecard": 2,
+    "Store & Group Scorecards": 1,
+    "Recent Movement Signals": 2,
+    "Evidence Detail": 3,
+    "Action History": 3,
+    "Data Quality": 1,
+    "Management Setup": 2,
+    "Run Notes": 1,
+}
+HOW_TO_USE_SECTION_HEADINGS: tuple[str, ...] = (
+    "SCOPE AND PROHIBITED USE",
+    "SIX-STEP WEEKLY WORKFLOW",
+    "REQUIRED EVIDENCE REVIEW",
+    "SIGNAL INTERPRETATION",
+    "ACTION BOARD EDIT SURFACE",
+    "DISPOSITION MEANINGS",
+    "WORKBOOK MAP",
+    "LIMITS, ASSUMPTIONS, AND ESCALATION",
+)
 
 OPERATING_WEEK_START_WEEKDAY = 1  # Tuesday; date.weekday() uses Monday=0.
 OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
@@ -237,6 +394,10 @@ class MetricRecord:
     source_format: str = ""
     parser_engine: str = ""
     report_date_source: str = "Unknown"
+    rate_available: bool = True
+    ticket_time_available: bool = True
+    check_count: float = 0.0
+    check_count_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -381,6 +542,71 @@ class ManagementEvidencePackageV1:
         }
 
 
+@dataclass(frozen=True)
+class EvidenceRecordV2(EvidenceRecord):
+    comparator_type: str = "Same-store prior-four-week median"
+    peer_cohort_size: int = 0
+    peer_cohort_weeks: int = 0
+    threshold_version: str = MANAGEMENT_METHODOLOGY_VERSION
+    evidence_status: str = ""
+    recurring_drivers: str = ""
+    stability_result: str = ""
+    review_disposition: str = "Pending Review"
+    reviewed_by: str = ""
+    review_date: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(
+            {
+                "comparator_type": self.comparator_type,
+                "peer_cohort_size": self.peer_cohort_size,
+                "peer_cohort_weeks": self.peer_cohort_weeks,
+                "threshold_version": self.threshold_version,
+                "evidence_status": self.evidence_status,
+                "recurring_drivers": self.recurring_drivers,
+                "stability_result": self.stability_result,
+                "review_disposition": self.review_disposition,
+                "reviewed_by": self.reviewed_by,
+                "review_date": self.review_date,
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class ManagementEvidencePackageV2:
+    source: dict[str, Any]
+    records: tuple[EvidenceRecordV2, ...]
+    retention_delete_after: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": "ManagementEvidencePackageV2",
+            "schema_version": 2,
+            "classification": "Restricted Employee Performance Information",
+            "permitted_use": (
+                "Human-reviewed observational coaching and recognition prompts only."
+            ),
+            "prohibited_use": (
+                "Not the sole or determinative basis for pay, scheduling, discipline, "
+                "promotion, or termination."
+            ),
+            "retention": {
+                "days": 365,
+                "delete_after": self.retention_delete_after,
+                "automatic_deletion": False,
+            },
+            "distribution": {
+                "mode": "Manual local export after exact-fingerprint approval",
+                "automatic_upload": False,
+                "automatic_send": False,
+            },
+            "source": self.source,
+            "records": [record.to_dict() for record in self.records],
+        }
+
+
 def is_blank(value: Any) -> bool:
     if value is None:
         return True
@@ -396,8 +622,12 @@ def to_float(value: Any) -> float:
     if is_blank(value):
         return 0.0
     if isinstance(value, (int, float)):
-        return float(value)
-    return float(str(value).replace(",", "").replace("$", "").strip())
+        number = float(value)
+    else:
+        number = float(str(value).replace(",", "").replace("$", "").strip())
+    if not math.isfinite(number):
+        raise ValueError(f"Expected a finite number, received {value!r}.")
+    return number
 
 
 def ticket_time_to_seconds(value: Any) -> float:
@@ -424,6 +654,61 @@ def ticket_time_to_seconds(value: Any) -> float:
     hours, minutes, seconds, fraction = match.groups()
     micros = float(f"0.{fraction}") if fraction else 0.0
     return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + micros
+
+
+def optional_float(value: Any) -> tuple[float, bool]:
+    """Return a finite numeric value plus whether it was actually available."""
+
+    if is_blank(value):
+        return 0.0, False
+    try:
+        return to_float(value), True
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, False
+
+
+def optional_nonnegative_float(value: Any) -> tuple[float, bool]:
+    """Return an available finite value only when it is non-negative."""
+
+    number, available = optional_float(value)
+    return (number, True) if available and number >= 0 else (0.0, False)
+
+
+def optional_check_count(value: Any) -> tuple[float, bool]:
+    """Parse a non-negative whole-number Check Count."""
+
+    number, available = optional_nonnegative_float(value)
+    if not available or not float(number).is_integer():
+        return 0.0, False
+    return number, True
+
+
+def optional_ticket_time_seconds(value: Any) -> tuple[float, bool]:
+    """Parse ticket time without turning malformed or non-finite input into a benefit."""
+
+    if is_blank(value):
+        return 0.0, False
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)) or float(value) < 0:
+            return 0.0, False
+    if isinstance(value, str):
+        match = re.match(
+            r"^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$", value.strip()
+        )
+        if not match:
+            return 0.0, False
+        _, minutes, seconds, _ = match.groups()
+        if int(minutes) >= 60 or int(seconds) >= 60:
+            return 0.0, False
+    try:
+        seconds = ticket_time_to_seconds(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, False
+    return (
+        (seconds, True)
+        if math.isfinite(seconds) and seconds >= 0
+        else (0.0, False)
+    )
 
 
 def parse_date_text(text: str) -> date:
@@ -516,19 +801,23 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
         if "Report(All)" not in workbook.sheet_names:
             if "No Data Available" in workbook.sheet_names:
                 raise ValueError(
-                    "the Toast export contains a 'No Data Available' worksheet instead of report "
+                    "the source export contains a 'No Data Available' worksheet instead of report "
                     "data. Replace it with a complete Daily Report export, then rerun. No "
                     "workbooks were created and no source files were moved."
                 )
             available_sheets = ", ".join(workbook.sheet_names) or "none"
             raise ValueError(
                 "the required 'Report(All)' worksheet is missing "
-                f"(worksheets found: {available_sheets}). Replace the file with a complete Toast "
+                f"(worksheets found: {available_sheets}). Replace the file with a complete Red Onion "
                 "Daily Report export, then rerun."
             )
         df = workbook.parse("Report(All)", header=None)
     report_date, report_date_source = parse_report_date_with_source(df, path)
     header_row, location_col, block_starts = find_header_row(df)
+    header_values = [
+        "" if is_blank(value) else str(value).strip()
+        for value in df.iloc[header_row].tolist()
+    ]
     location_names = set(config["locations"])
     records: list[MetricRecord] = []
 
@@ -547,16 +836,35 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
 
         for start_col in block_starts:
             values = [row.get(start_col + offset) for offset in range(len(METRICS))]
-            if all(is_blank(value) for value in values):
+            check_count_col = start_col + len(METRICS)
+            has_check_count = (
+                check_count_col < len(header_values)
+                and header_values[check_count_col] == "Check Count"
+            )
+            check_count_value = row.get(check_count_col) if has_check_count else None
+            if all(is_blank(value) for value in values) and is_blank(check_count_value):
                 continue
 
             gross_sales = to_float(values[0])
             guest_count = to_float(values[1])
             wine_sales = to_float(values[3])
-            rate = to_float(values[4])
-            ticket_seconds = ticket_time_to_seconds(values[5])
+            rate, rate_available = optional_nonnegative_float(values[4])
+            ticket_seconds, ticket_time_available = optional_ticket_time_seconds(
+                values[5]
+            )
+            check_count, check_count_available = (
+                optional_check_count(check_count_value)
+                if has_check_count
+                else (0.0, False)
+            )
 
-            if raw_user_name and gross_sales == 0 and guest_count == 0 and wine_sales == 0:
+            if (
+                raw_user_name
+                and gross_sales == 0
+                and guest_count == 0
+                and wine_sales == 0
+                and not (check_count_available and check_count > 0)
+            ):
                 continue
 
             check_average = gross_sales / guest_count if guest_count else 0.0
@@ -580,6 +888,15 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
                     source_format=path.suffix.lower(),
                     parser_engine=parser_engine,
                     report_date_source=report_date_source,
+                    rate_available=(
+                        guest_count <= 0 or (rate_available and rate > 0)
+                    ),
+                    ticket_time_available=(
+                        (guest_count <= 0 and check_count <= 0)
+                        or ticket_time_available
+                    ),
+                    check_count=check_count,
+                    check_count_available=check_count_available,
                 )
             )
             break
@@ -973,26 +1290,51 @@ def report_date_for_records(path: Path, records: list[MetricRecord]) -> date:
     return report_dates[0]
 
 
-def semantic_report_signature(records: list[MetricRecord]) -> tuple[tuple[Any, ...], ...]:
+def semantic_report_signature(
+    records: list[MetricRecord],
+    *,
+    include_check_count: bool = True,
+) -> tuple[tuple[Any, ...], ...]:
     def normalized_number(value: float) -> float:
         number = round(float(value), 6)
         return 0.0 if number == 0 else number
 
-    return tuple(
-        sorted(
-            (
-                record.location.strip(),
-                record.raw_user_name.strip(),
-                bool(record.is_location_total),
-                normalized_number(record.gross_sales),
-                normalized_number(record.guest_count),
-                normalized_number(record.wine_sales),
-                normalized_number(record.rate_of_sale_by_guest_count),
-                normalized_number(record.average_ticket_time_seconds),
-            )
-            for record in records
+    def record_signature(record: MetricRecord) -> tuple[Any, ...]:
+        signature: tuple[Any, ...] = (
+            record.location.strip(),
+            record.raw_user_name.strip(),
+            bool(record.is_location_total),
+            normalized_number(record.gross_sales),
+            normalized_number(record.guest_count),
+            normalized_number(record.wine_sales),
+            normalized_number(record.rate_of_sale_by_guest_count),
+            normalized_number(record.average_ticket_time_seconds),
+            bool(record.rate_available),
+            bool(record.ticket_time_available),
         )
+        if include_check_count:
+            signature += (
+                normalized_number(record.check_count),
+                bool(record.check_count_available),
+            )
+        return signature
+
+    signature_records = (
+        records
+        if include_check_count
+        else [
+            record
+            for record in records
+            if not (
+                record.check_count_available
+                and record.check_count > 0
+                and record.gross_sales == 0
+                and record.guest_count == 0
+                and record.wine_sales == 0
+            )
+        ]
     )
+    return tuple(sorted(record_signature(record) for record in signature_records))
 
 
 def resolve_report_duplicates(
@@ -1006,13 +1348,44 @@ def resolve_report_duplicates(
     duplicates: list[Path] = []
     for report_date, reports in sorted(reports_by_date.items()):
         reports.sort(key=lambda item: str(item[0]).casefold())
-        selected_path, selected_records = reports[0]
-        selected_signature = semantic_report_signature(selected_records)
-        conflicting_paths = [
-            path
-            for path, records in reports[1:]
-            if semantic_report_signature(records) != selected_signature
-        ]
+        core_signatures = {
+            semantic_report_signature(records, include_check_count=False)
+            for _, records in reports
+        }
+        conflicting_paths: list[Path] = []
+        if len(core_signatures) == 1:
+            # A newer export can contain the same daily facts plus Check Count.
+            # Prefer the most complete copy instead of treating additive
+            # context as a conflict. Conflicting values at the same coverage
+            # level still fail closed.
+            richest_coverage = max(
+                sum(record.check_count_available for record in records)
+                for _, records in reports
+            )
+            richest_reports = [
+                (path, records)
+                for path, records in reports
+                if sum(record.check_count_available for record in records)
+                == richest_coverage
+            ]
+            selected_path, selected_records = richest_reports[0]
+            selected_signature = semantic_report_signature(selected_records)
+            conflicting_paths = [
+                path
+                for path, records in richest_reports[1:]
+                if semantic_report_signature(records) != selected_signature
+            ]
+        else:
+            selected_path, selected_records = reports[0]
+            selected_core_signature = semantic_report_signature(
+                selected_records, include_check_count=False
+            )
+            conflicting_paths = [
+                path
+                for path, records in reports[1:]
+                if semantic_report_signature(records, include_check_count=False)
+                != selected_core_signature
+            ]
         if conflicting_paths:
             paths = [selected_path, *conflicting_paths]
             path_lines = "\n".join(f"  - {path}" for path in paths)
@@ -1025,7 +1398,7 @@ def resolve_report_duplicates(
                 "source files were moved."
             )
         resolved[selected_path] = selected_records
-        duplicates.extend(path for path, _ in reports[1:])
+        duplicates.extend(path for path, _ in reports if path != selected_path)
 
     return ReportResolution(
         records_by_path=resolved,
@@ -1159,6 +1532,80 @@ def validated_data_quality_coverage(
             "source files were moved."
         )
     return coverage_start, coverage_end, row_count
+
+
+def validate_daily_location_reconciliation(
+    records: Iterable[MetricRecord],
+    config: dict[str, Any],
+) -> None:
+    """Require daily person rows to reconcile to each configured location total."""
+
+    grouped: dict[tuple[date, str], list[MetricRecord]] = defaultdict(list)
+    for record in records:
+        if is_operating_day(record.report_date):
+            grouped[(record.report_date, record.location)].append(record)
+    failures: list[str] = []
+    for (report_date, location), rows in sorted(grouped.items()):
+        if location not in config.get("locations", {}):
+            continue
+        totals = [row for row in rows if row.is_location_total]
+        people = [row for row in rows if not row.is_location_total]
+        if len(totals) != 1:
+            failures.append(
+                f"{report_date.isoformat()} {location}: expected one location total, "
+                f"found {len(totals)}"
+            )
+            continue
+        total = totals[0]
+        if any(row.check_count_available for row in rows):
+            missing_check_rows = [
+                row.raw_user_name for row in rows if not row.check_count_available
+            ]
+            if missing_check_rows:
+                preview = ", ".join(missing_check_rows[:3])
+                failures.append(
+                    f"{report_date.isoformat()} {location}: Check Count is only "
+                    f"partially available (missing for {preview})"
+                )
+            else:
+                person_checks = sum(row.check_count for row in people)
+                if abs(person_checks - total.check_count) > 1e-6:
+                    failures.append(
+                        f"{report_date.isoformat()} {location}: check count person rows "
+                        f"{person_checks:.4f} != location total {total.check_count:.4f}"
+                    )
+        comparisons = (
+            (
+                "guest count",
+                sum(row.guest_count for row in people),
+                total.guest_count,
+                1e-6,
+            ),
+            (
+                "gross sales",
+                sum(row.gross_sales for row in people),
+                total.gross_sales,
+                0.01,
+            ),
+            (
+                "wine sales",
+                sum(row.wine_sales for row in people),
+                total.wine_sales,
+                0.01,
+            ),
+        )
+        for label, person_value, total_value, tolerance in comparisons:
+            if abs(person_value - total_value) > tolerance:
+                failures.append(
+                    f"{report_date.isoformat()} {location}: {label} person rows "
+                    f"{person_value:.4f} != location total {total_value:.4f}"
+                )
+    if failures:
+        detail = "; ".join(failures[:5])
+        raise ValueError(
+            "Daily reconciliation failed. No history files were copied, no workbooks "
+            f"were created, and no active source files were moved. {detail}"
+        )
 
 
 def archive_destination_for(
@@ -1780,11 +2227,17 @@ def aggregate_records(
                     "gross_sales": 0.0,
                     "guest_count": 0.0,
                     "wine_sales": 0.0,
-                    "rate_weighted_sum": 0.0,
-                    "rate_weight": 0.0,
+                    "check_count": 0.0,
+                    "rate_qualifying_sales": 0.0,
+                    "rate_opportunities": 0.0,
                     "ticket_weighted_sum": 0.0,
                     "ticket_weight": 0.0,
+                    "rate_available": True,
+                    "ticket_time_available": True,
+                    "check_count_available": True,
+                    "has_active_rows": False,
                     "active_dates": set(),
+                    "daily_records": [],
                     "source_files": set(),
                     "source_evidence": set(),
                 }
@@ -1794,17 +2247,55 @@ def aggregate_records(
         group["gross_sales"] += record.gross_sales
         group["guest_count"] += record.guest_count
         group["wine_sales"] += record.wine_sales
+        group["check_count"] += (
+            record.check_count if record.check_count_available else 0.0
+        )
+        active_row = (
+            record.guest_count > 0
+            or record.gross_sales > 0
+            or (record.check_count_available and record.check_count > 0)
+        )
+        if active_row:
+            group["has_active_rows"] = True
+            group["check_count_available"] = (
+                group["check_count_available"] and record.check_count_available
+            )
         if record.guest_count > 0:
-            group["rate_weighted_sum"] += (
-                record.rate_of_sale_by_guest_count * record.guest_count
+            group["rate_available"] = group["rate_available"] and record.rate_available
+            if record.rate_available and record.rate_of_sale_by_guest_count > 0:
+                group["rate_qualifying_sales"] += (
+                    record.guest_count / record.rate_of_sale_by_guest_count
+                )
+                group["rate_opportunities"] += record.guest_count
+        if record.check_count > 0 and record.check_count_available:
+            group["ticket_time_available"] = (
+                group["ticket_time_available"] and record.ticket_time_available
             )
-            group["rate_weight"] += record.guest_count
+        if (
+            record.check_count > 0
+            and record.check_count_available
+            and record.ticket_time_available
+        ):
             group["ticket_weighted_sum"] += (
-                record.average_ticket_time_seconds * record.guest_count
+                record.average_ticket_time_seconds * record.check_count
             )
-            group["ticket_weight"] += record.guest_count
-        if record.guest_count > 0 or record.gross_sales > 0:
+            group["ticket_weight"] += record.check_count
+        if active_row:
             group["active_dates"].add(record.report_date)
+        group["daily_records"].append(
+            {
+                "report_date": record.report_date,
+                "gross_sales": record.gross_sales,
+                "guest_count": record.guest_count,
+                "wine_sales": record.wine_sales,
+                "rate_of_sale_by_guest_count": record.rate_of_sale_by_guest_count,
+                "average_ticket_time_seconds": record.average_ticket_time_seconds,
+                "rate_available": record.rate_available,
+                "ticket_time_available": record.ticket_time_available,
+                "check_count": record.check_count,
+                "check_count_available": record.check_count_available,
+            }
+        )
         group["source_files"].add(record.source_file)
         group["source_evidence"].add(
             (
@@ -1825,17 +2316,50 @@ def aggregate_records(
         rollup = dict(group)
         rollup["check_average"] = gross_sales / guest_count if guest_count else 0.0
         rollup["wine_pct"] = wine_sales / gross_sales if gross_sales else 0.0
+        rollup["check_count_available"] = bool(
+            group["has_active_rows"] and group["check_count_available"]
+        )
+        rollup["sales_per_check"] = (
+            gross_sales / group["check_count"]
+            if rollup["check_count_available"] and group["check_count"]
+            else 0.0
+        )
+        rollup["guests_per_check"] = (
+            guest_count / group["check_count"]
+            if rollup["check_count_available"] and group["check_count"]
+            else 0.0
+        )
+        rollup["rate_available"] = bool(
+            group["rate_available"]
+            and group["rate_opportunities"] > 0
+            and group["rate_qualifying_sales"] > 0
+        )
         rollup["rate_of_sale_by_guest_count"] = (
-            group["rate_weighted_sum"] / group["rate_weight"] if group["rate_weight"] else 0.0
+            group["rate_opportunities"] / group["rate_qualifying_sales"]
+            if rollup["rate_available"]
+            else 0.0
+        )
+        rollup["ticket_time_available"] = bool(
+            rollup["check_count_available"]
+            and group["ticket_time_available"]
+            and group["ticket_weight"] > 0
         )
         rollup["average_ticket_time_seconds"] = (
             group["ticket_weighted_sum"] / group["ticket_weight"]
-            if group["ticket_weight"]
+            if rollup["ticket_time_available"]
             else 0.0
+        )
+        rollup["ticket_time_weight_basis"] = (
+            "Check Count"
+            if rollup["ticket_time_available"]
+            else "Unavailable (Check Count missing or incomplete)"
         )
         rollup["active_days"] = len(group["active_dates"])
         rollup["source_days"] = len(group["active_dates"])
         rollup["source_files"] = ", ".join(sorted(group["source_files"]))
+        rollup["daily_records"] = sorted(
+            group["daily_records"], key=lambda item: item["report_date"]
+        )
         rollup["source_evidence"] = [
             {
                 "source_file": item[0],
@@ -1848,10 +2372,11 @@ def aggregate_records(
             for item in sorted(group["source_evidence"])
         ]
         for helper in (
-            "rate_weighted_sum",
-            "rate_weight",
+            "rate_qualifying_sales",
+            "rate_opportunities",
             "ticket_weighted_sum",
             "ticket_weight",
+            "has_active_rows",
             "active_dates",
         ):
             rollup.pop(helper, None)
@@ -1914,7 +2439,9 @@ def format_date_range(start: date, end: date) -> str:
     return f"{start:%m/%d/%Y} - {end:%m/%d/%Y}"
 
 
-def duration_fraction(seconds: float) -> float:
+def duration_fraction(seconds: float | None) -> float | None:
+    if seconds is None:
+        return None
     return seconds / 86400 if seconds else 0.0
 
 
@@ -2219,11 +2746,17 @@ def assign_rank(
     *,
     higher_is_better: bool,
     min_guest_count: int,
+    availability_field: str | None = None,
 ) -> None:
     eligible = [
         row
         for row in rows
-        if row.get("guest_count", 0) >= min_guest_count and row.get(value_field) is not None
+        if row.get("guest_count", 0) >= min_guest_count
+        and row.get(value_field) is not None
+        and (
+            availability_field is None
+            or bool(row.get(availability_field, False))
+        )
     ]
     eligible.sort(
         key=lambda row: row[value_field],
@@ -2274,6 +2807,7 @@ def weekly_server_rank_rows(
             "rate_rank",
             higher_is_better=False,
             min_guest_count=min_guest_count,
+            availability_field="rate_available",
         )
         assign_rank(
             group_rows,
@@ -2281,6 +2815,7 @@ def weekly_server_rank_rows(
             "ticket_time_rank",
             higher_is_better=False,
             min_guest_count=min_guest_count,
+            availability_field="ticket_time_available",
         )
         ranked_rows.extend(group_rows)
 
@@ -2306,11 +2841,11 @@ def trend_note(
 
     improved = 0
     declined = 0
+    # Person-level trend labels are limited to the two validated action
+    # measures. Rate of Sale and Ticket Time remain adjacent context only.
     for value, higher_is_better in (
         (check_change, True),
         (wine_change, True),
-        (rate_change, False),
-        (ticket_change_minutes, False),
     ):
         if value is None or abs(value) < 0.000001:
             continue
@@ -2373,8 +2908,6 @@ def average_rank_movement(row: dict[str, Any]) -> float | None:
     movements = [
         row.get("check_average_rank_movement"),
         row.get("wine_pct_rank_movement"),
-        row.get("rate_rank_movement"),
-        row.get("ticket_time_rank_movement"),
     ]
     available = [movement for movement in movements if movement is not None]
     if not available:
@@ -2394,10 +2927,18 @@ def server_week_trend_rows(ranked_rows: list[dict[str, Any]]) -> list[dict[str, 
         for row in rows:
             check_change = metric_delta(row, previous, "check_average")
             wine_change = metric_delta(row, previous, "wine_pct")
-            rate_change = metric_delta(row, previous, "rate_of_sale_by_guest_count")
+            rate_change = (
+                metric_delta(row, previous, "rate_of_sale_by_guest_count")
+                if previous
+                and row.get("rate_available")
+                and previous.get("rate_available")
+                else None
+            )
             ticket_change_minutes = (
                 (row["average_ticket_time_seconds"] - previous["average_ticket_time_seconds"]) / 60
                 if previous
+                and row.get("ticket_time_available")
+                and previous.get("ticket_time_available")
                 else None
             )
             rank_fields = (
@@ -2485,13 +3026,13 @@ def server_star_rows(
 
         metric_components = [
             (
-                "Check average",
+                "Sales / Guest",
                 star_score_component(
                     row.get("check_average_change"),
                     lower_is_better=False,
                     strong_threshold=5.0,
                 ),
-                f"Check avg {format_change(row.get('check_average_change'), 'currency')}",
+                f"Sales / Guest {format_change(row.get('check_average_change'), 'currency')}",
                 "check",
             ),
             (
@@ -2504,47 +3045,10 @@ def server_star_rows(
                 f"Wine {format_change(row.get('wine_pct_change'), 'pct_points')}",
                 "wine",
             ),
-            (
-                "Rate",
-                star_score_component(
-                    row.get("rate_change"),
-                    lower_is_better=True,
-                    strong_threshold=0.25,
-                ),
-                f"Rate {format_change(row.get('rate_change'), 'number')}",
-                "rate",
-            ),
-            (
-                "Ticket time",
-                star_score_component(
-                    row.get("ticket_time_change_minutes"),
-                    lower_is_better=True,
-                    strong_threshold=5.0,
-                ),
-                f"Ticket {format_change(row.get('ticket_time_change_minutes'), 'minutes')}",
-                "ticket",
-            ),
         ]
         avg_rank_move = average_rank_movement(row)
-        rank_score = 0
-        if avg_rank_move is not None:
-            if avg_rank_move >= 5:
-                rank_score = 2
-            elif avg_rank_move >= 2:
-                rank_score = 1
-            elif avg_rank_move <= -5:
-                rank_score = -2
-            elif avg_rank_move <= -2:
-                rank_score = -1
-        score = sum(component[1] for component in metric_components) + rank_score
+        score = sum(component[1] for component in metric_components)
         components = [(label, component_score, sort_key) for _, component_score, label, sort_key in metric_components]
-        components.append(
-            (
-                f"Rank {format_change(avg_rank_move, 'rank')}",
-                rank_score,
-                "rank",
-            )
-        )
         star_rows.append(
             {
                 "category": star_classification(score),
@@ -2613,12 +3117,25 @@ def compact_minutes(value: float | None) -> str:
 
 def star_action(row: dict[str, Any]) -> tuple[str, str, str]:
     if row["category"] == "Falling Star":
-        priority = "High" if row["composite_score"] <= -5 else "Medium"
-        return priority, "Coach", "Review recent shifts and coach the drivers shown in Evidence."
+        priority = "High" if row["composite_score"] <= -4 else "Medium"
+        return (
+            priority,
+            "Coach",
+            "What comparable-shift context explains the Sales / Guest and Wine % "
+            "movement, and what one coaching step is supported?",
+        )
     if row["category"] == "Rising Star":
-        priority = "Recognize" if row["composite_score"] >= 5 else "Share"
-        return priority, "Recognize", "Recognize the improvement and ask what changed so the tactic can be shared."
-    return "Monitor", "Monitor", "Keep watching next week before acting."
+        priority = "Recognize" if row["composite_score"] >= 4 else "Share"
+        return (
+            priority,
+            "Recognize",
+            "What supported practice should be recognized and shared after context review?",
+        )
+    return (
+        "Monitor",
+        "Monitor",
+        "What should be watched in the next qualified week before acting?",
+    )
 
 
 def store_status(row: dict[str, Any]) -> tuple[str, str, str]:
@@ -2626,18 +3143,33 @@ def store_status(row: dict[str, Any]) -> tuple[str, str, str]:
     guests_down = (row.get("guest_count_change") or 0) < 0
     check_down = (row.get("check_average_change") or 0) < 0
     wine_down = (row.get("wine_pct_change") or 0) < 0
-    ticket_slower = (row.get("ticket_time_change_minutes") or 0) > 0
-    negative_count = sum([gross_down, guests_down, check_down, wine_down, ticket_slower])
+    negative_count = sum([gross_down, guests_down, check_down, wine_down])
 
     if gross_down and guests_down:
-        return "High", "Traffic Watch", "Sales and guest count both fell; review traffic, staffing, and event calendar."
+        return (
+            "High",
+            "Traffic Watch",
+            "What changed in reservations, events, operating hours, staffing, or local demand?",
+        )
     if check_down and wine_down:
-        return "Medium", "Upsell Watch", "Guests held better than spend; coach check average and wine attachment."
-    if ticket_slower and negative_count >= 2:
-        return "Medium", "Service Watch", "Ticket time worsened with other declines; review service flow."
+        return (
+            "Medium",
+            "Upsell Watch",
+            "Did guest mix, menu availability, training, or shift mix explain the "
+            "Sales / Guest and Wine % change?",
+        )
     if negative_count >= 2:
-        return "Medium", "Mixed Watch", "Multiple metrics moved the wrong way; review manager notes."
-    return "Monitor", "Stable / Mixed", "No urgent store action; monitor next run."
+        return (
+            "Medium",
+            "Mixed Watch",
+            "Which validated movement changed, what context explains it, and what "
+            "one follow-up should be assigned?",
+        )
+    return (
+        "Monitor",
+        "Stable / Mixed",
+        "What, if anything, needs follow-up before the next weekly review?",
+    )
 
 
 def trend_evidence(row: dict[str, Any]) -> str:
@@ -2786,10 +3318,18 @@ def weekly_metric_trend_rows(
         for row in rows:
             check_change = metric_delta(row, previous, "check_average")
             wine_change = metric_delta(row, previous, "wine_pct")
-            rate_change = metric_delta(row, previous, "rate_of_sale_by_guest_count")
+            rate_change = (
+                metric_delta(row, previous, "rate_of_sale_by_guest_count")
+                if previous
+                and row.get("rate_available")
+                and previous.get("rate_available")
+                else None
+            )
             ticket_change_minutes = (
                 (row["average_ticket_time_seconds"] - previous["average_ticket_time_seconds"]) / 60
                 if previous
+                and row.get("ticket_time_available")
+                and previous.get("ticket_time_available")
                 else None
             )
             trend_rows.append(
@@ -2848,10 +3388,23 @@ def weekly_metric_summary_rows(
         total_gross = sum(row["gross_sales"] for row in rows)
         total_guests = sum(row["guest_count"] for row in rows)
         total_wine = sum(row["wine_sales"] for row in rows)
-        rate_weighted = sum(row["rate_of_sale_by_guest_count"] * row["guest_count"] for row in rows)
-        ticket_weighted = sum(row["average_ticket_time_seconds"] * row["guest_count"] for row in rows)
+        operational_context = aggregate_weekly_rows(rows) or {}
         latest = rows[-1]
         prior = rows[-2] if len(rows) > 1 else None
+        overall_rate_available = bool(
+            operational_context.get("rate_available", False)
+        )
+        overall_ticket_available = bool(
+            operational_context.get("ticket_time_available", False)
+        )
+        latest_rate_available = bool(latest.get("rate_available", False))
+        prior_rate_available = bool(prior and prior.get("rate_available", False))
+        latest_ticket_available = bool(
+            latest.get("ticket_time_available", False)
+        )
+        prior_ticket_available = bool(
+            prior and prior.get("ticket_time_available", False)
+        )
         row = {field: value for field, value in zip(identity_fields, key)}
         row.update(
             {
@@ -2863,8 +3416,22 @@ def weekly_metric_summary_rows(
                 "weighted_check_average": total_gross / total_guests if total_guests else 0.0,
                 "total_wine_sales": total_wine,
                 "overall_wine_pct": total_wine / total_gross if total_gross else 0.0,
-                "weighted_rate": rate_weighted / total_guests if total_guests else 0.0,
-                "weighted_ticket_time_seconds": ticket_weighted / total_guests if total_guests else 0.0,
+                "weighted_rate": (
+                    operational_context.get("rate_of_sale_by_guest_count")
+                    if overall_rate_available
+                    else None
+                ),
+                "weighted_ticket_time_seconds": (
+                    operational_context.get("average_ticket_time_seconds")
+                    if overall_ticket_available
+                    else None
+                ),
+                "rate_available": overall_rate_available,
+                "ticket_time_available": overall_ticket_available,
+                "ticket_time_weight_basis": operational_context.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                ),
                 "first_week_end": rows[0]["week_end"],
                 "latest_week_end": latest["week_end"],
                 "prior_week_end": prior["week_end"] if prior else None,
@@ -2880,16 +3447,34 @@ def weekly_metric_summary_rows(
                 "latest_wine_pct": latest["wine_pct"],
                 "prior_wine_pct": prior["wine_pct"] if prior else None,
                 "wine_pct_change": metric_delta(latest, prior, "wine_pct"),
-                "latest_rate": latest["rate_of_sale_by_guest_count"],
-                "prior_rate": prior["rate_of_sale_by_guest_count"] if prior else None,
-                "rate_change": metric_delta(latest, prior, "rate_of_sale_by_guest_count"),
-                "latest_ticket_time_seconds": latest["average_ticket_time_seconds"],
+                "latest_rate": (
+                    latest["rate_of_sale_by_guest_count"]
+                    if latest_rate_available
+                    else None
+                ),
+                "prior_rate": (
+                    prior["rate_of_sale_by_guest_count"]
+                    if prior_rate_available
+                    else None
+                ),
+                "rate_change": (
+                    metric_delta(latest, prior, "rate_of_sale_by_guest_count")
+                    if latest_rate_available and prior_rate_available
+                    else None
+                ),
+                "latest_ticket_time_seconds": (
+                    latest["average_ticket_time_seconds"]
+                    if latest_ticket_available
+                    else None
+                ),
                 "prior_ticket_time_seconds": (
-                    prior["average_ticket_time_seconds"] if prior else None
+                    prior["average_ticket_time_seconds"]
+                    if prior_ticket_available
+                    else None
                 ),
                 "ticket_time_change_minutes": (
                     (latest["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
-                    if prior
+                    if latest_ticket_available and prior_ticket_available
                     else None
                 ),
             }
@@ -2911,10 +3496,23 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
         total_gross = sum(row["gross_sales"] for row in rows)
         total_guests = sum(row["guest_count"] for row in rows)
         total_wine = sum(row["wine_sales"] for row in rows)
-        rate_weighted = sum(row["rate_of_sale_by_guest_count"] * row["guest_count"] for row in rows)
-        ticket_weighted = sum(row["average_ticket_time_seconds"] * row["guest_count"] for row in rows)
+        operational_context = aggregate_weekly_rows(rows) or {}
         latest = rows[-1]
         prior = rows[-2] if len(rows) > 1 else None
+        overall_rate_available = bool(
+            operational_context.get("rate_available", False)
+        )
+        overall_ticket_available = bool(
+            operational_context.get("ticket_time_available", False)
+        )
+        latest_rate_available = bool(latest.get("rate_available", False))
+        prior_rate_available = bool(prior and prior.get("rate_available", False))
+        latest_ticket_available = bool(
+            latest.get("ticket_time_available", False)
+        )
+        prior_ticket_available = bool(
+            prior and prior.get("ticket_time_available", False)
+        )
         summary.append(
             {
                 "location": location,
@@ -2927,8 +3525,22 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
                 "weighted_check_average": total_gross / total_guests if total_guests else 0.0,
                 "total_wine_sales": total_wine,
                 "overall_wine_pct": total_wine / total_gross if total_gross else 0.0,
-                "weighted_rate": rate_weighted / total_guests if total_guests else 0.0,
-                "weighted_ticket_time_seconds": ticket_weighted / total_guests if total_guests else 0.0,
+                "weighted_rate": (
+                    operational_context.get("rate_of_sale_by_guest_count")
+                    if overall_rate_available
+                    else None
+                ),
+                "weighted_ticket_time_seconds": (
+                    operational_context.get("average_ticket_time_seconds")
+                    if overall_ticket_available
+                    else None
+                ),
+                "rate_available": overall_rate_available,
+                "ticket_time_available": overall_ticket_available,
+                "ticket_time_weight_basis": operational_context.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                ),
                 "first_week_end": rows[0]["week_end"],
                 "latest_week_end": latest["week_end"],
                 "prior_week_end": prior["week_end"] if prior else None,
@@ -2940,20 +3552,34 @@ def trend_summary_rows(weekly_server_rows: list[dict[str, Any]]) -> list[dict[st
                 "latest_wine_pct": latest["wine_pct"],
                 "prior_wine_pct": prior["wine_pct"] if prior else None,
                 "wine_pct_change": latest["wine_pct"] - prior["wine_pct"] if prior else None,
-                "latest_rate": latest["rate_of_sale_by_guest_count"],
-                "prior_rate": prior["rate_of_sale_by_guest_count"] if prior else None,
-                "rate_change": (
-                    latest["rate_of_sale_by_guest_count"] - prior["rate_of_sale_by_guest_count"]
-                    if prior
+                "latest_rate": (
+                    latest["rate_of_sale_by_guest_count"]
+                    if latest_rate_available
                     else None
                 ),
-                "latest_ticket_time_seconds": latest["average_ticket_time_seconds"],
+                "prior_rate": (
+                    prior["rate_of_sale_by_guest_count"]
+                    if prior_rate_available
+                    else None
+                ),
+                "rate_change": (
+                    latest["rate_of_sale_by_guest_count"] - prior["rate_of_sale_by_guest_count"]
+                    if latest_rate_available and prior_rate_available
+                    else None
+                ),
+                "latest_ticket_time_seconds": (
+                    latest["average_ticket_time_seconds"]
+                    if latest_ticket_available
+                    else None
+                ),
                 "prior_ticket_time_seconds": (
-                    prior["average_ticket_time_seconds"] if prior else None
+                    prior["average_ticket_time_seconds"]
+                    if prior_ticket_available
+                    else None
                 ),
                 "ticket_time_change_minutes": (
                     (latest["average_ticket_time_seconds"] - prior["average_ticket_time_seconds"]) / 60
-                    if prior
+                    if latest_ticket_available and prior_ticket_available
                     else None
                 ),
             }
@@ -2989,22 +3615,30 @@ def priority_fill(value: Any) -> PatternFill | None:
     if text in {
         "high", "coach", "coach now", "falling", "declining", "falling star",
         "below benchmark", "traffic watch", "incomplete week",
+        "coaching prompt", "downward", "below peer reference",
     }:
         return soft_fill("F4CCCC")
     if text in {
         "medium", "coach fundamentals", "protect performance", "reinforce improvement",
         "store review", "group review", "upsell watch", "service watch", "mixed watch",
-        "building history", "low sample",
+        "building history", "low sample", "context review", "sensitive",
+        "limited history", "limited volume", "reference unavailable",
     }:
         return soft_fill("FFF2CC")
     if text in {
         "recognize", "recognize & replicate", "share", "rising", "improving",
-        "rising star", "above benchmark",
+        "rising star", "above benchmark", "recognition prompt", "upward",
+        "above peer reference",
     }:
         return soft_fill("D9EAD3")
-    if text in {"review", "data quality", "short week"}:
+    if text in {
+        "review", "review needed", "data quality", "short week", "eligible",
+    }:
         return soft_fill("D9EAF7")
-    if text in {"monitor", "stable", "stable / mixed", "on track", "not scored"}:
+    if text in {
+        "monitor", "stable", "stable / mixed", "on track", "not scored",
+        "not evaluated", "within peer range",
+    }:
         return soft_fill("EDEDED")
     return None
 
@@ -4286,14 +4920,14 @@ def _write_master_workbook_base(
         ),
         (
             "Rising/Falling Stars",
-            "Composite score balances check average, wine percent, rate of sale, ticket time, and rank movement.",
+            "Person trend labels use Sales / Guest and Wine % only. Rate of Sale and Ticket Time remain context only.",
         ),
         (
             "Trend Tabs",
             "Server, store, and group trend tabs show week-over-week changes plus latest/prior/total-period summaries.",
         ),
-        ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
-        ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
+        ("Metric Rule", "Sales / Guest and Wine % are recalculated from rolled-up sales, guests, and wine sales."),
+        ("Metric Rule", "Rate of Sale uses opportunities divided by inferred qualifying sales. Ticket Time is Check Count-weighted only when Check Count coverage is complete."),
     ]
     for row_index, (label, value) in enumerate(note_rows, start=3):
         notes.cell(row=row_index, column=1, value=label).font = Font(bold=True)
@@ -4324,9 +4958,19 @@ def safe_pct_delta(current: float | None, comparison: float | None) -> float | N
     return (current - comparison) / comparison
 
 
-def management_threshold(config: dict[str, Any], field: str) -> dict[str, Any]:
-    defaults = DEFAULT_CONFIG["management_score_thresholds"][field]
-    configured = config.get("management_score_thresholds", {}).get(field, {})
+def management_threshold(
+    config: dict[str, Any],
+    field: str,
+    *,
+    comparator: str = "movement",
+) -> dict[str, Any]:
+    family = (
+        "management_peer_score_thresholds"
+        if comparator == "peer"
+        else "management_score_thresholds"
+    )
+    defaults = DEFAULT_CONFIG[family][field]
+    configured = config.get(family, {}).get(field, {})
     return {**defaults, **configured}
 
 
@@ -4352,35 +4996,116 @@ def directional_variance(current: float, benchmark: float, threshold: dict[str, 
     return -variance if threshold.get("lower_is_better") else variance
 
 
-def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, float] | None:
+def operational_context_rollup(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    selected = list(rows)
+    active_rows = [
+        row
+        for row in selected
+        if (
+            float(row.get("guest_count", 0) or 0) > 0
+            or float(row.get("gross_sales", 0) or 0) > 0
+            or (
+                bool(row.get("check_count_available", False))
+                and float(row.get("check_count", 0) or 0) > 0
+            )
+        )
+    ]
+    check_count_available = bool(active_rows) and all(
+        bool(row.get("check_count_available", False)) for row in active_rows
+    )
+    check_count = sum(
+        float(row.get("check_count", 0) or 0)
+        for row in selected
+        if bool(row.get("check_count_available", False))
+    )
+
+    rate_rows = [
+        row
+        for row in selected
+        if float(row.get("guest_count", 0) or 0) > 0
+    ]
+    rate_available = bool(rate_rows) and all(
+        bool(row.get("rate_available", True))
+        and float(row.get("rate_of_sale_by_guest_count", 0) or 0) > 0
+        for row in rate_rows
+    )
+    rate_opportunities = sum(
+        float(row.get("guest_count", 0) or 0) for row in rate_rows
+    )
+    rate_qualifying_sales = sum(
+        float(row.get("guest_count", 0) or 0)
+        / float(row.get("rate_of_sale_by_guest_count", 0) or 0)
+        for row in rate_rows
+        if bool(row.get("rate_available", True))
+        and float(row.get("rate_of_sale_by_guest_count", 0) or 0) > 0
+    )
+    rate_available = bool(
+        rate_available and rate_opportunities > 0 and rate_qualifying_sales > 0
+    )
+
+    ticket_rows = [
+        row
+        for row in selected
+        if (
+            bool(row.get("check_count_available", False))
+            and float(row.get("check_count", 0) or 0) > 0
+        )
+    ]
+    ticket_time_available = bool(
+        check_count_available
+        and ticket_rows
+        and all(bool(row.get("ticket_time_available", True)) for row in ticket_rows)
+    )
+    ticket_weight = sum(
+        float(row.get("check_count", 0) or 0) for row in ticket_rows
+    )
+    ticket_weighted = sum(
+        float(row.get("average_ticket_time_seconds", 0) or 0)
+        * float(row.get("check_count", 0) or 0)
+        for row in ticket_rows
+        if bool(row.get("ticket_time_available", True))
+    )
+    return {
+        "check_count": check_count,
+        "check_count_available": check_count_available,
+        "sales_per_check": 0.0,
+        "guests_per_check": 0.0,
+        "rate_of_sale_by_guest_count": (
+            rate_opportunities / rate_qualifying_sales if rate_available else 0.0
+        ),
+        "rate_available": rate_available,
+        "average_ticket_time_seconds": (
+            ticket_weighted / ticket_weight
+            if ticket_time_available and ticket_weight
+            else 0.0
+        ),
+        "ticket_time_available": ticket_time_available,
+        "ticket_time_weight_basis": (
+            "Check Count"
+            if ticket_time_available
+            else "Unavailable (Check Count missing or incomplete)"
+        ),
+    }
+
+
+def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
     selected = list(rows)
     if not selected:
         return None
     gross_sales = sum(float(row.get("gross_sales", 0) or 0) for row in selected)
     guest_count = sum(float(row.get("guest_count", 0) or 0) for row in selected)
     wine_sales = sum(float(row.get("wine_sales", 0) or 0) for row in selected)
-    rate_weight = sum(float(row.get("guest_count", 0) or 0) for row in selected)
-    ticket_weight = rate_weight
-    rate_weighted = sum(
-        float(row.get("rate_of_sale_by_guest_count", 0) or 0)
-        * float(row.get("guest_count", 0) or 0)
-        for row in selected
-    )
-    ticket_weighted = sum(
-        float(row.get("average_ticket_time_seconds", 0) or 0)
-        * float(row.get("guest_count", 0) or 0)
-        for row in selected
-    )
+    context = operational_context_rollup(selected)
+    if context["check_count_available"] and context["check_count"]:
+        context["sales_per_check"] = gross_sales / context["check_count"]
+        context["guests_per_check"] = guest_count / context["check_count"]
     return {
         "gross_sales": gross_sales,
         "guest_count": guest_count,
         "check_average": gross_sales / guest_count if guest_count else 0.0,
         "wine_sales": wine_sales,
         "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
-        "rate_of_sale_by_guest_count": rate_weighted / rate_weight if rate_weight else 0.0,
-        "average_ticket_time_seconds": (
-            ticket_weighted / ticket_weight if ticket_weight else 0.0
-        ),
+        **context,
     }
 
 
@@ -4410,8 +5135,6 @@ def management_rank_block_movement(
     for rank_field in (
         "check_average_rank",
         "wine_pct_rank",
-        "rate_rank",
-        "ticket_time_rank",
     ):
         recent_ranks = [
             rank_lookup[(row["week_end"], row["location"], row["raw_user_name"])].get(rank_field)
@@ -4509,30 +5232,505 @@ def merged_source_evidence(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any
 
 
 def recommended_server_follow_up(row: dict[str, Any]) -> str:
-    negative_fields = [field for field, score in row["metric_scores"].items() if score < 0]
-    positive_fields = [field for field, score in row["metric_scores"].items() if score > 0]
-    field = negative_fields[0] if negative_fields else positive_fields[0] if positive_fields else None
-    if row["action"] == "Recognize & Replicate":
-        if negative_fields:
-            return "Recognize the improvement, then address the watch item before sharing the successful practice."
-        return "Recognize the improvement and ask what changed so the practice can be shared."
-    if row["action"] == "Reinforce Improvement":
-        return "Acknowledge the progress and reinforce the strongest improving behavior."
-    if row["action"] == "Protect Performance":
-        return "Check in on the decline while reinforcing the server's current strengths."
-    if row["action"] == "Coach Fundamentals":
-        return "Review recent shifts and agree on one measurable improvement for next week."
-    if row["action"] != "Coach Now":
-        return "Monitor another full week before taking action."
-    if field == "check_average":
-        return "Review suggestive selling, add-ons, and check-building opportunities on recent shifts."
-    if field == "wine_pct":
-        return "Coach wine pairing prompts and wine attachment opportunities on recent shifts."
+    action = str(row.get("action") or "Monitor")
+    recurring = row.get("recurring_driver_fields", []) or []
+    driver_text = ", ".join(
+        field.replace("_", " ")
+        for field in recurring
+    )
+    context_prompt = (
+        "What changed in shift mix, section load, guest mix, check volume, staffing, "
+        "or service conditions, and do manager observations corroborate the validated "
+        "Sales / Guest and Wine % signal?"
+    )
+    if action == "Coaching Prompt":
+        suffix = f" Recurring drivers: {driver_text}." if driver_text else ""
+        return (
+            "After reviewing comparable work context, what one measurable coaching "
+            f"step is supported by the Sales / Guest and Wine % evidence?{suffix}"
+        )
+    if action == "Recognition Prompt":
+        suffix = f" Recurring drivers: {driver_text}." if driver_text else ""
+        return (
+            "After reviewing comparable work context, what supported practice should "
+            f"be recognized and shared?{suffix}"
+        )
+    if action == "Context Review":
+        return context_prompt
+    return (
+        "What should be watched during the next complete, qualified week before "
+        "opening any coaching or recognition prompt?"
+    )
+
+
+def management_metric_available(row: dict[str, Any], field: str) -> bool:
     if field == "rate_of_sale_by_guest_count":
-        return "Review table pacing and section load to identify the source of the slower rate."
+        return bool(row.get("rate_available", True))
     if field == "average_ticket_time_seconds":
-        return "Review service flow and ticket-time bottlenecks on the affected shifts."
-    return "Review recent shifts and coach the largest declining driver."
+        return bool(row.get("ticket_time_available", True))
+    value = row.get(field)
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def management_metric_band(
+    config: dict[str, Any],
+    field: str,
+    *,
+    comparator: str = "movement",
+) -> MetricBand:
+    threshold = management_threshold(config, field, comparator=comparator)
+    return MetricBand(
+        neutral=float(threshold["neutral"]),
+        strong=float(threshold["strong"]),
+    )
+
+
+def management_metric_score(
+    change: float | None,
+    config: dict[str, Any],
+    field: str,
+    *,
+    comparator: str = "movement",
+) -> int | None:
+    threshold = management_threshold(config, field, comparator=comparator)
+    return score_metric(
+        change,
+        management_metric_band(config, field, comparator=comparator),
+        higher_is_better=not bool(threshold.get("lower_is_better")),
+    )
+
+
+def classification_from_metric_scores(
+    scores: dict[str, int | None],
+    *,
+    positive_label: str,
+    negative_label: str,
+    unavailable_label: str,
+) -> tuple[str, int]:
+    if any(scores.get(field) is None for field in SERVER_TREND_FIELDS):
+        return unavailable_label, 0
+    return management_trend_classification(
+        {field: int(scores[field] or 0) for field in SERVER_TREND_FIELDS},
+        0,
+        improving_label=positive_label,
+        declining_label=negative_label,
+    )
+
+
+def weekly_row_from_daily_records(
+    daily_records: Iterable[dict[str, Any]],
+) -> dict[str, Any] | None:
+    rows = list(daily_records)
+    if not rows:
+        return None
+    gross_sales = sum(float(row.get("gross_sales", 0) or 0) for row in rows)
+    guest_count = sum(float(row.get("guest_count", 0) or 0) for row in rows)
+    wine_sales = sum(float(row.get("wine_sales", 0) or 0) for row in rows)
+    active_dates = {
+        as_date(row.get("report_date"))
+        for row in rows
+        if (
+            float(row.get("guest_count", 0) or 0) > 0
+            or float(row.get("gross_sales", 0) or 0) > 0
+            or (
+                bool(row.get("check_count_available", False))
+                and float(row.get("check_count", 0) or 0) > 0
+            )
+        )
+    }
+    context = operational_context_rollup(rows)
+    if context["check_count_available"] and context["check_count"]:
+        context["sales_per_check"] = gross_sales / context["check_count"]
+        context["guests_per_check"] = guest_count / context["check_count"]
+    return {
+        "gross_sales": gross_sales,
+        "guest_count": guest_count,
+        "check_average": gross_sales / guest_count if guest_count else 0.0,
+        "wine_sales": wine_sales,
+        "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
+        **context,
+        "active_days": len({value for value in active_dates if value is not None}),
+        "source_days": len({value for value in active_dates if value is not None}),
+        "daily_records": rows,
+    }
+
+
+def evaluate_server_week_signal(
+    current: dict[str, Any],
+    weekly_server_rows: list[dict[str, Any]],
+    full_by_location: dict[str, set[date]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    location = current["location"]
+    current_week_end = current["week_end"]
+    baseline_limit = int(config.get("dashboard_baseline_full_weeks", 4))
+    min_prior_weeks = int(config.get("dashboard_min_prior_full_weeks", 2))
+    min_prior_guests = float(config.get("dashboard_min_prior_guest_count", 50))
+    peer_config = config.get("management_peer_reference", {})
+    peer_prior_limit = int(peer_config.get("prior_full_weeks", 4))
+    min_peer_weeks = int(peer_config.get("min_prior_full_weeks", 3))
+    min_peers_per_week = int(
+        peer_config.get("min_distinct_peers_per_week", 5)
+    )
+    min_peer_server_weeks = int(peer_config.get("min_peer_server_weeks", 20))
+    eligible_week_ends = sorted(
+        week_end
+        for week_end in full_by_location.get(location, set())
+        if week_end < current_week_end
+    )
+    self_week_ends = eligible_week_ends[-baseline_limit:]
+    peer_week_ends = eligible_week_ends[-peer_prior_limit:]
+    prior_rows = [
+        row
+        for row in weekly_server_rows
+        if row["location"] == location
+        and row["raw_user_name"] == current["raw_user_name"]
+        and row["week_end"] in self_week_ends
+    ]
+    baseline = aggregate_weekly_rows(prior_rows)
+    prior_guest_count = sum(
+        float(row.get("guest_count", 0) or 0) for row in prior_rows
+    )
+    full_latest = current_week_end in full_by_location.get(location, set())
+    current_sample_eligible = dashboard_trend_eligible(current, config)
+    self_history_eligible = (
+        len(prior_rows) >= min_prior_weeks
+        and prior_guest_count >= min_prior_guests
+    )
+
+    changes: dict[str, float | None] = {}
+    metric_scores: dict[str, int | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        available = (
+            baseline is not None
+            and management_metric_available(current, field)
+            and management_metric_available(baseline, field)
+        )
+        change = (
+            float(current[field]) - float(baseline[field])
+            if available and baseline is not None
+            else None
+        )
+        changes[field] = change
+        metric_scores[field] = management_metric_score(change, config, field)
+    movement, composite_score = classification_from_metric_scores(
+        metric_scores,
+        positive_label=RecentMovement.UPWARD.value,
+        negative_label=RecentMovement.DOWNWARD.value,
+        unavailable_label=RecentMovement.NOT_EVALUATED.value,
+    )
+
+    peer_references: dict[str, Any] = {}
+    peer_scores: dict[str, int | None] = {}
+    peer_changes: dict[str, float | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        observations = [
+            PeerObservation(
+                person_id=str(row.get("raw_user_name") or ""),
+                location=str(row.get("location") or ""),
+                week_end=row["week_end"],
+                value=(
+                    float(row[field])
+                    if management_metric_available(row, field)
+                    else None
+                ),
+                qualified=dashboard_trend_eligible(row, config),
+                excluded=dashboard_excluded(row, config),
+            )
+            for row in weekly_server_rows
+            if row["location"] == location and row["week_end"] in peer_week_ends
+        ]
+        reference = leave_one_out_same_store_peer_reference(
+            observations,
+            focal_person_id=str(current.get("raw_user_name") or ""),
+            location=location,
+            prior_week_ends=peer_week_ends,
+            max_prior_weeks=peer_prior_limit,
+            min_usable_weeks=min_peer_weeks,
+            min_distinct_peers_per_week=min_peers_per_week,
+            min_peer_weeks=min_peer_server_weeks,
+        )
+        peer_references[field] = reference
+        peer_change = (
+            float(current[field]) - float(reference.value)
+            if reference.sufficient
+            and reference.value is not None
+            and management_metric_available(current, field)
+            else None
+        )
+        peer_changes[field] = peer_change
+        peer_scores[field] = management_metric_score(
+            peer_change,
+            config,
+            field,
+            comparator="peer",
+        )
+    peer_reference_available = all(
+        reference.sufficient for reference in peer_references.values()
+    )
+    peer_score_label, peer_composite_score = classification_from_metric_scores(
+        peer_scores,
+        positive_label=PeerComparison.ABOVE.value,
+        negative_label=PeerComparison.BELOW.value,
+        unavailable_label=PeerComparison.UNAVAILABLE.value,
+    )
+    if (
+        peer_score_label == "Stable"
+        and peer_reference_available
+    ):
+        peer_score_label = PeerComparison.WITHIN.value
+
+    combined_scores: dict[str, int | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        movement_score = metric_scores.get(field)
+        peer_score = peer_scores.get(field)
+        if movement_score is None or peer_score is None:
+            combined_scores[field] = None
+        elif movement_score and peer_score and movement_score * peer_score > 0:
+            direction = 1 if movement_score > 0 else -1
+            combined_scores[field] = direction * min(
+                abs(movement_score), abs(peer_score)
+            )
+        else:
+            combined_scores[field] = 0
+    candidate = classify_candidate(
+        movement,
+        peer_score_label,
+        combined_scores,
+        required_metrics=SERVER_TREND_FIELDS,
+    )
+
+    current_peer_rows = [
+        row
+        for row in weekly_server_rows
+        if row["location"] == location
+        and row["week_end"] == current_week_end
+        and str(row.get("raw_user_name") or "").casefold()
+        != str(current.get("raw_user_name") or "").casefold()
+        and dashboard_trend_eligible(row, config)
+        and not dashboard_excluded(row, config)
+    ]
+    current_peer_changes: dict[str, float | None] = {}
+    for field in SERVER_TREND_FIELDS:
+        valid_values = [
+            float(row[field])
+            for row in current_peer_rows
+            if management_metric_available(row, field)
+        ]
+        reference = peer_references[field]
+        current_peer_changes[field] = (
+            float(median(valid_values)) - float(reference.value)
+            if len(valid_values) >= min_peers_per_week
+            and reference.sufficient
+            and reference.value is not None
+            else None
+        )
+    shock = assess_common_store_shock(
+        candidate.polarity,
+        peer_changes,
+        current_peer_changes,
+        {
+            field: management_metric_band(config, field, comparator="peer")
+            for field in SERVER_TREND_FIELDS
+        },
+        {
+            field: not bool(
+                management_threshold(
+                    config,
+                    field,
+                    comparator="peer",
+                ).get("lower_is_better")
+            )
+            for field in SERVER_TREND_FIELDS
+        },
+        candidate_drivers=candidate.agreeing_drivers,
+    )
+    base_qualified = (
+        full_latest
+        and current_sample_eligible
+        and self_history_eligible
+        and peer_reference_available
+    )
+    candidate_qualified = base_qualified and candidate.eligible
+    full_candidate_polarity = (
+        candidate.polarity
+        if candidate_qualified and shock.guard_passed
+        else CandidatePolarity.NONE
+    )
+
+    daily_records = list(current.get("daily_records", []) or [])
+    leave_one_day_polarities: list[CandidatePolarity] = []
+    if candidate_qualified and daily_records:
+        active_dates = sorted(
+            {
+                as_date(item.get("report_date"))
+                for item in daily_records
+                if (
+                    float(item.get("guest_count", 0) or 0) > 0
+                    or float(item.get("gross_sales", 0) or 0) > 0
+                    or (
+                        bool(item.get("check_count_available", False))
+                        and float(item.get("check_count", 0) or 0) > 0
+                    )
+                )
+                and as_date(item.get("report_date")) is not None
+            }
+        )
+        for removed_date in active_dates:
+            reduced = weekly_row_from_daily_records(
+                item
+                for item in daily_records
+                if as_date(item.get("report_date")) != removed_date
+            )
+            if reduced is None or not dashboard_trend_eligible(reduced, config):
+                leave_one_day_polarities.append(CandidatePolarity.NONE)
+                continue
+            reduced_movement_scores: dict[str, int | None] = {}
+            reduced_peer_scores: dict[str, int | None] = {}
+            reduced_peer_changes: dict[str, float | None] = {}
+            for field in SERVER_TREND_FIELDS:
+                movement_change = (
+                    float(reduced[field]) - float(baseline[field])
+                    if baseline is not None
+                    and management_metric_available(reduced, field)
+                    and management_metric_available(baseline, field)
+                    else None
+                )
+                peer_reference = peer_references[field]
+                peer_change = (
+                    float(reduced[field]) - float(peer_reference.value)
+                    if peer_reference.sufficient
+                    and peer_reference.value is not None
+                    and management_metric_available(reduced, field)
+                    else None
+                )
+                reduced_movement_scores[field] = management_metric_score(
+                    movement_change, config, field
+                )
+                reduced_peer_scores[field] = management_metric_score(
+                    peer_change,
+                    config,
+                    field,
+                    comparator="peer",
+                )
+                reduced_peer_changes[field] = peer_change
+            reduced_movement, _ = classification_from_metric_scores(
+                reduced_movement_scores,
+                positive_label=RecentMovement.UPWARD.value,
+                negative_label=RecentMovement.DOWNWARD.value,
+                unavailable_label=RecentMovement.NOT_EVALUATED.value,
+            )
+            reduced_peer_label, _ = classification_from_metric_scores(
+                reduced_peer_scores,
+                positive_label=PeerComparison.ABOVE.value,
+                negative_label=PeerComparison.BELOW.value,
+                unavailable_label=PeerComparison.UNAVAILABLE.value,
+            )
+            if reduced_peer_label == "Stable":
+                reduced_peer_label = PeerComparison.WITHIN.value
+            reduced_combined: dict[str, int | None] = {}
+            for field in SERVER_TREND_FIELDS:
+                left = reduced_movement_scores[field]
+                right = reduced_peer_scores[field]
+                if left is None or right is None:
+                    reduced_combined[field] = None
+                elif left and right and left * right > 0:
+                    reduced_combined[field] = (
+                        1 if left > 0 else -1
+                    ) * min(abs(left), abs(right))
+                else:
+                    reduced_combined[field] = 0
+            reduced_candidate = classify_candidate(
+                reduced_movement,
+                reduced_peer_label,
+                reduced_combined,
+                required_metrics=SERVER_TREND_FIELDS,
+            )
+            reduced_shock = assess_common_store_shock(
+                reduced_candidate.polarity,
+                reduced_peer_changes,
+                current_peer_changes,
+                {
+                    field: management_metric_band(
+                        config,
+                        field,
+                        comparator="peer",
+                    )
+                    for field in SERVER_TREND_FIELDS
+                },
+                {
+                    field: not bool(
+                        management_threshold(
+                            config,
+                            field,
+                            comparator="peer",
+                        ).get(
+                            "lower_is_better"
+                        )
+                    )
+                    for field in SERVER_TREND_FIELDS
+                },
+                candidate_drivers=reduced_candidate.agreeing_drivers,
+            )
+            leave_one_day_polarities.append(
+                reduced_candidate.polarity
+                if reduced_candidate.eligible and reduced_shock.guard_passed
+                else CandidatePolarity.NONE
+            )
+    day_stable = leave_one_day_stability(
+        full_candidate_polarity, leave_one_day_polarities
+    )
+
+    if not full_latest:
+        evidence_status = "Incomplete Week"
+    elif not current_sample_eligible:
+        evidence_status = "Limited Volume"
+    elif not self_history_eligible:
+        evidence_status = "Limited History"
+    elif any(
+        not management_metric_available(current, field)
+        for field in SERVER_TREND_FIELDS
+    ):
+        evidence_status = "Data Issue"
+    elif not peer_reference_available:
+        evidence_status = "Reference Unavailable"
+    elif candidate_qualified and not day_stable:
+        evidence_status = "Sensitive"
+    elif candidate_qualified and shock.guard_passed:
+        evidence_status = "Stable"
+    else:
+        evidence_status = "Eligible"
+
+    return {
+        "prior_rows": prior_rows,
+        "prior_week_ends": self_week_ends,
+        "prior_guest_count": prior_guest_count,
+        "baseline": baseline,
+        "full_latest": full_latest,
+        "current_sample_eligible": current_sample_eligible,
+        "self_history_eligible": self_history_eligible,
+        "changes": changes,
+        "metric_scores": metric_scores,
+        "composite_score": composite_score,
+        "movement": movement if base_qualified else RecentMovement.NOT_EVALUATED.value,
+        "peer_comparison": (
+            peer_score_label
+            if peer_reference_available
+            else PeerComparison.UNAVAILABLE.value
+        ),
+        "peer_composite_score": peer_composite_score,
+        "peer_changes": peer_changes,
+        "peer_scores": peer_scores,
+        "peer_references": peer_references,
+        "peer_reference_available": peer_reference_available,
+        "combined_scores": combined_scores,
+        "candidate": candidate,
+        "candidate_qualified": candidate_qualified,
+        "store_shock": shock,
+        "day_stable": day_stable,
+        "leave_one_day_polarities": leave_one_day_polarities,
+        "evidence_status": evidence_status,
+    }
 
 
 def management_server_rows(
@@ -4545,9 +5743,6 @@ def management_server_rows(
     if not weekly_server_rows:
         return []
     latest_week_end = max(row["week_end"] for row in weekly_server_rows)
-    baseline_limit = int(config.get("dashboard_baseline_full_weeks", 4))
-    min_prior_weeks = int(config.get("dashboard_min_prior_full_weeks", 2))
-    min_prior_guests = float(config.get("dashboard_min_prior_guest_count", 50))
     long_term_limit = int(config.get("dashboard_long_term_full_weeks", 8))
     long_term_block = int(config.get("dashboard_long_term_block_weeks", 4))
     full_min_recent_guests = float(
@@ -4572,70 +5767,35 @@ def management_server_rows(
         config.get("dashboard_long_term_developing_min_earlier_guests", 50)
     )
     full_by_location, _ = full_week_ends_by_location(weekly_location_rows)
-    rank_lookup = {
-        (row["week_end"], row["location"], row["raw_user_name"]): row for row in ranked_rows
-    }
-    location_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in weekly_location_rows:
-        location_rows[row["location"]].append(row)
+    evaluations: dict[tuple[date, str, str], dict[str, Any]] = {}
+
+    def evaluation_for(row: dict[str, Any]) -> dict[str, Any]:
+        key = (row["week_end"], row["location"], row["raw_user_name"])
+        if key not in evaluations:
+            evaluations[key] = evaluate_server_week_signal(
+                row, weekly_server_rows, full_by_location, config
+            )
+        return evaluations[key]
 
     output: list[dict[str, Any]] = []
     for current in weekly_server_rows:
         if current["week_end"] != latest_week_end or dashboard_excluded(current, config):
             continue
         location = current["location"]
-        eligible_week_ends = sorted(
-            week_end
-            for week_end in full_by_location.get(location, set())
-            if week_end < latest_week_end
-        )[-baseline_limit:]
-        prior_rows = [
-            row
-            for row in weekly_server_rows
-            if row["location"] == location
-            and row["raw_user_name"] == current["raw_user_name"]
-            and row["week_end"] in eligible_week_ends
-        ]
-        baseline = aggregate_weekly_rows(prior_rows)
-        location_baseline = aggregate_weekly_rows(
-            row
-            for row in location_rows.get(location, [])
-            if row["week_end"] in eligible_week_ends
-        )
-        prior_guest_count = sum(float(row.get("guest_count", 0) or 0) for row in prior_rows)
-        full_latest = latest_week_end in full_by_location.get(location, set())
-        current_sample_eligible = dashboard_trend_eligible(current, config)
-        prominent = (
-            full_latest
-            and current_sample_eligible
-            and len(prior_rows) >= min_prior_weeks
-            and prior_guest_count >= min_prior_guests
-        )
-
-        metric_scores: dict[str, int] = {}
-        changes: dict[str, float | None] = {}
+        evaluated = evaluation_for(current)
+        prior_rows = evaluated["prior_rows"]
+        changes = evaluated["changes"]
+        metric_scores = evaluated["metric_scores"]
         positive_drivers: list[str] = []
         negative_drivers: list[str] = []
         for field in SERVER_TREND_FIELDS:
-            change = current[field] - baseline[field] if baseline else None
-            score = directional_score(change, management_threshold(config, field))
-            changes[field] = change
-            metric_scores[field] = score
+            change = changes[field]
+            score = metric_scores[field]
             if change is not None and score > 0:
                 positive_drivers.append(metric_driver(field, change))
             elif change is not None and score < 0:
                 negative_drivers.append(metric_driver(field, change))
-
-        average_rank_move, rank_score = management_rank_block_movement(
-            [current], prior_rows, rank_lookup
-        )
-        scored_momentum, composite_score = management_trend_classification(
-            metric_scores,
-            rank_score,
-            improving_label="Rising",
-            declining_label="Falling",
-        )
-        momentum = scored_momentum if prominent else "Not Scored"
+        movement = evaluated["movement"]
 
         history_week_ends = sorted(
             week_end
@@ -4706,121 +5866,199 @@ def management_server_rows(
                 else None
             )
             long_term_changes[field] = change
-            long_term_metric_scores[field] = directional_score(
-                change, management_threshold(config, field)
+            long_term_metric_scores[field] = management_metric_score(
+                change, config, field
             )
-        long_term_average_rank_move, long_term_rank_modifier = management_rank_block_movement(
-            recent_history_rows, earlier_history_rows, rank_lookup
-        )
-        scored_long_term_direction, long_term_composite_score = management_trend_classification(
+        scored_long_term_direction, long_term_composite_score = classification_from_metric_scores(
             long_term_metric_scores,
-            long_term_rank_modifier,
-            improving_label="Improving",
-            declining_label="Declining",
+            positive_label=RecentMovement.UPWARD.value,
+            negative_label=RecentMovement.DOWNWARD.value,
+            unavailable_label=RecentMovement.NOT_EVALUATED.value,
         )
         long_term_direction = (
             scored_long_term_direction
-            if full_latest and history_label in {"Full", "Developing"}
-            else "Not Scored"
+            if evaluated["full_latest"] and history_label in {"Full", "Developing"}
+            else RecentMovement.NOT_EVALUATED.value
         )
 
-        benchmark_values: dict[str, float | None] = {}
+        benchmark_values = {
+            field: evaluated["peer_references"][field].value
+            for field in SERVER_TREND_FIELDS
+        }
         benchmark_sources: dict[str, str] = {}
         level_statuses: dict[str, str] = {}
         for field in SERVER_TREND_FIELDS:
             target_value = targets.get(location, {}).get(field)
-            benchmark_value = target_value if target_value is not None else (
-                location_baseline.get(field) if location_baseline else None
-            )
-            benchmark_values[field] = benchmark_value
             benchmark_sources[field] = (
-                "Target" if target_value is not None else f"{len(eligible_week_ends)}-week baseline"
+                "Same-store prior-four-week median"
+                if evaluated["peer_references"][field].sufficient
+                else "Reference unavailable"
             )
-            if benchmark_value is None:
+            score = evaluated["peer_scores"][field] if "peer_scores" in evaluated else None
+            if score is None:
                 level_statuses[field] = "Unavailable"
-                continue
-            threshold = management_threshold(config, field)
-            variance = directional_variance(current[field], benchmark_value, threshold)
-            neutral = float(threshold["neutral"])
-            level_statuses[field] = (
-                "Above" if variance >= neutral else "Below" if variance <= -neutral else "On Track"
-            )
-        below_count = sum(status == "Below" for status in level_statuses.values())
-        above_count = sum(status == "Above" for status in level_statuses.values())
-        available_levels = sum(status != "Unavailable" for status in level_statuses.values())
-        if not available_levels:
-            performance_level = "Insufficient History"
-        elif below_count >= 2:
-            performance_level = "Below Benchmark"
-        elif above_count >= 2 and below_count <= 1:
-            performance_level = "Above Benchmark"
-        else:
-            performance_level = "On Track"
+            else:
+                level_statuses[field] = (
+                    "Above"
+                    if score > 0
+                    else "Below"
+                    if score < 0
+                    else "Within"
+                )
+        peer_comparison = evaluated["peer_comparison"]
 
-        if not full_latest:
-            priority, action, confidence = "Monitor", "Monitor", "Incomplete Week"
-        elif not current_sample_eligible:
-            priority, action, confidence = "Monitor", "Monitor", "Low Sample"
-        elif not prominent:
-            priority, action, confidence = "Monitor", "Monitor", "Building History"
-        elif momentum == "Falling" and performance_level == "Below Benchmark":
-            priority, action, confidence = "High", "Coach Now", "High"
-        elif momentum == "Falling":
-            priority, action, confidence = "Medium", "Protect Performance", "High"
-        elif momentum == "Rising" and performance_level == "Below Benchmark":
-            priority, action, confidence = "Medium", "Reinforce Improvement", "High"
-        elif momentum == "Rising":
-            priority, action, confidence = "Recognize", "Recognize & Replicate", "High"
-        elif performance_level == "Below Benchmark":
-            priority, action, confidence = "Medium", "Coach Fundamentals", "High"
+        previous_row = next(
+            (
+                row
+                for row in weekly_server_rows
+                if row["location"] == location
+                and row["raw_user_name"] == current["raw_user_name"]
+                and row["week_end"] == latest_week_end - timedelta(days=7)
+            ),
+            None,
+        )
+        previous_evaluation = evaluation_for(previous_row) if previous_row else None
+        current_candidate = evaluated["candidate"]
+        current_week_signal = WeeklyCandidateSignal(
+            week_end=latest_week_end,
+            polarity=current_candidate.polarity,
+            drivers=current_candidate.agreeing_drivers,
+            qualified=evaluated["candidate_qualified"],
+            leave_one_day_stable=evaluated["day_stable"],
+            store_shock_guard_passed=evaluated["store_shock"].guard_passed,
+        )
+        previous_week_signal = None
+        if previous_row is not None and previous_evaluation is not None:
+            previous_candidate = previous_evaluation["candidate"]
+            previous_week_signal = WeeklyCandidateSignal(
+                week_end=previous_row["week_end"],
+                polarity=previous_candidate.polarity,
+                drivers=previous_candidate.agreeing_drivers,
+                qualified=previous_evaluation["candidate_qualified"],
+                leave_one_day_stable=previous_evaluation["day_stable"],
+                store_shock_guard_passed=previous_evaluation[
+                    "store_shock"
+                ].guard_passed,
+            )
+        persistence = evaluate_two_week_persistence(
+            current_week_signal, previous_week_signal
+        )
+        action = persistence.action.value
+        if action == PromptAction.COACHING_PROMPT.value:
+            priority = "Medium"
+        elif action == PromptAction.RECOGNITION_PROMPT.value:
+            priority = "Recognize"
+        elif action == PromptAction.CONTEXT_REVIEW.value:
+            priority = "Review"
         else:
-            priority, action, confidence = "Monitor", "Monitor", "High"
+            priority = "Monitor"
+        evidence_status = evaluated["evidence_status"]
+        if persistence.reason == "day_sensitive":
+            evidence_status = "Sensitive"
+        prominent = action != PromptAction.MONITOR.value
 
         why_parts = []
         if positive_drivers:
             why_parts.append("Improving: " + "; ".join(positive_drivers[:3]))
         if negative_drivers:
             why_parts.append("Watch: " + "; ".join(negative_drivers[:3]))
-        if average_rank_move is not None and rank_score:
-            why_parts.append(f"Rank movement {average_rank_move:+.1f}")
-        if long_term_direction != "Not Scored":
+        if peer_comparison != PeerComparison.UNAVAILABLE.value:
+            why_parts.append(f"Peer comparison {peer_comparison}")
+        if long_term_direction != RecentMovement.NOT_EVALUATED.value:
             why_parts.append(f"8-week direction {long_term_direction} ({history_label})")
+        if evaluated["store_shock"].common_store_shock:
+            why_parts.append("Common-store movement guard applied")
         row = {
             **current,
             "prior_weeks": len(prior_rows),
-            "prior_guest_count": prior_guest_count,
-            "baseline": baseline,
+            "prior_guest_count": evaluated["prior_guest_count"],
+            "baseline": evaluated["baseline"],
             "changes": changes,
             "metric_scores": metric_scores,
-            "rank_modifier": rank_score,
-            "average_rank_movement": average_rank_move,
-            "composite_score": composite_score,
-            "momentum": momentum,
+            "rank_modifier": 0,
+            "average_rank_movement": None,
+            "composite_score": evaluated["composite_score"],
+            "momentum": movement,
             "long_term_direction": long_term_direction,
             "long_term_history_label": history_label,
             "history_used": history_used,
             "long_term_changes": long_term_changes,
             "long_term_metric_scores": long_term_metric_scores,
-            "long_term_rank_modifier": long_term_rank_modifier,
-            "long_term_average_rank_movement": long_term_average_rank_move,
+            "long_term_rank_modifier": 0,
+            "long_term_average_rank_movement": None,
             "long_term_composite_score": long_term_composite_score,
-            "performance_level": performance_level,
+            "performance_level": peer_comparison,
+            "peer_composite_score": evaluated["peer_composite_score"],
             "benchmark_values": benchmark_values,
             "benchmark_sources": benchmark_sources,
             "level_statuses": level_statuses,
+            "peer_changes": evaluated["peer_changes"],
+            "peer_scores": evaluated["peer_scores"],
+            "combined_scores": evaluated["combined_scores"],
+            "target_values": {
+                field: targets.get(location, {}).get(field)
+                for field in SERVER_TREND_FIELDS
+            },
+            "context_metrics": {
+                "check_count": current.get("check_count", 0.0),
+                "check_count_available": current.get(
+                    "check_count_available", False
+                ),
+                "sales_per_check": current.get("sales_per_check", 0.0),
+                "guests_per_check": current.get("guests_per_check", 0.0),
+                "rate_of_sale_by_guest_count": current.get(
+                    "rate_of_sale_by_guest_count", 0.0
+                ),
+                "rate_available": current.get("rate_available", False),
+                "average_ticket_time_seconds": current.get(
+                    "average_ticket_time_seconds", 0.0
+                ),
+                "ticket_time_available": current.get(
+                    "ticket_time_available", False
+                ),
+                "ticket_time_weight_basis": current.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                ),
+            },
             "positive_drivers": positive_drivers,
             "negative_drivers": negative_drivers,
             "priority": priority,
             "action": action,
-            "confidence": confidence,
+            "confidence": evidence_status,
             "prominent": prominent,
             "why": " | ".join(why_parts) if why_parts else "No material movement",
+            "candidate_polarity": current_candidate.polarity.value,
+            "persistence_reason": persistence.reason,
+            "recurring_driver_fields": list(persistence.recurring_drivers),
+            "stability_result": (
+                "Stable under every active-day removal"
+                if evaluated["day_stable"]
+                else "Sensitive to at least one active-day removal"
+                if evaluated["candidate_qualified"]
+                else "Not applicable"
+            ),
+            "peer_cohort_size": min(
+                reference.distinct_peer_count
+                for reference in evaluated["peer_references"].values()
+            ),
+            "peer_cohort_weeks": min(
+                len(reference.usable_weeks)
+                for reference in evaluated["peer_references"].values()
+            ),
+            "peer_server_weeks": min(
+                reference.peer_week_count
+                for reference in evaluated["peer_references"].values()
+            ),
+            "threshold_version": config.get(
+                "management_threshold_calibration", {}
+            ).get("version", MANAGEMENT_METHODOLOGY_VERSION),
             "evidence_week_ends": [
                 week_end.isoformat()
                 for week_end in sorted(
                     {
                         latest_week_end,
-                        *eligible_week_ends,
+                        *evaluated["prior_week_ends"],
                         *history_week_ends,
                     }
                 )
@@ -4830,12 +6068,9 @@ def management_server_rows(
             ),
         }
         row["recommended_next_step"] = recommended_server_follow_up(row)
-        context = server_trend_context(momentum, long_term_direction)
-        if context:
-            row["recommended_next_step"] = f"{row['recommended_next_step']} {context}"
         output.append(row)
 
-    priority_order = {"High": 0, "Medium": 1, "Recognize": 2, "Monitor": 3}
+    priority_order = {"Medium": 0, "Review": 1, "Recognize": 2, "Monitor": 3}
     output.sort(
         key=lambda row: (
             priority_order.get(row["priority"], 9),
@@ -4857,6 +6092,9 @@ def management_entity_rows(
     if not weekly_rows:
         return []
     baseline_limit = int(config.get("dashboard_baseline_full_weeks", 4))
+    minimum_baseline_weeks = int(
+        config.get("management_min_entity_baseline_weeks", 2)
+    )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in weekly_rows:
         grouped[row[entity_field]].append(row)
@@ -4879,21 +6117,48 @@ def management_entity_rows(
         benchmark_sources: dict[str, str] = {}
         for field, _, _ in MANAGEMENT_METRICS:
             target_value = targets.get(entity, {}).get(field)
-            benchmark_values[field] = target_value if target_value is not None else (
-                baseline.get(field) if baseline else None
+            baseline_value = (
+                baseline.get(field)
+                if baseline
+                and (
+                    field not in SERVER_CONTEXT_FIELDS
+                    or management_metric_available(baseline, field)
+                )
+                else None
+            )
+            benchmark_values[field] = (
+                target_value if target_value is not None else baseline_value
             )
             benchmark_sources[field] = (
-                "Target" if target_value is not None else f"{len(baseline_rows)}-week baseline"
+                "Target"
+                if target_value is not None
+                else f"{len(baseline_rows)}-week baseline"
+                if baseline_value is not None
+                else "Reference unavailable"
             )
 
         prior_changes = {
-            field: latest[field] - prior[field] if prior else None
+            field: (
+                latest[field] - prior[field]
+                if prior
+                and management_metric_available(latest, field)
+                and management_metric_available(prior, field)
+                else None
+            )
             for field, _, _ in MANAGEMENT_METRICS
         }
         benchmark_changes = {
-            field: latest[field] - benchmark_values[field]
-            if benchmark_values[field] is not None
-            else None
+            field: (
+                latest[field] - benchmark_values[field]
+                if benchmark_values[field] is not None
+                and management_metric_available(latest, field)
+                and (
+                    field not in SERVER_CONTEXT_FIELDS
+                    or (baseline is not None and management_metric_available(baseline, field))
+                    or targets.get(entity, {}).get(field) is not None
+                )
+                else None
+            )
             for field, _, _ in MANAGEMENT_METRICS
         }
         materiality = config.get("management_materiality", DEFAULT_CONFIG["management_materiality"])
@@ -4901,43 +6166,46 @@ def management_entity_rows(
         guest_pct = safe_pct_delta(latest["guest_count"], benchmark_values["guest_count"])
         check_change = benchmark_changes["check_average"]
         wine_change = benchmark_changes["wine_pct"]
-        rate_change = benchmark_changes["rate_of_sale_by_guest_count"]
-        ticket_change_minutes = (
-            benchmark_changes["average_ticket_time_seconds"] / 60
-            if benchmark_changes["average_ticket_time_seconds"] is not None
-            else None
-        )
         negative_count = sum(
             [
                 sales_pct is not None and sales_pct <= -float(materiality["sales_pct"]),
                 guest_pct is not None and guest_pct <= -float(materiality["guest_pct"]),
                 check_change is not None and check_change <= -float(materiality["check_average"]),
                 wine_change is not None and wine_change <= -float(materiality["wine_pct"]),
-                rate_change is not None and rate_change >= float(materiality["rate"]),
-                ticket_change_minutes is not None
-                and ticket_change_minutes >= float(materiality["ticket_minutes"]),
             ]
         )
-        if sales_pct is not None and guest_pct is not None and sales_pct <= -float(materiality["sales_pct"]) and guest_pct <= -float(materiality["guest_pct"]):
+        if len(baseline_rows) < minimum_baseline_weeks:
+            priority = "Monitor"
+            status = "Limited History"
+            focus = (
+                f"Wait for at least {minimum_baseline_weeks} complete baseline weeks "
+                "before opening an operational review."
+            )
+        elif sales_pct is not None and guest_pct is not None and sales_pct <= -float(materiality["sales_pct"]) and guest_pct <= -float(materiality["guest_pct"]):
             priority = "High"
             status = "Traffic Watch"
-            focus = "Review traffic drivers, staffing, holidays, and the event calendar."
+            focus = (
+                "What changed in reservations, events, operating hours, staffing, "
+                "or local demand?"
+            )
         elif check_change is not None and wine_change is not None and check_change <= -float(materiality["check_average"]) and wine_change <= -float(materiality["wine_pct"]):
             priority = "Medium"
             status = "Upsell Watch"
-            focus = "Coach check-building and wine attachment opportunities."
-        elif ticket_change_minutes is not None and ticket_change_minutes >= float(materiality["ticket_minutes"]) and negative_count >= 2:
-            priority = "Medium"
-            status = "Service Watch"
-            focus = "Review service flow, table pacing, and section load."
+            focus = (
+                "Did guest mix, menu availability, training, or shift mix explain "
+                "the Sales / Guest and Wine % change?"
+            )
         elif negative_count >= 2:
             priority = "Medium"
             status = "Mixed Watch"
-            focus = "Review the material declines and agree on one management response."
+            focus = (
+                "Which validated movement changed, what operating context explains it, "
+                "and what one follow-up should be assigned?"
+            )
         else:
             priority = "Monitor"
             status = "On Track / Mixed"
-            focus = "No material alert; continue monitoring."
+            focus = "What, if anything, needs follow-up before the next weekly review?"
         output.append(
             {
                 "entity": entity,
@@ -4993,14 +6261,38 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
 
 def validate_action_board_records(
     records: list[dict[str, Any]],
+    *,
+    allowed_reviewers: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Reject pasted status values that Excel list validation can be made to bypass."""
+    """Normalize legacy headers and reject pasted workflow values that bypass Excel."""
     canonical_statuses = {
         status.casefold(): status
         for status in ACTION_STATUS_CHOICES
     }
+    canonical_dispositions = {
+        disposition.casefold(): disposition
+        for disposition in REVIEW_DISPOSITION_CHOICES
+    }
+    allowed_reviewer_keys = (
+        {
+            str(reviewer).strip().casefold()
+            for reviewer in allowed_reviewers
+            if str(reviewer).strip()
+        }
+        if allowed_reviewers is not None
+        else None
+    )
     allowed_text = ", ".join(ACTION_STATUS_CHOICES)
     for row_number, record in enumerate(records, start=5):
+        legacy_schema = "Manager Notes" in record and "Context Notes" not in record
+        for old, new in (
+            ("Manager Notes", "Context Notes"),
+            ("Performance Level", "Peer Comparison"),
+            ("Momentum", "Recent Movement"),
+            ("Confidence", "Evidence Status"),
+        ):
+            if is_blank(record.get(new)) and not is_blank(record.get(old)):
+                record[new] = record.get(old)
         raw_status = record.get("Status")
         status_text = "" if is_blank(raw_status) else str(raw_status).strip()
         canonical_status = canonical_statuses.get(status_text.casefold())
@@ -5012,6 +6304,55 @@ def validate_action_board_records(
                 "No workbooks were created and no source files were moved."
             )
         record["Status"] = canonical_status
+        raw_disposition = record.get("Review Disposition")
+        disposition_text = (
+            "Pending Review"
+            if is_blank(raw_disposition)
+            else str(raw_disposition).strip()
+        )
+        canonical_disposition = canonical_dispositions.get(
+            disposition_text.casefold()
+        )
+        if canonical_disposition is None:
+            action_id = str(record.get("Action ID") or f"row {row_number}")
+            allowed = ", ".join(REVIEW_DISPOSITION_CHOICES)
+            raise ValueError(
+                f"Action Board Review Disposition values must be one of {allowed}; "
+                f"received {raw_disposition!r} for action {action_id!r}. "
+                "No workbooks were created and no source files were moved."
+            )
+        record["Review Disposition"] = canonical_disposition
+        if legacy_schema:
+            record.setdefault("Reviewed By", "")
+            record.setdefault("Review Date", None)
+            continue
+        review_completed = canonical_disposition != "Pending Review"
+        status_requires_review = canonical_status.casefold() not in {
+            "review needed",
+            "open",
+        }
+        if review_completed or status_requires_review:
+            reviewer = str(record.get("Reviewed By") or "").strip()
+            review_date = as_date(record.get("Review Date"))
+            if canonical_disposition == "Pending Review" or not reviewer or review_date is None:
+                action_id = str(record.get("Action ID") or f"row {row_number}")
+                raise ValueError(
+                    f"Action {action_id!r} cannot move to {canonical_status} until "
+                    "Review Disposition, Reviewed By, and Review Date are complete. "
+                    "No workbooks were created and no source files were moved."
+                )
+            if (
+                allowed_reviewer_keys is not None
+                and reviewer.casefold() not in allowed_reviewer_keys
+            ):
+                action_id = str(record.get("Action ID") or f"row {row_number}")
+                raise ValueError(
+                    f"Action {action_id!r} Reviewed By must name an active person "
+                    "from the Owner Roster. No workbooks were created and no "
+                    "source files were moved."
+                )
+            record["Reviewed By"] = excel_safe_text(reviewer)
+            record["Review Date"] = review_date
     return records
 
 
@@ -5211,10 +6552,13 @@ def read_management_state(
             state["owner_roster_capacity"] = owner_roster_capacity_from_sheet(ws)
         if "Action Board" in wb.sheetnames:
             state["active_actions"] = validate_action_board_records(
-                records_from_sheet(wb["Action Board"], "Action ID")
+                records_from_sheet(wb["Action Board"], "Action ID"),
+                allowed_reviewers=state["owners"],
             )
         if "Action History" in wb.sheetnames:
-            state["action_history"] = records_from_sheet(wb["Action History"], "Action ID")
+            state["action_history"] = validate_action_board_records(
+                records_from_sheet(wb["Action History"], "Action ID")
+            )
         if "Evidence Detail" in wb.sheetnames:
             evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
             state["evidence_by_action_id"] = {
@@ -5632,7 +6976,16 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
                 for col in range(1, ws.max_column + 1)
                 if ws.cell(row=header_row, column=col).value
             }
-            for header in ("Status", "Owner", "Due Date", "Manager Notes"):
+            for header in (
+                "Status",
+                "Owner",
+                "Due Date",
+                "Context Notes",
+                "Manager Notes",
+                "Review Disposition",
+                "Reviewed By",
+                "Review Date",
+            ):
                 col = headers.get(header)
                 if col is None:
                     continue
@@ -5919,26 +7272,73 @@ def expected_management_list_validations(
         action_min_col, action_min_row, action_max_col, action_max_row = range_boundaries(
             action_board.tables["ActionBoardTable"].ref
         )
-        if (action_min_col, action_max_col) != (1, len(ACTION_HEADERS)):
+        if action_min_col != 1 or action_max_col not in {
+            len(ACTION_HEADERS),
+            len(LEGACY_ACTION_HEADERS_V1),
+        }:
             raise IntegrityError("The Action Board table has an unexpected shape.")
+        expected_action_headers = (
+            ACTION_HEADERS
+            if action_max_col == len(ACTION_HEADERS)
+            else LEGACY_ACTION_HEADERS_V1
+        )
+        actual_action_headers = [
+            action_board.cell(row=action_min_row, column=column).value
+            for column in range(1, action_max_col + 1)
+        ]
+        if actual_action_headers != expected_action_headers:
+            raise IntegrityError(
+                "The Action Board table headers do not match a supported schema."
+            )
+        action_status_choices = (
+            ACTION_STATUS_CHOICES
+            if action_max_col == len(ACTION_HEADERS)
+            else LEGACY_ACTION_STATUS_CHOICES
+        )
         expected.extend(
             [
                 (
                     "Action Board",
-                    f'"{",".join(ACTION_STATUS_CHOICES)}"',
+                    f'"{",".join(action_status_choices)}"',
                     False,
                     column_range("D", action_min_row + 1, action_max_row),
                     "Action Board status",
                 ),
+            ]
+        )
+        if action_max_col == len(ACTION_HEADERS):
+            expected.extend(
+                [
+                    (
+                        "Action Board",
+                        f"={OWNER_ROSTER_DEFINED_NAME}",
+                        True,
+                        (
+                            column_range("E", action_min_row + 1, action_max_row)
+                            + " "
+                            + column_range("V", action_min_row + 1, action_max_row)
+                        ),
+                        "Action Board owner and reviewer",
+                    ),
+                    (
+                        "Action Board",
+                        f'"{",".join(REVIEW_DISPOSITION_CHOICES)}"',
+                        False,
+                        column_range("U", action_min_row + 1, action_max_row),
+                        "Action Board review disposition",
+                    ),
+                ]
+            )
+        else:
+            expected.append(
                 (
                     "Action Board",
                     f"={OWNER_ROSTER_DEFINED_NAME}",
                     True,
                     column_range("E", action_min_row + 1, action_max_row),
                     "Action Board owner",
-                ),
-            ]
-        )
+                )
+            )
     elif records_from_sheet(action_board, "Action ID"):
         raise IntegrityError("The Action Board table is missing.")
     return expected
@@ -6025,9 +7425,12 @@ def validate_management_workbook_controls(
         raise IntegrityError("Management Setup is missing a required protected input table.")
     if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
         raise IntegrityError("The active-owner workbook name is missing.")
-    owner_roster_from_sheet(setup)
+    owner_roster = owner_roster_from_sheet(setup)
     action_board = wb["Action Board"]
-    validate_action_board_records(records_from_sheet(action_board, "Action ID"))
+    validate_action_board_records(
+        records_from_sheet(action_board, "Action ID"),
+        allowed_reviewers=active_owner_names(owner_roster),
+    )
     return setup, action_board
 
 
@@ -6065,7 +7468,113 @@ def require_pre_contract_list_validations(wb: Workbook) -> None:
             )
 
 
-def validate_management_workbook(path: Path, expected_digest: str | None = None) -> str:
+def workbook_color_suffix(color: Any) -> str | None:
+    value = getattr(color, "rgb", None)
+    return str(value)[-6:].upper() if value else None
+
+
+def require_current_workbook_usability_contract(
+    wb: Workbook,
+    *,
+    previous_v2: bool = False,
+    previous_tab_navigation: bool = False,
+) -> None:
+    """Require the exact current or immediately preceding usability contract."""
+
+    if not wb.sheetnames or wb.sheetnames[0] != "How to Use":
+        raise IntegrityError("How to Use must be the first worksheet.")
+    guide = wb["How to Use"]
+    if guide.sheet_state != "visible":
+        raise IntegrityError("How to Use must remain visible.")
+    if any(cell.protection.locked is False for cell in guide._cells.values()):
+        raise IntegrityError("How to Use must contain no editable cells.")
+    if guide._charts or guide._images:
+        raise IntegrityError("How to Use must not contain drawings.")
+    if any(cell.comment is not None for cell in guide._cells.values()):
+        raise IntegrityError("How to Use must not contain comments.")
+    if guide.freeze_panes != "A3":
+        raise IntegrityError("How to Use must freeze the title and navigation rows.")
+    if guide.sheet_view.zoomScale != 85:
+        raise IntegrityError("How to Use must use the approved 85% zoom.")
+    for column in range(1, 13):
+        letter = get_column_letter(column)
+        if guide.column_dimensions[letter].width != 13:
+            raise IntegrityError("How to Use must use uniform A:L column widths.")
+    guide_text = {
+        str(cell.value)
+        for cell in guide._cells.values()
+        if cell.value not in (None, "")
+    }
+    missing_headings = [
+        heading for heading in HOW_TO_USE_SECTION_HEADINGS if heading not in guide_text
+    ]
+    if missing_headings:
+        raise IntegrityError(
+            "How to Use is missing required section headings: "
+            + ", ".join(missing_headings)
+        )
+    methodology_version = (
+        PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION
+        if previous_v2
+        else MANAGEMENT_METHODOLOGY_VERSION
+    )
+    rate_guidance = (
+        PREVIOUS_RATE_OF_SALE_GUIDANCE
+        if previous_v2
+        else "Rate of Sale is opportunities divided by qualifying sales"
+    )
+    ticket_guidance = (
+        PREVIOUS_TICKET_TIME_GUIDANCE
+        if previous_v2
+        else "Ticket Time is weighted only by complete Check Count coverage"
+    )
+    required_guide_phrases = (
+        methodology_version,
+        "never be the sole or determinative basis",
+        "Do not infer protected characteristics from names.",
+        "ExternalCheckRequired",
+        "D — Status",
+        "E — Owner",
+        "F — Due Date",
+        "N — Context Notes",
+        "U — Review Disposition",
+        "V — Reviewed By",
+        "W — Review Date",
+        rate_guidance,
+        ticket_guidance,
+    )
+    flattened_guide_text = "\n".join(sorted(guide_text))
+    missing_phrases = [
+        phrase for phrase in required_guide_phrases if phrase not in flattened_guide_text
+    ]
+    missing_phrases.extend(
+        choice
+        for choice in (*ACTION_STATUS_CHOICES, *REVIEW_DISPOSITION_CHOICES)
+        if choice not in flattened_guide_text
+    )
+    if missing_phrases:
+        raise IntegrityError(
+            "How to Use is missing required operating guidance: "
+            + ", ".join(missing_phrases)
+        )
+    if "NotChecked" in flattened_guide_text:
+        raise IntegrityError(
+            "How to Use contains obsolete readiness terminology."
+        )
+
+    if previous_v2 or previous_tab_navigation:
+        require_legacy_tab_navigation_contract(wb, previous_v2=previous_v2)
+    else:
+        require_management_menu_contract(wb)
+
+
+def validate_management_workbook(
+    path: Path,
+    expected_digest: str | None = None,
+    *,
+    previous_v2_usability: bool = False,
+    previous_tab_navigation: bool = False,
+) -> str:
     """Validate protection, visibility, editable cells, tables, and digest."""
     reject_unapproved_workbook_drawings(path)
     wb = load_workbook(path, data_only=False)
@@ -6078,6 +7587,12 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
         setup, action_board = validate_management_workbook_controls(
             wb, protect_objects_and_scenarios=True
         )
+        if "How to Use" in VISIBLE_MANAGEMENT_SHEETS:
+            require_current_workbook_usability_contract(
+                wb,
+                previous_v2=previous_v2_usability,
+                previous_tab_navigation=previous_tab_navigation,
+            )
         expected_validations = expected_management_list_validations(wb)
         require_exact_validation_count(
             wb, expected_validations, contract_label="strict protection-contract"
@@ -6104,6 +7619,86 @@ def validate_management_workbook(path: Path, expected_digest: str | None = None)
             "Master workbook generated-content verification failed: "
             f"expected {required_digest or 'a stamped digest'}; actual {actual_digest}. "
             "No outputs were replaced and no active source files were moved."
+        )
+    return actual_digest
+
+
+def validate_pre_guide_management_workbook(path: Path, expected_digest: str) -> str:
+    """Verify the exact protected v0.3.1 workbook before adding the guide."""
+
+    required_digest = str(expected_digest).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
+        raise IntegrityError("The pre-guide workbook requires a valid recorded digest.")
+    reject_unapproved_workbook_drawings(path)
+    wb = load_workbook(path, data_only=False)
+    try:
+        if stamped_workbook_protection_contract(wb) != WORKBOOK_PROTECTION_CONTRACT:
+            raise IntegrityError("The pre-guide workbook protection contract is unsupported.")
+        validate_management_workbook_controls(
+            wb,
+            protect_objects_and_scenarios=True,
+            visible_sheets=PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS,
+        )
+        expected_validations = expected_management_list_validations(wb)
+        require_exact_validation_count(
+            wb, expected_validations, contract_label="pre-guide v0.3.1 schema"
+        )
+        for sheet_name, formula1, allow_blank, sqref, label in expected_validations:
+            require_stop_style_list_validation(
+                wb[sheet_name],
+                formula1=formula1,
+                label=label,
+                allow_blank=allow_blank,
+                sqref=sqref,
+            )
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    actual_digest = workbook_generated_content_sha256(path)
+    if stamped != required_digest or actual_digest != required_digest:
+        raise IntegrityError(
+            "Pre-guide workbook verification failed: the recorded, stamped, and actual "
+            "generated-content digests must match exactly."
+        )
+    return actual_digest
+
+
+def validate_v1_action_focus_workbook(path: Path, expected_digest: str) -> str:
+    """Verify the exact v0.2.x protected workbook before one-way v2 migration."""
+
+    required_digest = str(expected_digest).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
+        raise IntegrityError("The v1 workbook requires a valid recorded digest.")
+    reject_unapproved_workbook_drawings(path)
+    wb = load_workbook(path, data_only=False)
+    try:
+        if stamped_workbook_protection_contract(wb) != WORKBOOK_PROTECTION_CONTRACT:
+            raise IntegrityError("The v1 workbook protection contract is unsupported.")
+        validate_management_workbook_controls(
+            wb,
+            protect_objects_and_scenarios=True,
+            visible_sheets=LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS,
+        )
+        expected_validations = expected_management_list_validations(wb)
+        require_exact_validation_count(
+            wb, expected_validations, contract_label="v1 action-focus schema"
+        )
+        for sheet_name, formula1, allow_blank, sqref, label in expected_validations:
+            require_stop_style_list_validation(
+                wb[sheet_name],
+                formula1=formula1,
+                label=label,
+                allow_blank=allow_blank,
+                sqref=sqref,
+            )
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    actual_digest = workbook_generated_content_sha256(path)
+    if stamped != required_digest or actual_digest != required_digest:
+        raise IntegrityError(
+            "V1 workbook verification failed: the recorded, stamped, and actual "
+            "generated-content digests must match exactly."
         )
     return actual_digest
 
@@ -6167,12 +7762,19 @@ def validate_pre_contract_management_workbook(path: Path, expected_digest: str) 
             raise IntegrityError(
                 "The compatibility verifier only accepts a markerless pre-contract workbook."
             )
+        has_action_focus_schema = all(
+            name in wb.sheetnames
+            for name in ("Action Focus", "Evidence Detail")
+        )
         legacy_visible_sheets = (
-            VISIBLE_MANAGEMENT_SHEETS
-            if all(
-                name in wb.sheetnames
-                for name in ("Action Focus", "Evidence Detail")
+            LEGACY_V1_VISIBLE_MANAGEMENT_SHEETS
+            if (
+                has_action_focus_schema
+                and "Rising & Falling Stars" in wb.sheetnames
+                and "Recent Movement Signals" not in wb.sheetnames
             )
+            else PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS
+            if has_action_focus_schema
             else PRE_ACTION_FOCUS_VISIBLE_MANAGEMENT_SHEETS
         )
         validate_management_workbook_controls(
@@ -6206,6 +7808,71 @@ def pre_contract_management_workbook(path: Path) -> bool:
         wb.close()
 
 
+def workbook_uses_previous_v2_usability(wb: Workbook) -> bool:
+    if (
+        stamped_workbook_protection_contract(wb)
+        != WORKBOOK_PROTECTION_CONTRACT
+        or "How to Use" not in wb.sheetnames
+    ):
+        return False
+    guide_text = "\n".join(
+        str(cell.value)
+        for cell in wb["How to Use"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    return (
+        PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
+        and MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+    )
+
+
+def workbook_uses_legacy_multi_link_navigation(wb: Workbook) -> bool:
+    """Identify the exact manifest-bound v3 layout emitted before the menu bar."""
+
+    if (
+        stamped_workbook_protection_contract(wb)
+        != WORKBOOK_PROTECTION_CONTRACT
+        or "How to Use" not in wb.sheetnames
+        or any(
+            name not in wb.sheetnames
+            for name in VISIBLE_MANAGEMENT_SHEETS
+        )
+    ):
+        return False
+    guide_text = "\n".join(
+        str(cell.value)
+        for cell in wb["How to Use"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    if (
+        MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+        or PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
+    ):
+        return False
+    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
+    return all(
+        [
+            ws.cell(row=2, column=column).value
+            for column in management_navigation_columns(ws)
+        ]
+        == expected_labels
+        for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS)
+    )
+
+
+def management_workbook_upgrade_pending(path: Path) -> bool:
+    if pre_contract_management_workbook(path):
+        return True
+    wb = load_workbook(path, data_only=False)
+    try:
+        return (
+            workbook_uses_previous_v2_usability(wb)
+            or workbook_uses_legacy_multi_link_navigation(wb)
+        )
+    finally:
+        wb.close()
+
+
 def verify_existing_management_workbook_integrity(
     path: Path,
     *,
@@ -6227,11 +7894,68 @@ def verify_existing_management_workbook_integrity(
         has_action_focus_schema = all(
             name in wb.sheetnames for name in ("Action Focus", "Evidence Detail")
         )
+        has_how_to_use_schema = "How to Use" in wb.sheetnames
+        has_previous_v2_usability = workbook_uses_previous_v2_usability(wb)
+        has_legacy_multi_link_navigation = (
+            workbook_uses_legacy_multi_link_navigation(wb)
+        )
+        action_headers = (
+            {
+                str(cell.value)
+                for cell in wb["Action Board"][4]
+                if cell.value is not None
+            }
+            if "Action Board" in wb.sheetnames
+            else set()
+        )
+        has_v2_action_schema = {
+            "Context Notes",
+            "Review Disposition",
+            "Evidence Status",
+        }.issubset(action_headers)
     finally:
         wb.close()
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
+        if has_v2_action_schema:
+            if has_how_to_use_schema:
+                if has_previous_v2_usability:
+                    if (
+                        not allow_legacy_protection_upgrade
+                        or expected_digest is None
+                    ):
+                        raise IntegrityError(
+                            "The existing master workbook predates the current "
+                            "usability contract. It may be upgraded only when its "
+                            "exact digest is pinned by the verified integrity manifest."
+                        )
+                    return validate_management_workbook(
+                        path,
+                        expected_digest,
+                        previous_v2_usability=True,
+                    )
+                if has_legacy_multi_link_navigation:
+                    if (
+                        not allow_legacy_protection_upgrade
+                        or expected_digest is None
+                    ):
+                        raise IntegrityError(
+                            "The existing master workbook predates the current "
+                            "navigation contract. It may be upgraded only when its "
+                            "exact digest is pinned by the verified integrity manifest."
+                        )
+                    return validate_management_workbook(
+                        path,
+                        expected_digest,
+                        previous_tab_navigation=True,
+                    )
+                return validate_management_workbook(path, expected_digest or stamped)
+            return validate_pre_guide_management_workbook(
+                path, expected_digest or stamped or ""
+            )
         if has_action_focus_schema:
-            return validate_management_workbook(path, expected_digest or stamped)
+            return validate_v1_action_focus_workbook(
+                path, expected_digest or stamped or ""
+            )
         return validate_previous_action_schema_workbook(
             path, expected_digest or stamped or ""
         )
@@ -6268,7 +7992,7 @@ def compact_server_evidence(row: dict[str, Any]) -> str:
         parts.append("Improving: " + "; ".join(row["positive_drivers"][:2]))
     if row["negative_drivers"]:
         parts.append("Watch: " + "; ".join(row["negative_drivers"][:2]))
-    if row.get("long_term_direction") != "Not Scored":
+    if row.get("long_term_direction") != RecentMovement.NOT_EVALUATED.value:
         parts.append(
             f"8-week {row['long_term_direction']} ({row['long_term_history_label']})"
         )
@@ -6278,6 +8002,9 @@ def compact_server_evidence(row: dict[str, Any]) -> str:
 
 def stable_action_code(action: Any) -> str:
     codes = {
+        "coaching prompt": "COACHING_PROMPT",
+        "recognition prompt": "RECOGNITION_PROMPT",
+        "context review": "CONTEXT_REVIEW",
         "coach now": "COACH_NOW",
         "protect performance": "PROTECT_PERFORMANCE",
         "reinforce improvement": "REINFORCE_IMPROVEMENT",
@@ -6295,24 +8022,28 @@ def stable_action_code(action: Any) -> str:
 
 def stable_reason_code(signal: dict[str, Any]) -> str:
     action = str(signal.get("Action") or "").strip().casefold()
-    momentum = str(signal.get("Momentum") or "").strip().casefold()
-    performance = str(signal.get("Performance Level") or "").strip().casefold()
+    movement = str(
+        signal.get("Recent Movement", signal.get("Momentum")) or ""
+    ).strip().casefold()
+    comparison = str(
+        signal.get("Peer Comparison", signal.get("Performance Level")) or ""
+    ).strip().casefold()
     entity_key = str(signal.get("Entity Key") or "").casefold()
     if action == "data quality":
         return "DQ_INCOMPLETE_LATEST_WEEK"
     if action == "paused carryover":
         return "LATEST_WEEK_INCOMPLETE_PRIOR_ACTION_RETAINED"
     if entity_key.startswith("server|"):
-        if momentum == "falling" and performance == "below benchmark":
-            return "SERVER_FALLING_BELOW_BENCHMARK"
-        if momentum == "falling":
-            return "SERVER_FALLING"
-        if momentum == "rising" and performance == "below benchmark":
-            return "SERVER_RISING_BELOW_BENCHMARK"
-        if momentum == "rising":
-            return "SERVER_RISING"
-        if performance == "below benchmark":
-            return "SERVER_BELOW_BENCHMARK"
+        if action == "coaching prompt":
+            return "SERVER_TWO_WEEK_DOWNWARD_BELOW_PEER_STABLE"
+        if action == "recognition prompt":
+            return "SERVER_TWO_WEEK_UPWARD_ABOVE_PEER_STABLE"
+        if action == "context review":
+            if movement == "downward" and comparison == "below peer reference":
+                return "SERVER_DOWNWARD_BELOW_PEER_CONTEXT_REVIEW"
+            if movement == "upward" and comparison == "above peer reference":
+                return "SERVER_UPWARD_ABOVE_PEER_CONTEXT_REVIEW"
+            return "SERVER_CONTEXT_REVIEW"
         return "SERVER_MATERIAL_SIGNAL"
     if entity_key.startswith("store|"):
         return "STORE_" + stable_action_code(signal.get("Signal"))
@@ -6363,10 +8094,95 @@ def enrich_management_signal(signal: dict[str, Any]) -> dict[str, Any]:
                 sort_keys=True,
                 separators=(",", ":"),
             ),
+            "Comparator Type": enriched.get(
+                "Comparator Type", "Same-store prior-four-week median"
+            ),
+            "Peer Cohort Size": enriched.get("Peer Cohort Size", 0),
+            "Peer Cohort Weeks": enriched.get("Peer Cohort Weeks", 0),
+            "Threshold Version": enriched.get(
+                "Threshold Version", MANAGEMENT_METHODOLOGY_VERSION
+            ),
+            "Evidence Status": enriched.get(
+                "Evidence Status",
+                enriched.get("Confidence", ""),
+            ),
+            "Recurring Drivers": enriched.get("Recurring Drivers", ""),
+            "Stability Result": enriched.get("Stability Result", ""),
             "Methodology Version": MANAGEMENT_METHODOLOGY_VERSION,
         }
     )
     return enriched
+
+
+CONTEXT_ONLY_EVIDENCE_KEYS = frozenset(
+    {
+        *SERVER_CONTEXT_FIELDS,
+        "check_count",
+        "check_count_available",
+        "sales_per_check",
+        "guests_per_check",
+        "rate_available",
+        "ticket_time_available",
+        "ticket_time_weight_basis",
+        "context_only_metrics",
+        "target_values_context_only",
+    }
+)
+
+
+def decision_only_evidence(value: Any) -> Any:
+    """Remove operational context that must not reopen a people-review decision."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): decision_only_evidence(item)
+            for key, item in value.items()
+            if str(key) not in CONTEXT_ONLY_EVIDENCE_KEYS
+        }
+    if isinstance(value, list):
+        return [decision_only_evidence(item) for item in value]
+    return value
+
+
+def review_reset_fingerprint(action: dict[str, Any]) -> str:
+    """Hash only evidence allowed to reset a saved review disposition."""
+
+    raw_metric_evidence = action.get(
+        "Metric Evidence", action.get("_metric_evidence", {})
+    )
+    if isinstance(raw_metric_evidence, str):
+        try:
+            metric_evidence = json.loads(raw_metric_evidence)
+        except json.JSONDecodeError:
+            metric_evidence = {"unparsed_metric_evidence": raw_metric_evidence}
+    elif isinstance(raw_metric_evidence, dict):
+        metric_evidence = raw_metric_evidence
+    else:
+        metric_evidence = {}
+    last_seen = action.get("Last Seen")
+    if isinstance(last_seen, (date, datetime)):
+        last_seen = last_seen.isoformat()
+    payload = {
+        "entity_key": action.get("Entity Key"),
+        "last_seen": last_seen,
+        "action_code": action.get("Action Code")
+        or stable_action_code(action.get("Action")),
+        "reason_code": action.get("Reason Code") or stable_reason_code(action),
+        "evidence_week_ends": action.get("Evidence Week Ends")
+        or action.get("_evidence_week_ends", []),
+        "metric_evidence": decision_only_evidence(metric_evidence),
+        "comparator_type": action.get("Comparator Type"),
+        "peer_cohort_size": action.get("Peer Cohort Size"),
+        "peer_cohort_weeks": action.get("Peer Cohort Weeks"),
+        "threshold_version": action.get("Threshold Version"),
+        "evidence_status": action.get("Evidence Status"),
+        "recurring_drivers": action.get("Recurring Drivers"),
+        "stability_result": action.get("Stability Result"),
+        "methodology_version": action.get(
+            "Methodology Version", MANAGEMENT_METHODOLOGY_VERSION
+        ),
+    }
+    return canonical_json_sha256(payload)
 
 
 def refresh_management_evidence(
@@ -6421,13 +8237,23 @@ def refresh_management_evidence(
         metric_evidence = {
             "signal": refreshed.get("Signal"),
             "why_it_matters": refreshed.get("Why It Matters"),
-            "confidence": refreshed.get("Confidence"),
+            "evidence_status": refreshed.get(
+                "Evidence Status", refreshed.get("Confidence")
+            ),
             "provenance_status": (
                 "Legacy action carried forward before row-level source evidence "
                 "was introduced."
             ),
         }
-    for field in ACTION_EVIDENCE_FIELDS:
+    for field in (
+        "Evidence ID",
+        "Action Code",
+        "Reason Code",
+        "Evidence Week Ends",
+        "Evidence Sources",
+        "Metric Evidence",
+        "Methodology Version",
+    ):
         refreshed.pop(field, None)
     refreshed.update(
         {
@@ -6451,7 +8277,11 @@ def build_management_action_signals(
     for row in server_rows if analytical_ready else []:
         if not row["prominent"] or row["action"] == "Monitor":
             continue
-        family = "recognition" if row["action"] == "Recognize & Replicate" else "coaching"
+        family = (
+            "recognition"
+            if row.get("candidate_polarity") == CandidatePolarity.POSITIVE.value
+            else "coaching"
+        )
         entity_key = "|".join(
             ["server", row["location"], str(row["raw_user_name"]), family]
         ).casefold()
@@ -6468,24 +8298,49 @@ def build_management_action_signals(
                 ),
                 "Why It Matters": compact_server_evidence(row),
                 "Recommended Next Step": row["recommended_next_step"],
-                "Performance Level": row["performance_level"],
-                "Momentum": row["momentum"],
-                "Confidence": row["confidence"],
+                "Peer Comparison": row["performance_level"],
+                "Recent Movement": row["momentum"],
+                "Evidence Status": row["confidence"],
+                "Comparator Type": "Same-store prior-four-week median",
+                "Peer Cohort Size": row.get("peer_cohort_size", 0),
+                "Peer Cohort Weeks": row.get("peer_cohort_weeks", 0),
+                "Threshold Version": row.get(
+                    "threshold_version", MANAGEMENT_METHODOLOGY_VERSION
+                ),
+                "Recurring Drivers": ", ".join(
+                    row.get("recurring_driver_fields", []) or []
+                ),
+                "Stability Result": row.get("stability_result", ""),
                 "Last Seen": row["week_end"],
                 "_evidence_week_ends": row.get("evidence_week_ends", []),
                 "_source_evidence": row.get("source_evidence", []),
                 "_metric_evidence": {
+                    "decision_metric_fields": list(SERVER_PERSON_ACTION_FIELDS),
                     "current_sample": {
                         "guest_count": row.get("guest_count"),
+                        "check_count": row.get("check_count"),
+                        "check_count_available": row.get(
+                            "check_count_available", False
+                        ),
                         "active_days": row.get("active_days"),
                     },
                     "recent_changes": row.get("changes"),
                     "recent_metric_scores": row.get("metric_scores"),
+                    "peer_changes": row.get("peer_changes"),
+                    "peer_metric_scores": row.get("peer_scores"),
+                    "combined_metric_scores": row.get("combined_scores"),
                     "long_term_changes": row.get("long_term_changes"),
                     "long_term_metric_scores": row.get("long_term_metric_scores"),
                     "benchmark_values": row.get("benchmark_values"),
                     "benchmark_sources": row.get("benchmark_sources"),
+                    "target_values_context_only": row.get("target_values"),
+                    "peer_cohort_size": row.get("peer_cohort_size"),
+                    "peer_cohort_weeks": row.get("peer_cohort_weeks"),
+                    "peer_server_weeks": row.get("peer_server_weeks"),
+                    "persistence_reason": row.get("persistence_reason"),
+                    "stability_result": row.get("stability_result"),
                     "history_used": row.get("history_used"),
+                    "context_only_metrics": row.get("context_metrics"),
                 },
             }
         )
@@ -6513,16 +8368,41 @@ def build_management_action_signals(
                         else "Material movement requires management review"
                     ),
                     "Recommended Next Step": row["recommended_focus"],
-                    "Performance Level": row["status"],
-                    "Momentum": "Watch",
-                    "Confidence": "High" if row["baseline_weeks"] >= 2 else "Low Sample",
+                    "Peer Comparison": row["status"],
+                    "Recent Movement": "Operational Watch",
+                    "Evidence Status": (
+                        "Eligible" if row["baseline_weeks"] >= 2 else "Limited History"
+                    ),
+                    "Comparator Type": "Store/group rolling baseline",
+                    "Peer Cohort Size": 0,
+                    "Peer Cohort Weeks": row["baseline_weeks"],
+                    "Threshold Version": MANAGEMENT_METHODOLOGY_VERSION,
+                    "Recurring Drivers": "",
+                    "Stability Result": "Not applicable",
                     "Last Seen": latest["week_end"],
                     "_evidence_week_ends": row.get("evidence_week_ends", []),
                     "_source_evidence": row.get("source_evidence", []),
                     "_metric_evidence": {
-                        "latest": {
+                        "decision_metrics": {
                             field: latest.get(field)
-                            for field, _, _ in MANAGEMENT_METRICS
+                            for field in (
+                                "gross_sales",
+                                "guest_count",
+                                *SERVER_PERSON_ACTION_FIELDS,
+                            )
+                        },
+                        "context_only_metrics": {
+                            field: latest.get(field)
+                            for field in (
+                                "check_count",
+                                "check_count_available",
+                                "sales_per_check",
+                                "guests_per_check",
+                                *SERVER_CONTEXT_FIELDS,
+                                "rate_available",
+                                "ticket_time_available",
+                                "ticket_time_weight_basis",
+                            )
                         },
                         "benchmark_values": row.get("benchmark_values"),
                         "benchmark_sources": row.get("benchmark_sources"),
@@ -6554,10 +8434,13 @@ def build_management_action_signals(
                     "Action": "Data Quality",
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": detail,
-                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
-                    "Performance Level": "Preliminary",
-                    "Momentum": "Not Scored",
-                    "Confidence": "Low Sample",
+                    "Recommended Next Step": (
+                        "Which source reports are missing or incomplete, and who will "
+                        "confirm them before any people review?"
+                    ),
+                    "Peer Comparison": "Preliminary",
+                    "Recent Movement": "Not Evaluated",
+                    "Evidence Status": "Incomplete Week",
                     "Last Seen": readiness.latest_week_end,
                     "_evidence_week_ends": [readiness.latest_week_end.isoformat()],
                     "_source_evidence": (
@@ -6582,10 +8465,13 @@ def build_management_action_signals(
                     "Action": "Data Quality",
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": f"Missing {readiness.missing_text}",
-                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
-                    "Performance Level": "Preliminary",
-                    "Momentum": "Not Scored",
-                    "Confidence": "Low Sample",
+                    "Recommended Next Step": (
+                        "Which source reports are missing or incomplete, and who will "
+                        "confirm them before any people review?"
+                    ),
+                    "Peer Comparison": "Preliminary",
+                    "Recent Movement": "Not Evaluated",
+                    "Evidence Status": "Incomplete Week",
                     "Last Seen": readiness.latest_week_end,
                     "_evidence_week_ends": [readiness.latest_week_end.isoformat()],
                     "_source_evidence": merged_source_evidence(
@@ -6616,10 +8502,13 @@ def build_management_action_signals(
                     "Action": "Data Quality",
                     "Signal": "Incomplete Latest Week",
                     "Why It Matters": f"{row['source_days']} of {OPERATING_WEEK_DAYS} source days",
-                    "Recommended Next Step": "Confirm the missing reports before using trends for coaching.",
-                    "Performance Level": "Preliminary",
-                    "Momentum": "Not Scored",
-                    "Confidence": "Low Sample",
+                    "Recommended Next Step": (
+                        "Which source reports are missing or incomplete, and who will "
+                        "confirm them before any people review?"
+                    ),
+                    "Peer Comparison": "Preliminary",
+                    "Recent Movement": "Not Evaluated",
+                    "Evidence Status": "Incomplete Week",
                     "Last Seen": latest_week_end,
                     "_evidence_week_ends": [latest_week_end.isoformat()],
                     "_source_evidence": row.get("source_evidence", []),
@@ -6643,7 +8532,11 @@ def merge_management_actions(
         enriched_prior = dict(row)
         evidence = evidence_by_action_id.get(str(row.get("Action ID")), {})
         enriched_prior.update(
-            {field: evidence.get(field) for field in ACTION_EVIDENCE_FIELDS}
+            {
+                field: evidence[field]
+                for field in ACTION_EVIDENCE_FIELDS
+                if field in evidence
+            }
         )
         prior_rows.append(enriched_prior)
     prior_active = {
@@ -6656,7 +8549,11 @@ def merge_management_actions(
         enriched_history = dict(row)
         evidence = evidence_by_action_id.get(str(row.get("Action ID")), {})
         enriched_history.update(
-            {field: evidence.get(field) for field in ACTION_EVIDENCE_FIELDS}
+            {
+                field: evidence[field]
+                for field in ACTION_EVIDENCE_FIELDS
+                if field in evidence
+            }
         )
         history.append(enriched_history)
     current: list[dict[str, Any]] = []
@@ -6671,10 +8568,32 @@ def merge_management_actions(
         if prior and prior_status not in completed_statuses:
             first_seen = as_date(prior.get("First Seen")) or last_seen
             action_id = str(prior.get("Action ID") or action_episode_id(key, first_seen))
-            status = prior.get("Status") or "Open"
+            status = prior.get("Status") or "Review Needed"
+            if (
+                "Review Disposition" not in prior
+                and str(status).casefold() in {"open", "in progress", "blocked"}
+            ):
+                status = "Review Needed"
             owner = prior.get("Owner") or ""
             due_date = as_date(prior.get("Due Date"))
-            notes = prior.get("Manager Notes") or ""
+            notes = prior.get("Context Notes", prior.get("Manager Notes")) or ""
+            same_evidence = (
+                str(prior.get("Evidence ID") or "")
+                == str(signal.get("Evidence ID") or "")
+                or review_reset_fingerprint(prior)
+                == review_reset_fingerprint(signal)
+            )
+            if not same_evidence:
+                status = "Review Needed"
+            review_disposition = (
+                prior.get("Review Disposition") or "Pending Review"
+                if same_evidence
+                else "Pending Review"
+            )
+            reviewed_by = prior.get("Reviewed By") or "" if same_evidence else ""
+            review_date = (
+                as_date(prior.get("Review Date")) if same_evidence else None
+            )
         else:
             if prior:
                 completed = dict(prior)
@@ -6682,7 +8601,12 @@ def merge_management_actions(
                 history.append(completed)
             first_seen = last_seen
             action_id = action_episode_id(key, first_seen)
-            status, owner, due_date, notes = "Open", "", None, ""
+            status, owner, due_date, notes = "Review Needed", "", None, ""
+            review_disposition, reviewed_by, review_date = (
+                "Pending Review",
+                "",
+                None,
+            )
         weeks_open = max(1, ((last_seen - first_seen).days // 7) + 1)
         current.append(
             {
@@ -6693,8 +8617,11 @@ def merge_management_actions(
                 "Due Date": due_date,
                 "First Seen": first_seen,
                 "Weeks Open": weeks_open,
-                "Manager Notes": notes,
+                "Context Notes": notes,
                 "Signal State": "Current",
+                "Review Disposition": review_disposition,
+                "Reviewed By": reviewed_by,
+                "Review Date": review_date,
             }
         )
     for key, prior in prior_active.items():
@@ -6712,6 +8639,16 @@ def merge_management_actions(
             and not is_data_quality
         ):
             paused = dict(prior)
+            if "Review Disposition" not in paused:
+                paused["Status"] = "Review Needed"
+                paused["Context Notes"] = (
+                    paused.get("Context Notes")
+                    or paused.get("Manager Notes")
+                    or ""
+                )
+                paused["Review Disposition"] = "Pending Review"
+                paused["Reviewed By"] = ""
+                paused["Review Date"] = None
             prior_last_seen = as_date(paused.get("Last Seen"))
             first_seen = (
                 as_date(paused.get("First Seen"))
@@ -6741,9 +8678,9 @@ def merge_management_actions(
                 "Keep the manual assignment on hold until a complete week can confirm, "
                 "update, or clear the prior signal."
             )
-            paused["Performance Level"] = "Preliminary"
-            paused["Momentum"] = "Not Scored"
-            paused["Confidence"] = "Paused"
+            paused["Peer Comparison"] = "Preliminary"
+            paused["Recent Movement"] = "Not Evaluated"
+            paused["Evidence Status"] = "Paused"
             paused["Signal State"] = "Paused / Carryover"
             paused_context = {
                 "latest_week_end": (
@@ -6859,33 +8796,670 @@ def remove_sheet_if_present(wb: Workbook, name: str) -> None:
         wb.remove(wb[name])
 
 
-def add_management_navigation(ws) -> None:
-    links = [
-        ("Dashboard", "Dashboard"),
-        ("Focus", "Action Focus"),
-        ("Actions", "Action Board"),
-        ("Servers", "Server Scorecard"),
-        ("Stores", "Store & Group Scorecards"),
-        ("Stars", "Rising & Falling Stars"),
-        ("Evidence", "Evidence Detail"),
-        ("Quality", "Data Quality"),
-        ("Setup", "Management Setup"),
+def management_navigation_columns(ws) -> tuple[int, ...]:
+    """Return the legacy 12-link columns and current menu-bar bounds."""
+
+    columns: list[int] = []
+    column = 1
+    while len(columns) < len(MANAGEMENT_NAVIGATION_LINKS):
+        letter = get_column_letter(column)
+        if ws.column_dimensions[letter].hidden is not True:
+            columns.append(column)
+        column += 1
+        if column > 256:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} has too few visible columns for navigation."
+            )
+    return tuple(columns)
+
+
+def management_menu_bounds(ws) -> tuple[int, int]:
+    """Return the visible start and end columns for the uniform workbook menu."""
+
+    navigation_columns = management_navigation_columns(ws)
+    return navigation_columns[0], navigation_columns[-1]
+
+
+def require_management_title_and_freeze_contract(ws) -> None:
+    title_merges = [
+        merged
+        for merged in ws.merged_cells.ranges
+        if merged.min_row == merged.max_row == 1
+        and merged.min_col == 1
+        and merged.max_col >= 12
     ]
-    for col, (label, target) in enumerate(links, start=1):
-        cell = ws.cell(row=2, column=col, value=label)
-        cell.hyperlink = f"#'{target}'!A1"
-        cell.font = Font(color="7A1E1E", bold=True, underline="single", size=9)
-        cell.alignment = Alignment(horizontal="center")
+    if len(title_merges) != 1:
+        raise IntegrityError(
+            f"Worksheet {ws.title!r} title band must extend through column L."
+        )
+    frozen_at = ws.freeze_panes
+    if hasattr(frozen_at, "coordinate"):
+        frozen_at = frozen_at.coordinate
+    frozen_row_match = re.search(r"\d+", str(frozen_at or ""))
+    if not frozen_row_match or int(frozen_row_match.group()) < 3:
+        raise IntegrityError(
+            f"Worksheet {ws.title!r} must retain the title and navigation rows."
+        )
+
+
+def require_legacy_tab_navigation_contract(
+    wb: Workbook,
+    *,
+    previous_v2: bool,
+) -> None:
+    """Validate the exact protected multi-link layout used before v0.4.0."""
+
+    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
+    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
+        navigation_columns = management_navigation_columns(ws)
+        actual_labels = [
+            ws.cell(row=2, column=column).value
+            for column in navigation_columns
+        ]
+        if actual_labels != expected_labels:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not contain the approved legacy "
+                "navigation labels."
+            )
+        if any(
+            ws.column_dimensions[get_column_letter(column)].hidden is True
+            for column in navigation_columns
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} legacy navigation must remain fully visible."
+            )
+        if ws.row_dimensions[2].height != 24:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the approved navigation height."
+            )
+        require_management_title_and_freeze_contract(ws)
+        for column, (_, target) in zip(
+            navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
+        ):
+            cell = ws.cell(row=2, column=column)
+            expected_target = f"#'{target}'!A1"
+            if cell.hyperlink is None or cell.hyperlink.target != expected_target:
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} has an invalid legacy navigation target."
+                )
+            is_current = target == ws.title
+            expected_fill = "7A1E1E" if previous_v2 and is_current else "F2F2F2"
+            expected_font_color = (
+                "FFFFFF" if previous_v2 and is_current else "7A1E1E"
+            )
+            expected_underline = (
+                None if previous_v2 else ("single" if is_current else None)
+            )
+            expected_side_style = "thin" if previous_v2 else None
+            if (
+                workbook_color_suffix(cell.fill.fgColor) != expected_fill
+                or workbook_color_suffix(cell.font.color) != expected_font_color
+                or cell.font.bold is not True
+                or cell.font.size != 9
+                or cell.font.underline != expected_underline
+                or cell.alignment.horizontal != "center"
+                or cell.alignment.vertical != "center"
+                or cell.alignment.shrink_to_fit is not True
+                or cell.border.top.style != "thin"
+                or cell.border.bottom.style != "thin"
+                or getattr(cell.border.left, "style", None) != expected_side_style
+                or getattr(cell.border.right, "style", None) != expected_side_style
+            ):
+                raise IntegrityError(
+                    f"Worksheet {ws.title!r} navigation style does not match the "
+                    "contract for the legacy layout."
+                )
+
+
+def require_management_menu_contract(wb: Workbook) -> None:
+    """Validate the locked, width-independent current workbook menu."""
+
+    guide = wb["How to Use"]
+    if guide["A44"].value != HOW_TO_USE_SECTION_HEADINGS[6]:
+        raise IntegrityError(
+            "How to Use does not place the workbook map at the approved menu target."
+        )
+    if {
+        str(merged)
+        for merged in guide.merged_cells.ranges
+        if merged.min_row <= 45 <= merged.max_row
+    } != {"A45:B45", "C45:J45", "K45:L45"}:
+        raise IntegrityError(
+            "How to Use contains an invalid workbook-map heading layout."
+        )
+    if guide["A45"].value != "Sheet - click to open":
+        raise IntegrityError(
+            "How to Use is missing the approved workbook-map heading."
+        )
+    for row, (_, target) in enumerate(MANAGEMENT_NAVIGATION_LINKS, start=46):
+        cell = guide.cell(row=row, column=1)
+        if (
+            cell.value != target
+            or cell.hyperlink is None
+            or cell.hyperlink.target != f"#'{target}'!A1"
+            or cell.font.underline != "single"
+            or cell.protection.locked is not True
+        ):
+            raise IntegrityError(
+                "How to Use contains an invalid workbook-map navigation link."
+            )
+        expected_merges = {
+            f"A{row}:B{row}",
+            f"C{row}:J{row}",
+            f"K{row}:L{row}",
+        }
+        actual_merges = {
+            str(merged)
+            for merged in guide.merged_cells.ranges
+            if merged.min_row <= row <= merged.max_row
+        }
+        if actual_merges != expected_merges:
+            raise IntegrityError(
+                "How to Use contains an invalid workbook-map row layout."
+            )
+
+    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
+        start_column, end_column = management_menu_bounds(ws)
+        expected_range = (
+            f"{get_column_letter(start_column)}2:"
+            f"{get_column_letter(end_column)}2"
+        )
+        menu_merges = {
+            str(merged)
+            for merged in ws.merged_cells.ranges
+            if merged.min_row <= 2 <= merged.max_row
+        }
+        if menu_merges != {expected_range}:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the approved workbook-menu merge."
+            )
+        if (
+            ws.column_dimensions[get_column_letter(start_column)].hidden is True
+            or ws.column_dimensions[get_column_letter(end_column)].hidden is True
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} workbook menu must start and end visibly."
+            )
+        if ws.row_dimensions[2].height != 24:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the approved menu height."
+            )
+        require_management_title_and_freeze_contract(ws)
+        cell = ws.cell(row=2, column=start_column)
+        if (
+            cell.value != MANAGEMENT_MENU_LABEL
+            or cell.hyperlink is None
+            or cell.hyperlink.target != MANAGEMENT_MENU_TARGET
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} has an invalid navigation target."
+            )
+        if (
+            workbook_color_suffix(cell.fill.fgColor) != "F2F2F2"
+            or workbook_color_suffix(cell.font.color) != "7A1E1E"
+            or cell.font.bold is not True
+            or cell.font.size != 9
+            or cell.font.underline != "single"
+            or cell.protection.locked is not True
+            or cell.alignment.horizontal != "left"
+            or cell.alignment.vertical != "center"
+            or cell.alignment.shrink_to_fit is not True
+            or cell.alignment.indent != 1
+            or cell.border.top.style != "thin"
+            or cell.border.bottom.style != "thin"
+            or getattr(cell.border.left, "style", None) is not None
+            or getattr(cell.border.right, "style", None) is not None
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} navigation style does not match the contract."
+            )
+
+
+def add_management_navigation(ws) -> None:
+    """Add one consistent menu link without changing data-column widths."""
+
+    neutral_fill = PatternFill("solid", fgColor="F2F2F2")
+    navigation_border = Border(
+        top=Side(style="thin", color="B7B7B7"),
+        bottom=Side(style="thin", color="B7B7B7"),
+    )
+    start_column, end_column = management_menu_bounds(ws)
+    # Set the anchor border before merging so openpyxl materializes the same
+    # top/bottom edge cells on the first save and every subsequent reload.
+    # Assigning it only after merge makes the protected semantic digest drift
+    # when openpyxl later formats the merged range.
+    ws.cell(row=2, column=start_column).border = navigation_border
+    ws.merge_cells(
+        start_row=2,
+        start_column=start_column,
+        end_row=2,
+        end_column=end_column,
+    )
+    cell = ws.cell(row=2, column=start_column, value=MANAGEMENT_MENU_LABEL)
+    cell.hyperlink = MANAGEMENT_MENU_TARGET
+    cell.fill = neutral_fill
+    cell.font = Font(
+        color="7A1E1E",
+        bold=True,
+        underline="single",
+        size=9,
+    )
+    cell.alignment = Alignment(
+        horizontal="left",
+        vertical="center",
+        shrink_to_fit=True,
+        indent=1,
+    )
+    cell.border = navigation_border
+    ws.row_dimensions[2].height = 24
+
+
+def configure_management_print_layout(ws) -> None:
+    """Use a readable, sheet-specific printable width."""
+
+    last_column = max(ws.max_column, len(MANAGEMENT_NAVIGATION_LINKS))
+    last_row = max(ws.max_row, 2)
+    if not ws.print_area:
+        ws.print_area = (
+            f"A1:{get_column_letter(last_column)}{last_row}"
+        )
+    if not ws.print_title_rows:
+        ws.print_title_rows = "1:2"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = MANAGEMENT_PRINT_WIDTHS.get(ws.title, 1)
+    if ws.title == "Data Quality":
+        # The compact quality summary retains wide source-provenance columns
+        # below its print area. Tabloid landscape keeps the complete navigation
+        # and summary legible without splitting them across horizontal pages.
+        ws.page_setup.paperSize = ws.PAPERSIZE_TABLOID
+    if ws.page_setup.fitToHeight is None:
+        ws.page_setup.fitToHeight = 0
+    ws.print_options.horizontalCentered = True
 
 
 def style_management_title(ws, title: str, end_col: int) -> None:
     ws.sheet_view.showGridLines = False
+    end_col = max(end_col, len(MANAGEMENT_NAVIGATION_LINKS))
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
-    cell = ws.cell(row=1, column=1, value=title)
+    cell = ws.cell(
+        row=1,
+        column=1,
+        value=title,
+    )
     cell.fill = PatternFill("solid", fgColor="7A1E1E")
     cell.font = Font(color="FFFFFF", bold=True, size=16)
     cell.alignment = Alignment(vertical="center")
-    ws.row_dimensions[1].height = 26
+    ws.row_dimensions[1].height = 32
+
+
+def write_guide_text_row(
+    ws,
+    row: int,
+    text: str,
+    *,
+    height: float = 36,
+    fill_color: str = "FFFFFF",
+    bold: bool = False,
+    font_color: str = "1F1F1F",
+) -> None:
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
+    cell = ws.cell(row=row, column=1, value=text)
+    cell.fill = PatternFill("solid", fgColor=fill_color)
+    cell.font = Font(bold=bold, color=font_color, size=10)
+    cell.alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[row].height = height
+
+
+def write_guide_section_header(ws, row: int, label: str) -> None:
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
+    cell = ws.cell(row=row, column=1, value=label)
+    cell.fill = PatternFill("solid", fgColor="E7E6E6")
+    cell.font = Font(bold=True, color="7A1E1E", size=11)
+    cell.alignment = Alignment(vertical="center")
+    ws.row_dimensions[row].height = 24
+
+
+def write_how_to_use_sheet(wb: Workbook) -> None:
+    """Write the locked start-here guide for the protected management workbook."""
+
+    remove_sheet_if_present(wb, "How to Use")
+    ws = wb.create_sheet("How to Use")
+    style_management_title(ws, "How to Use This Workbook", 12)
+    for column in range(1, 13):
+        ws.column_dimensions[get_column_letter(column)].width = 13
+    ws.freeze_panes = "A3"
+    ws.sheet_view.zoomScale = 85
+
+    write_guide_section_header(ws, 3, HOW_TO_USE_SECTION_HEADINGS[0])
+    write_guide_text_row(
+        ws,
+        4,
+        (
+            "This workbook is a deterministic, rule-based observational coaching aid. "
+            "It does not determine performance and is not statistically confident, "
+            "predictive, causal, or validated for demographic fairness. A signal may "
+            "never be the sole or determinative basis for discipline, termination, pay, "
+            "promotion, demotion, scheduling, reduced opportunity, training, or a formal "
+            "performance rating."
+        ),
+        height=54,
+        fill_color="FFF2CC",
+        bold=True,
+        font_color="7F6000",
+    )
+    write_guide_text_row(
+        ws,
+        5,
+        (
+            f"Methodology {MANAGEMENT_METHODOLOGY_VERSION}. "
+            f"{MANAGEMENT_SIGNAL_DISCLAIMER}"
+        ),
+        height=30,
+        fill_color="F3F4F6",
+    )
+
+    write_guide_section_header(ws, 6, HOW_TO_USE_SECTION_HEADINGS[1])
+    workflow_steps = (
+        (
+            "1. Read LAST RUN STATUS.txt. Ready means verified within that run's stated "
+            "local scope. Attention means stop. NotEvaluated makes no verification claim. "
+            "Use Outcome and Stage to confirm whether the run completed. "
+            "ExternalCheckRequired means the local run does not evaluate that external "
+            "assurance; independent recovery still requires a separate check."
+        ),
+        (
+            "2. Open Data Quality and confirm the latest Tuesday–Sunday week is complete, "
+            "reconciled, and free of unresolved source or identity problems."
+        ),
+        (
+            "3. Use Dashboard and Store & Group Scorecards for the operations layer: "
+            "sales, guests, checks, Sales / Guest, Sales / Check, Guests / Check, Rate "
+            "of Sale, and Ticket Time. Do not make a person-level decision from a card."
+        ),
+        (
+            "4. Use Action Focus to triage current items, then click Open in Action Board."
+        ),
+        (
+            "5. For the people-review layer, use only Sales / Guest and Wine % as "
+            "action inputs. Review Check Count, Rate of Sale, Ticket Time, Evidence "
+            "Detail, and store context before choosing a disposition."
+        ),
+        (
+            "6. Complete the blue Action Board fields. Track follow-up; completed or "
+            "dismissed items move to Action History on the next successful run."
+        ),
+    )
+    for row, step in enumerate(workflow_steps, start=7):
+        write_guide_text_row(ws, row, step, height=42 if row in {7, 8, 11, 12} else 36)
+
+    write_guide_section_header(ws, 13, HOW_TO_USE_SECTION_HEADINGS[2])
+    required_review_rows = (
+        "Before dispositioning a generated row, verify:",
+        "• Source date, identity, location, completeness, and reconciliation",
+        "• Latest sample and peer-reference sufficiency",
+        (
+            "• Shift, daypart, section, party mix, staffing, event, training, tenure, "
+            "or menu context that could explain the result"
+        ),
+        "• Recurring metric drivers and leave-one-active-day stability",
+        "• Independent manager observations supporting any coaching or recognition",
+        "Do not infer protected characteristics from names.",
+    )
+    for row, text in enumerate(required_review_rows, start=14):
+        write_guide_text_row(
+            ws,
+            row,
+            text,
+            height=42 if row == 17 else 30,
+            fill_color="FCE8E6" if row == 20 else "FFFFFF",
+            bold=row in {14, 20},
+            font_color="9C0006" if row == 20 else "1F1F1F",
+        )
+
+    write_guide_section_header(ws, 21, HOW_TO_USE_SECTION_HEADINGS[3])
+    signal_rows = (
+        "Not Evaluated or Reference Unavailable — gates were not met; no prompt.",
+        "Context Review — investigate context only; this is not a coaching conclusion.",
+        (
+            "Coaching Prompt — second consecutive aligned qualified signal with a "
+            "recurring driver and stability; human corroboration is still required."
+        ),
+        (
+            "Recognition Prompt — the same persistence and stability requirements apply; "
+            "human corroboration is still required."
+        ),
+        (
+            "Monitor — observe another qualified period; no action quota exists. "
+            "Management targets and displayed rank are context only and cannot create "
+            "or change a person-level prompt."
+        ),
+    )
+    for row, text in enumerate(signal_rows, start=22):
+        write_guide_text_row(ws, row, text, height=42 if row >= 24 else 36)
+
+    write_guide_section_header(ws, 27, HOW_TO_USE_SECTION_HEADINGS[4])
+    write_guide_text_row(
+        ws,
+        28,
+        (
+            "Blue cells are the only editable cells. Do not alter generated fields, "
+            "formulas, technical sheets, or raw evidence."
+        ),
+        height=30,
+        fill_color="D9EAF7",
+        bold=True,
+        font_color="1F4E78",
+    )
+    ws.merge_cells("A29:B29")
+    ws.merge_cells("C29:L29")
+    ws["A29"] = "Field"
+    ws["C29"] = "Rule"
+    for cell in (ws["A29"], ws["C29"]):
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[29].height = 24
+    editable_fields = (
+        (
+            "D — Status",
+            (
+                "Generated rows start Review Needed. Open may remain pending. In Progress, "
+                "Blocked, Complete, and Dismissed require completed review fields."
+            ),
+        ),
+        ("E — Owner", "Select an active roster member or leave blank."),
+        ("F — Due Date", "Enter a real date or leave blank."),
+        (
+            "N — Context Notes",
+            "Record only the minimum information needed to explain the decision.",
+        ),
+        (
+            "U — Review Disposition",
+            "Use one of the exact approved choices in Disposition Meanings below.",
+        ),
+        (
+            "V — Reviewed By",
+            "Required for a completed disposition and must name an active roster member.",
+        ),
+        ("W — Review Date", "Required for a completed disposition."),
+    )
+    for row, (field, rule) in enumerate(editable_fields, start=30):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=12)
+        ws.cell(row=row, column=1, value=field).font = Font(bold=True, color="1F4E78")
+        ws.cell(row=row, column=3, value=rule)
+        for col in (1, 3):
+            cell = ws.cell(row=row, column=col)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7" if col == 1 else "FFFFFF")
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row].height = 42 if row == 30 else 36
+
+    write_guide_section_header(ws, 37, HOW_TO_USE_SECTION_HEADINGS[5])
+    disposition_descriptions = {
+        "Pending Review": "review is incomplete",
+        "Coaching Accepted": (
+            "independent manager review supports a coaching conversation"
+        ),
+        "Recognition Accepted": "independent manager review supports recognition",
+        "Context Explains": "operating or assignment context explains the signal",
+        "Data Issue": (
+            "source, identity, metric, or lineage problem; stop and escalate for correction"
+        ),
+        "Monitor": "no action now; watch a later qualified week",
+    }
+    for row, disposition in enumerate(REVIEW_DISPOSITION_CHOICES, start=38):
+        write_guide_text_row(
+            ws,
+            row,
+            f"{disposition} — {disposition_descriptions[disposition]}.",
+            height=36,
+        )
+
+    write_guide_section_header(ws, 44, HOW_TO_USE_SECTION_HEADINGS[6])
+    for start_col, end_col, value in (
+        (1, 2, "Sheet - click to open"),
+        (3, 10, "Purpose"),
+        (11, 12, "Editable?"),
+    ):
+        ws.merge_cells(
+            start_row=45,
+            start_column=start_col,
+            end_row=45,
+            end_column=end_col,
+        )
+        cell = ws.cell(row=45, column=start_col, value=value)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[45].height = 24
+    workbook_map = (
+        (
+            "How to Use",
+            "start-here workflow, interpretation, controls, and limitations",
+            "No — locked",
+        ),
+        ("Dashboard", "aggregate weekly brief", "No — locked"),
+        ("Action Focus", "current queue and links to Action Board", "No — locked"),
+        (
+            "Action Board",
+            "review and task tracking",
+            "Yes — seven blue fields only",
+        ),
+        (
+            "Server Scorecard",
+            "person-level sample, peer, movement, and evidence context",
+            "No — locked",
+        ),
+        (
+            "Store & Group Scorecards",
+            "operational context only",
+            "No — locked",
+        ),
+        (
+            "Recent Movement Signals",
+            "descriptive changes, not statistical significance",
+            "No — locked",
+        ),
+        (
+            "Evidence Detail",
+            (
+                "evidence weeks, cohort, threshold, stability, and methodology; exact "
+                "raw lineage stays hidden and protected for export and audit"
+            ),
+            "No — locked",
+        ),
+        (
+            "Action History",
+            "preserved closed and dismissed items",
+            "No — locked",
+        ),
+        (
+            "Data Quality",
+            "completeness, reconciliation, source provenance, and owner warnings",
+            "No — locked",
+        ),
+        (
+            "Management Setup",
+            "custodian-maintained store targets and owner roster",
+            "Yes — blue cells only",
+        ),
+        (
+            "Run Notes",
+            "release, integrity, methodology, and source-assumption audit trail",
+            "No — locked",
+        ),
+    )
+    for row, (sheet_name, purpose, editable) in enumerate(workbook_map, start=46):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=10)
+        ws.merge_cells(start_row=row, start_column=11, end_row=row, end_column=12)
+        sheet_cell = ws.cell(row=row, column=1, value=sheet_name)
+        sheet_cell.hyperlink = f"#'{sheet_name}'!A1"
+        sheet_cell.font = Font(
+            bold=True,
+            color="7A1E1E",
+            underline="single",
+        )
+        ws.cell(row=row, column=3, value=purpose)
+        ws.cell(row=row, column=11, value=editable)
+        for col in (1, 3, 11):
+            cell = ws.cell(row=row, column=col)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row].height = (
+            42 if sheet_name in {
+                "How to Use",
+                "Server Scorecard",
+                "Recent Movement Signals",
+                "Evidence Detail",
+                "Data Quality",
+                "Management Setup",
+                "Run Notes",
+            }
+            else 36
+        )
+
+    write_guide_section_header(ws, 58, HOW_TO_USE_SECTION_HEADINGS[7])
+    limit_rows = (
+        (
+            "Rate of Sale is opportunities divided by qualifying sales, so lower is "
+            "better; multi-row totals use opportunities divided by inferred qualifying "
+            "sales. Ticket Time is weighted only by complete Check Count coverage. "
+            "Legacy weeks without Check Count show Ticket Time as unavailable. Both "
+            "metrics are context only and cannot create person-level prompts."
+        ),
+        (
+            "The source does not observe assignment and equal-opportunity context. Correct "
+            "bad source data through the protected run; do not rewrite prior evidence."
+        ),
+        (
+            "Record context or methodology disagreements without deleting the original "
+            "signal."
+        ),
+        (
+            "Evidence export or sharing remains a separate manual, exact-fingerprint "
+            "approval workflow."
+        ),
+        (
+            "Restricted employee-performance information must remain limited to authorized "
+            "users."
+        ),
+    )
+    for row, text in enumerate(limit_rows, start=59):
+        write_guide_text_row(
+            ws,
+            row,
+            text,
+            height=72 if row == 59 else 42 if row == 60 else 36,
+            fill_color="FFF2CC" if row == 59 else "FFFFFF",
+        )
+
+    ws.print_area = "A1:L63"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_options.horizontalCentered = True
 
 
 def write_management_setup_sheet(
@@ -6928,6 +9502,7 @@ def write_management_setup_sheet(
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    ws.row_dimensions[5].height = 30
     entities = ["All Stores", *config.get("locations", {}).keys()]
     for row_index, entity in enumerate(entities, start=6):
         ws.cell(row=row_index, column=1, value=entity).font = Font(bold=True)
@@ -7055,7 +9630,7 @@ def write_management_setup_sheet(
     ws.add_data_validation(active_validation)
     active_validation.add(f"B{roster_header_row + 1}:B{roster_last_row}")
 
-    widths = {"A": 30, "B": 18, "C": 18, "D": 22, "E": 30, "F": 16, "G": 22}
+    widths = {"A": 30, "B": 18, "C": 18, "D": 25, "E": 48, "F": 16, "G": 22}
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
@@ -7123,18 +9698,24 @@ def write_action_tracking_sheet(
     for row_index, row in enumerate(rows, start=header_row + 1):
         for col, value in enumerate(action_row_values(row), start=1):
             cell = ws.cell(row=row_index, column=col, value=value)
-            cell.alignment = Alignment(vertical="top", wrap_text=col in {10, 11, 12, 14})
+            cell.alignment = Alignment(
+                vertical="top", wrap_text=col in {10, 11, 12, 14, 15, 16, 19, 21}
+            )
         priority_style = priority_fill(row.get("Priority"))
         if priority_style:
             ws.cell(row=row_index, column=3).fill = priority_style
         ws.cell(row=row_index, column=6).number_format = "m/d/yyyy"
         ws.cell(row=row_index, column=13).number_format = "m/d/yyyy"
         ws.cell(row=row_index, column=17).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=23).number_format = "m/d/yyyy"
         ws.row_dimensions[row_index].height = 60
     if rows:
         table = Table(
             displayName="ActionBoardTable" if editable else "ActionHistoryTable",
-            ref=f"A{header_row}:T{header_row + len(rows)}",
+            ref=(
+                f"A{header_row}:{get_column_letter(len(ACTION_HEADERS))}"
+                f"{header_row + len(rows)}"
+            ),
         )
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleLight1", showFirstColumn=False, showLastColumn=False,
@@ -7143,19 +9724,17 @@ def write_action_tracking_sheet(
         ws.add_table(table)
     ws.column_dimensions["A"].hidden = True
     ws.column_dimensions["B"].hidden = True
-    ws.column_dimensions["O"].hidden = True
-    ws.column_dimensions["P"].hidden = True
-    ws.column_dimensions["S"].hidden = True
     ws.column_dimensions["T"].hidden = True
     widths = {
         "C": 12, "D": 14, "E": 18, "F": 13, "G": 20, "H": 24, "I": 22,
         "J": 22, "K": 46, "L": 48, "M": 14, "N": 34, "O": 20, "P": 14,
-        "Q": 13, "R": 12, "S": 14,
+        "Q": 13, "R": 12, "S": 18, "T": 14, "U": 22, "V": 18, "W": 13,
     }
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "G5"
     ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = "1:4"
     if rows:
         first, last = header_row + 1, header_row + len(rows)
         red_fill = PatternFill("solid", fgColor="F4CCCC")
@@ -7176,7 +9755,7 @@ def write_action_tracking_sheet(
         )
         if editable:
             for row in range(first, last + 1):
-                for col in (4, 5, 6, 14):
+                for col in (4, 5, 6, 14, 21, 22, 23):
                     cell = ws.cell(row=row, column=col)
                     cell.fill = blue_fill
                     cell.protection = Protection(locked=False)
@@ -7198,10 +9777,22 @@ def write_action_tracking_sheet(
                 errorTitle="Choose an active owner",
                 error="Select an active owner from the Owner Roster or leave the cell blank.",
             )
+            disposition_validation = DataValidation(
+                type="list",
+                formula1=f'"{",".join(REVIEW_DISPOSITION_CHOICES)}"',
+                allow_blank=False,
+                showErrorMessage=True,
+                errorStyle="stop",
+                errorTitle="Choose a review disposition",
+                error="Select a review disposition from the list.",
+            )
             ws.add_data_validation(status_validation)
             ws.add_data_validation(owner_validation)
+            ws.add_data_validation(disposition_validation)
             status_validation.add(f"D{first}:D{last}")
             owner_validation.add(f"E{first}:E{last}")
+            owner_validation.add(f"V{first}:V{last}")
+            disposition_validation.add(f"U{first}:U{last}")
             ws.conditional_formatting.add(
                 f"E{first}:E{last}",
                 FormulaRule(
@@ -7210,6 +9801,17 @@ def write_action_tracking_sheet(
                         f'$D{first}<>"Complete",$D{first}<>"Dismissed")'
                     ],
                     fill=amber_fill,
+                ),
+            )
+            ws.conditional_formatting.add(
+                f"U{first}:W{last}",
+                FormulaRule(
+                    formula=[
+                        f'AND(OR($D{first}="Complete",$D{first}="Dismissed"),'
+                        f'OR($U{first}="Pending Review",$U{first}="",'
+                        f'$V{first}="",$W{first}=""))'
+                    ],
+                    fill=red_fill,
                 ),
             )
 
@@ -7227,7 +9829,9 @@ def write_action_focus_sheet(
         "Location",
         "Person / Area",
         "Action",
-        "Recommended Next Step",
+        "Evidence Status",
+        "Review Disposition",
+        "Manager Question",
         "Why It Matters",
         "Weeks Open",
         "Open Action",
@@ -7238,13 +9842,17 @@ def write_action_focus_sheet(
         row=3,
         column=1,
         value=(
-            "Immediate manager work only. Use Open Action to update owner, due date, "
-            "status, or notes on the protected Action Board."
+            "Start with the highest-priority row. Use the Manager Question to review "
+            "context, then open Action Board to document the owner, due date, and "
+            "review disposition."
         ),
     )
     ws.cell(row=3, column=1).fill = PatternFill("solid", fgColor="FFF2CC")
     ws.cell(row=3, column=1).font = Font(bold=True)
-    ws.cell(row=3, column=1).alignment = Alignment(wrap_text=True)
+    ws.cell(row=3, column=1).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[3].height = 48
     actionable = [
         row
         for row in current_actions
@@ -7271,6 +9879,8 @@ def write_action_focus_sheet(
             action.get("Location"),
             action.get("Person / Area"),
             action.get("Action"),
+            action.get("Evidence Status"),
+            action.get("Review Disposition"),
             action.get("Recommended Next Step"),
             action.get("Why It Matters"),
             action.get("Weeks Open"),
@@ -7279,12 +9889,12 @@ def write_action_focus_sheet(
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row=row_index, column=col, value=excel_safe_text(value))
             cell.alignment = Alignment(
-                vertical="top", wrap_text=col in {6, 7, 8, 9}
+                vertical="top", wrap_text=col in {6, 7, 8, 9, 10, 11}
             )
         ws.cell(row=row_index, column=4).number_format = "m/d/yyyy"
         target_row = board_rows.get(action_id)
         if target_row:
-            link = ws.cell(row=row_index, column=11)
+            link = ws.cell(row=row_index, column=13)
             link.hyperlink = f"#'Action Board'!C{target_row}"
             link.style = "Hyperlink"
         fill = priority_fill(action.get("Priority"))
@@ -7294,7 +9904,7 @@ def write_action_focus_sheet(
     if actionable:
         table = Table(
             displayName="ActionFocusTable",
-            ref=f"A{header_row}:K{header_row + len(actionable)}",
+            ref=f"A{header_row}:M{header_row + len(actionable)}",
         )
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",
@@ -7306,20 +9916,23 @@ def write_action_focus_sheet(
         ws.add_table(table)
     for column, width in {
         "A": 12,
-        "B": 14,
+        "B": 15,
         "C": 18,
         "D": 13,
         "E": 20,
         "F": 24,
         "G": 23,
-        "H": 50,
-        "I": 44,
-        "J": 12,
-        "K": 19,
+        "H": 18,
+        "I": 22,
+        "J": 50,
+        "K": 44,
+        "L": 12,
+        "M": 21,
     }.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "E6"
     ws.sheet_view.zoomScale = 85
+    ws.print_title_rows = "1:5"
 
 
 def action_with_evidence_fallback(action: dict[str, Any]) -> dict[str, Any]:
@@ -7340,6 +9953,29 @@ def write_evidence_detail_sheet(
     remove_sheet_if_present(wb, "Evidence Detail")
     ws = wb.create_sheet("Evidence Detail")
     style_management_title(ws, "Evidence Detail", len(EVIDENCE_DETAIL_HEADERS))
+    ws.merge_cells(
+        start_row=3,
+        start_column=1,
+        end_row=3,
+        end_column=len(EVIDENCE_DETAIL_HEADERS),
+    )
+    ws.cell(
+        row=3,
+        column=1,
+        value=(
+            "Person-level actions use Sales / Guest and Wine % only; Check Count, "
+            "Rate of Sale, and Ticket Time are context only. "
+            "Operator view: exact raw Evidence Sources and Metric Evidence columns are "
+            "hidden. Their protected values remain unchanged for carry-forward, approved "
+            "evidence export, and audit."
+        ),
+    )
+    ws.cell(row=3, column=1).fill = PatternFill("solid", fgColor="D9EAF7")
+    ws.cell(row=3, column=1).font = Font(bold=True, color="1F4E78")
+    ws.cell(row=3, column=1).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[3].height = 54
     evidence_by_action: dict[str, dict[str, Any]] = {}
     for action in [*action_history, *current_actions]:
         action_id = str(action.get("Action ID") or "")
@@ -7359,6 +9995,7 @@ def write_evidence_detail_sheet(
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    ws.row_dimensions[header_row].height = 42
     board_rows = {
         str(row.get("Action ID")): index
         for index, row in enumerate(current_actions, start=5)
@@ -7370,9 +10007,16 @@ def write_evidence_detail_sheet(
             cell.alignment = Alignment(
                 vertical="top",
                 wrap_text=header
-                in {"Evidence Sources", "Metric Evidence", "Evidence Week Ends"},
+                in {
+                    "Evidence Week Ends",
+                    "Comparator Type",
+                    "Evidence Status",
+                    "Recurring Drivers",
+                    "Stability Result",
+                    "Review Disposition",
+                },
             )
-            if header in {"Due Date", "Last Seen"}:
+            if header in {"Due Date", "Last Seen", "Review Date"}:
                 cell.number_format = "m/d/yyyy"
         action_id = str(action.get("Action ID") or "")
         target_row = board_rows.get(action_id)
@@ -7380,7 +10024,23 @@ def write_evidence_detail_sheet(
             evidence_cell = ws.cell(row=row_index, column=1)
             evidence_cell.hyperlink = f"#'Action Board'!C{target_row}"
             evidence_cell.style = "Hyperlink"
-        ws.row_dimensions[row_index].height = 72
+        visible_lengths = [
+            len(str(action.get(header) or ""))
+            for header in (
+                "Evidence Week Ends",
+                "Comparator Type",
+                "Evidence Status",
+                "Recurring Drivers",
+                "Stability Result",
+                "Review Disposition",
+            )
+        ]
+        ws.row_dimensions[row_index].height = (
+            90
+            if max(visible_lengths, default=0) >= 100
+            or sum(visible_lengths) >= 260
+            else 75
+        )
     if rows:
         table = Table(
             displayName="ManagementEvidenceDetail",
@@ -7401,7 +10061,7 @@ def write_evidence_detail_sheet(
         "A": 20,
         "B": 16,
         "C": 25,
-        "D": 38,
+        "D": 46,
         "E": 12,
         "F": 14,
         "G": 18,
@@ -7416,8 +10076,40 @@ def write_evidence_detail_sheet(
     }
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
+    for header in ("Evidence Sources", "Metric Evidence"):
+        ws.column_dimensions[
+            get_column_letter(EVIDENCE_DETAIL_HEADERS.index(header) + 1)
+        ].hidden = True
+    for header, width in {
+        "Comparator Type": 34,
+        "Peer Cohort Size": 16,
+        "Peer Cohort Weeks": 16,
+        "Threshold Version": 18,
+        "Evidence Status": 18,
+        "Recurring Drivers": 32,
+        "Stability Result": 42,
+        "Review Disposition": 22,
+        "Reviewed By": 18,
+        "Review Date": 13,
+    }.items():
+        ws.column_dimensions[
+            get_column_letter(EVIDENCE_DETAIL_HEADERS.index(header) + 1)
+        ].width = width
     ws.freeze_panes = "E5"
     ws.sheet_view.zoomScale = 70
+    ws.print_title_rows = "1:4"
+
+
+def operational_sample_text(row: dict[str, Any]) -> str:
+    check_text = (
+        f"{float(row.get('check_count', 0) or 0):,.0f} checks"
+        if row.get("check_count_available")
+        else "checks unavailable"
+    )
+    return (
+        f"{float(row.get('guest_count', 0) or 0):,.0f} guests / "
+        f"{check_text} / {int(row.get('active_days', 0) or 0)} days"
+    )
 
 
 def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
@@ -7427,14 +10119,14 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
         "Location",
         "Server",
         "Current Sample",
-        "Confidence",
-        "Performance",
-        "Recent Momentum",
+        "Evidence Status",
+        "Peer Comparison",
+        "Recent Movement",
         "8-Week Direction",
         "History Used",
         "Positive Drivers",
         "Watch Drivers",
-        "Recommended Next Step",
+        "Manager Question",
     ]
     data = []
     for row in rows:
@@ -7443,7 +10135,7 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
                 row["action"],
                 row["location"],
                 excel_safe_text(row["display_name"]),
-                f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
+                operational_sample_text(row),
                 row["confidence"],
                 row["performance_level"],
                 row["momentum"],
@@ -7457,12 +10149,14 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
     ws = write_table_sheet(
         wb, "Server Scorecard", headers, data, "ServerScorecard",
         widths={
-            "A": 24, "B": 20, "C": 24, "D": 22, "E": 16, "F": 20,
-            "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
+            "A": 24, "B": 20, "C": 24, "D": 22, "E": 21, "F": 23,
+            "G": 23, "H": 22, "I": 54, "J": 40, "K": 40, "L": 48,
         },
     )
+    style_management_title(ws, "Server Scorecard", len(headers))
     ws.freeze_panes = "D4"
     ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = "1:3"
     ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
         for col in (1, 5, 6, 7, 8):
@@ -7471,33 +10165,40 @@ def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> No
                 ws.cell(row=row, column=col).fill = fill
         for col in (4, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 48
+        ws.row_dimensions[row].height = 66
 
 
 def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     remove_sheet_if_present(wb, "Rising & Falling Stars")
-    star_rows = [row for row in rows if row["prominent"] and row["momentum"] in {"Rising", "Falling"}]
+    remove_sheet_if_present(wb, "Recent Movement Signals")
+    star_rows = [
+        row
+        for row in rows
+        if row["prominent"]
+        and row["momentum"]
+        in {RecentMovement.UPWARD.value, RecentMovement.DOWNWARD.value}
+    ]
     headers = [
         "Category",
         "Action",
         "Location",
         "Server",
         "Current Sample",
-        "Performance",
-        "Recent Momentum",
+        "Peer Comparison",
+        "Recent Movement",
         "8-Week Direction",
         "History Used",
         "Positive Drivers",
         "Watch Drivers",
-        "Recommended Next Step",
+        "Manager Question",
     ]
     data = [
         [
-            f"{row['momentum']} Star",
+            f"{row['momentum']} Movement Signal",
             row["action"],
             row["location"],
             excel_safe_text(row["display_name"]),
-            f"{row['guest_count']:,.0f} guests / {row['active_days']} days",
+            operational_sample_text(row),
             row["performance_level"],
             row["momentum"],
             row["long_term_direction"],
@@ -7509,14 +10210,20 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
         for row in star_rows
     ]
     ws = write_table_sheet(
-        wb, "Rising & Falling Stars", headers, data, "RisingFallingStarsV2",
+        wb,
+        "Recent Movement Signals",
+        headers,
+        data,
+        "RecentMovementSignalsV3",
         widths={
-            "A": 15, "B": 24, "C": 20, "D": 24, "E": 22, "F": 20,
+            "A": 26, "B": 24, "C": 20, "D": 24, "E": 22, "F": 23,
             "G": 18, "H": 18, "I": 54, "J": 40, "K": 40, "L": 48,
         },
     )
+    style_management_title(ws, "Recent Movement Signals", len(headers))
     ws.freeze_panes = "E4"
     ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = "1:3"
     ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
         for col in (1, 2, 6, 7, 8):
@@ -7525,7 +10232,7 @@ def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None
                 ws.cell(row=row, column=col).fill = fill
         for col in (5, 9, 10, 11, 12):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 48
+        ws.row_dimensions[row].height = 66
 
 
 def format_management_value(field: str, value: float | None) -> tuple[Any, str]:
@@ -7533,19 +10240,29 @@ def format_management_value(field: str, value: float | None) -> tuple[Any, str]:
         return None, "General"
     if field == "gross_sales":
         return value, "$#,##0"
-    if field == "guest_count":
+    if field in {"guest_count", "check_count"}:
         return value, "#,##0"
-    if field == "check_average":
+    if field in {"check_average", "sales_per_check"}:
         return value, "$0.00"
+    if field == "guests_per_check":
+        return value, "0.00"
     if field == "wine_pct":
         return value, "0.0%"
     if field == "rate_of_sale_by_guest_count":
         return value, "0.000"
-    return duration_fraction(value), "[h]:mm"
+    if field == "average_ticket_time_seconds":
+        return duration_fraction(value), "[h]:mm"
+    return value, "0.00"
 
 
 def management_metric_status(field: str, item: dict[str, Any], config: dict[str, Any] | None = None) -> str:
     config = config or DEFAULT_CONFIG
+    if field in SERVER_CONTEXT_FIELDS:
+        return (
+            "Context Only"
+            if management_metric_available(item["latest"], field)
+            else "Unavailable"
+        )
     current = item["latest"][field]
     benchmark = item["benchmark_values"].get(field)
     if benchmark is None:
@@ -7574,6 +10291,9 @@ def write_store_group_scorecards_sheet(
     style_management_title(ws, "Store & Group Scorecards", 7)
     ws.freeze_panes = "A4"
     current_row = 4
+    scorecard_start_rows: list[int] = []
+    print_section_start_rows: list[int] = []
+    guest_chart_row: int | None = None
     display_items: list[tuple[str, dict[str, Any] | None, str]] = []
     if readiness is None:
         display_items = [(item["entity"], item, "current") for item in rows]
@@ -7596,6 +10316,8 @@ def write_store_group_scorecards_sheet(
                 display_items.append((location, item, state))
 
     for entity, item, readiness_state in display_items:
+        scorecard_start_rows.append(current_row)
+        print_section_start_rows.append(current_row)
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
         if readiness_state == "missing":
             title_text = f"{entity} | Missing | No current-week data; comparisons are paused."
@@ -7610,13 +10332,19 @@ def write_store_group_scorecards_sheet(
         title = ws.cell(row=current_row, column=1, value=title_text)
         title.fill = priority_fill(title_priority) or PatternFill("solid", fgColor="E7E6E6")
         title.font = Font(bold=True)
-        title.alignment = Alignment(wrap_text=True)
+        title.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[current_row].height = 54
         for col, header in enumerate(["Metric", "Current", "vs Prior", "vs Benchmark", "Benchmark", "Source", "Status"], start=1):
             cell = ws.cell(row=current_row + 1, column=col, value=header)
             cell.fill = PatternFill("solid", fgColor="D9E1F2")
             cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center")
-        for offset, (field, label, _) in enumerate(MANAGEMENT_METRICS, start=2):
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True
+            )
+        ws.row_dimensions[current_row + 1].height = 30
+        for offset, (field, label, _) in enumerate(
+            STORE_GROUP_DISPLAY_METRICS, start=2
+        ):
             row = current_row + offset
             ws.cell(row=row, column=1, value=label)
             if readiness_state == "missing":
@@ -7627,15 +10355,53 @@ def write_store_group_scorecards_sheet(
                     ws.cell(row=row, column=7).fill = fill
                 continue
 
-            current_value, number_format = format_management_value(field, item["latest"][field])
-            prior_change = item["prior_changes"][field]
-            benchmark_change = item["benchmark_changes"][field]
-            benchmark_value, benchmark_format = format_management_value(field, item["benchmark_values"][field])
+            is_workload_context = field in {
+                "check_count",
+                "sales_per_check",
+                "guests_per_check",
+            }
+            context_available = (
+                bool(item["latest"].get("check_count_available", False))
+                if is_workload_context
+                else management_metric_available(item["latest"], field)
+            )
+            current_raw = item["latest"].get(field) if context_available else None
+            current_value, number_format = format_management_value(
+                field, current_raw
+            )
+            if is_workload_context:
+                prior_context_available = bool(
+                    item.get("prior")
+                    and item["prior"].get("check_count_available", False)
+                )
+                prior_change = (
+                    float(item["latest"].get(field, 0) or 0)
+                    - float(item["prior"].get(field, 0) or 0)
+                    if context_available and prior_context_available
+                    else None
+                )
+                benchmark_change = None
+                benchmark_value, benchmark_format = None, "General"
+            else:
+                prior_change = item["prior_changes"][field]
+                benchmark_change = item["benchmark_changes"][field]
+                benchmark_value, benchmark_format = format_management_value(
+                    field, item["benchmark_values"][field]
+                )
             ws.cell(row=row, column=2, value=current_value).number_format = number_format
             if readiness_state == "preliminary":
                 ws.cell(row=row, column=5, value=benchmark_value).number_format = benchmark_format
-                ws.cell(row=row, column=6, value=f"Preliminary; {item['benchmark_sources'][field]}")
+                source = (
+                    "Preliminary workload context"
+                    if is_workload_context
+                    else f"Preliminary; {item['benchmark_sources'][field]}"
+                )
+                ws.cell(row=row, column=6, value=source)
                 status = "Preliminary"
+            elif is_workload_context:
+                ws.cell(row=row, column=3, value=prior_change).number_format = number_format
+                ws.cell(row=row, column=6, value="Current workload context")
+                status = "Context Only" if context_available else "Unavailable"
             elif field in {"gross_sales", "guest_count"}:
                 prior_value = safe_pct_delta(item["latest"][field], item["prior"][field] if item["prior"] else None)
                 benchmark_delta = safe_pct_delta(item["latest"][field], item["benchmark_values"][field])
@@ -7647,24 +10413,86 @@ def write_store_group_scorecards_sheet(
             else:
                 ws.cell(row=row, column=3, value=prior_change).number_format = number_format
                 ws.cell(row=row, column=4, value=benchmark_change).number_format = number_format
-            if readiness_state == "current":
+            if readiness_state == "current" and not is_workload_context:
                 ws.cell(row=row, column=5, value=benchmark_value).number_format = benchmark_format
                 ws.cell(row=row, column=6, value=item["benchmark_sources"][field])
                 status = management_metric_status(field, item, config)
             ws.cell(row=row, column=7, value=status)
             fill = priority_fill(
                 "Review" if status == "Preliminary" else
+                "Review" if status == "Unavailable" else
                 "Medium" if status == "Watch" else
                 "Recognize" if status == "Above" else "Monitor"
             )
             if fill:
                 ws.cell(row=row, column=7).fill = fill
-        current_row += 10
+            for col in range(1, 8):
+                ws.cell(row=row, column=col).alignment = Alignment(
+                    wrap_text=col in {1, 6, 7},
+                    vertical="center",
+                )
+            ws.row_dimensions[row].height = 30
+        current_row += len(STORE_GROUP_DISPLAY_METRICS) + 4
+        if entity == "All Stores" and weekly_group_rows:
+            guest_chart_row = current_row
+            print_section_start_rows.append(current_row)
+            ws.merge_cells(
+                start_row=current_row,
+                start_column=1,
+                end_row=current_row,
+                end_column=7,
+            )
+            ws.cell(
+                row=current_row,
+                column=1,
+                value="All Stores | Complete-Week Guest Trend",
+            )
+            ws.cell(row=current_row, column=1).fill = PatternFill(
+                "solid", fgColor="D9EAF7"
+            )
+            ws.cell(row=current_row, column=1).font = Font(bold=True)
+            ws.cell(row=current_row, column=1).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
+            ws.row_dimensions[current_row].height = 54
+            ws.merge_cells(
+                start_row=current_row + 1,
+                start_column=1,
+                end_row=current_row + 6,
+                end_column=7,
+            )
+            ws.cell(
+                row=current_row + 1,
+                column=1,
+                value=(
+                    "Group-level operational context only. Use this trend to ask "
+                    "what changed in demand, events, hours, or capacity; do not "
+                    "attribute the movement to an individual."
+                ),
+            )
+            ws.cell(row=current_row + 1, column=1).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
+            for row_index in range(current_row + 1, current_row + 13):
+                ws.row_dimensions[row_index].height = 30
+            current_row += len(STORE_GROUP_DISPLAY_METRICS) + 4
     for column, width in {"A": 24, "B": 16, "C": 16, "D": 18, "E": 16, "F": 20, "G": 14}.items():
         ws.column_dimensions[column].width = width
     ws.column_dimensions["H"].width = 3
     ws.sheet_view.zoomScale = 80
-    add_management_scorecard_charts(wb, ws, weekly_location_rows, weekly_group_rows)
+    for section_start in print_section_start_rows[1:]:
+        ws.row_breaks.append(Break(id=section_start - 1))
+    sales_chart_row = scorecard_start_rows[0] if scorecard_start_rows else 4
+    if guest_chart_row is None:
+        guest_chart_row = sales_chart_row + len(STORE_GROUP_DISPLAY_METRICS) + 4
+    add_management_scorecard_charts(
+        wb,
+        ws,
+        weekly_location_rows,
+        weekly_group_rows,
+        sales_anchor=f"I{sales_chart_row}",
+        guest_anchor=f"I{guest_chart_row}",
+    )
 
 
 def latest_location_completeness(
@@ -7699,7 +10527,7 @@ def write_management_data_quality_sheet(
 ) -> None:
     remove_sheet_if_present(wb, "Data Quality")
     ws = wb.create_sheet("Data Quality")
-    style_management_title(ws, "Data Quality", 6)
+    style_management_title(ws, "Data Quality", 8)
     if readiness is None:
         latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
         latest_rows, configured_locations, _location_gaps, latest_complete = latest_location_completeness(
@@ -7711,7 +10539,7 @@ def write_management_data_quality_sheet(
         configured_locations = list(readiness.configured_locations)
         latest_complete = readiness.ready
     latest_by_location = {row["location"]: row for row in latest_rows}
-    ws.merge_cells("A3:F3")
+    ws.merge_cells("A3:L3")
     ws["A3"] = (
         f"Latest week ending {latest_week_end:%m/%d/%Y} is complete and suitable for management trends."
         if latest_complete and latest_week_end
@@ -7728,8 +10556,20 @@ def write_management_data_quality_sheet(
     ws["A3"].fill = PatternFill("solid", fgColor="D9EAD3" if latest_complete else "F4CCCC")
     ws["A3"].font = Font(bold=True)
     ws["A3"].alignment = Alignment(wrap_text=True)
-    ws.row_dimensions[3].height = 36
-    for col, header in enumerate(["Latest Week", "Location", "Active Days", "Source Days", "Status", "Management Use"], start=1):
+    ws.row_dimensions[3].height = 48
+    for col, header in enumerate(
+        [
+            "Latest Week",
+            "Location",
+            "Active Days",
+            "Source Days",
+            "Check Count",
+            "Ticket Time Basis",
+            "Status",
+            "Management Use",
+        ],
+        start=1,
+    ):
         cell = ws.cell(row=5, column=col, value=header)
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
@@ -7745,15 +10585,53 @@ def write_management_data_quality_sheet(
             location,
             row.get("active_days", 0) if row else 0,
             row.get("source_days", 0) if row else 0,
+            (
+                row.get("check_count", 0)
+                if row and row.get("check_count_available")
+                else "Unavailable"
+            ),
+            (
+                row.get(
+                    "ticket_time_weight_basis",
+                    "Unavailable (Check Count missing or incomplete)",
+                )
+                if row
+                else "Unavailable"
+            ),
             status,
-            "Use" if status == "Complete" else "Preliminary only",
+            (
+                "People review eligible; operational context complete"
+                if status == "Complete"
+                and row
+                and row.get("check_count_available")
+                and row.get("ticket_time_available")
+                and row.get("rate_available")
+                else "People review eligible; Rate of Sale unavailable"
+                if status == "Complete"
+                and row
+                and row.get("check_count_available")
+                and row.get("ticket_time_available")
+                else "People review eligible; Ticket Time unavailable"
+                if status == "Complete"
+                and row
+                and row.get("check_count_available")
+                else "People review eligible; check-based context unavailable"
+                if status == "Complete"
+                else "Preliminary only"
+            ),
         ]
         for col, value in enumerate(values, start=1):
             ws.cell(row=row_index, column=col, value=value)
+            ws.cell(row=row_index, column=col).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
         ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
+        if row and row.get("check_count_available"):
+            ws.cell(row=row_index, column=5).number_format = "#,##0"
         fill = priority_fill("Recognize" if status == "Complete" else "High")
         if fill:
-            ws.cell(row=row_index, column=5).fill = fill
+            ws.cell(row=row_index, column=7).fill = fill
+        ws.row_dimensions[row_index].height = 72
 
     ws["A10"] = "Historical Exceptions"
     ws["A10"].font = Font(bold=True)
@@ -7813,6 +10691,28 @@ def write_management_data_quality_sheet(
             )
 
     source_start = warning_start + max(4, len(warnings) + 3)
+    print_note_row = source_start - 1
+    ws.merge_cells(
+        start_row=print_note_row,
+        start_column=1,
+        end_row=print_note_row,
+        end_column=12,
+    )
+    ws.cell(
+        row=print_note_row,
+        column=1,
+        value=(
+            "Compact print view ends here. Source-by-source parsing and provenance "
+            "remain available below in the protected workbook."
+        ),
+    )
+    ws.cell(row=print_note_row, column=1).fill = PatternFill(
+        "solid", fgColor="D9EAF7"
+    )
+    ws.cell(row=print_note_row, column=1).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[print_note_row].height = 30
     ws.merge_cells(
         start_row=source_start,
         start_column=1,
@@ -7856,12 +10756,38 @@ def write_management_data_quality_sheet(
         }
         parsers = {record.parser_engine for record in source_records if record.parser_engine}
         formats = {record.source_format for record in source_records if record.source_format}
-        status = (
-            "Verified"
-            if len(hashes) == 1
+        unavailable_metrics = sorted(
+            {
+                metric
+                for record in source_records
+                if (
+                    record.guest_count > 0
+                    or record.gross_sales > 0
+                    or (record.check_count_available and record.check_count > 0)
+                )
+                for metric, available in (
+                    ("Rate of Sale", record.rate_available),
+                    ("Check Count", record.check_count_available),
+                    (
+                        "Ticket Time",
+                        record.ticket_time_available
+                        and record.check_count_available,
+                    ),
+                )
+                if not available
+            }
+        )
+        provenance_verified = (
+            len(hashes) == 1
             and len(date_sources) == 1
             and len(parsers) == 1
             and len(formats) == 1
+        )
+        status = (
+            "Metric unavailable: " + ", ".join(unavailable_metrics)
+            if unavailable_metrics
+            else "Verified"
+            if provenance_verified
             else "Review"
         )
         values = [
@@ -7876,24 +10802,30 @@ def write_management_data_quality_sheet(
         ]
         for col, value in enumerate(values, start=1):
             ws.cell(row=row_index, column=col, value=value)
+            ws.cell(row=row_index, column=col).alignment = Alignment(
+                wrap_text=col in {1, 3, 5, 7, 8},
+                vertical="center",
+            )
         ws.cell(row=row_index, column=2).number_format = "m/d/yyyy"
         if status != "Verified":
             ws.cell(row=row_index, column=8).fill = PatternFill(
                 "solid", fgColor="FFF2CC"
             )
+        ws.row_dimensions[row_index].height = 42
 
     for column, width in {
         "A": 44,
         "B": 16,
         "C": 34,
-        "D": 12,
-        "E": 16,
-        "F": 68,
-        "G": 30,
-        "H": 14,
+        "D": 13,
+        "E": 18,
+        "F": 69,
+        "G": 22,
+        "H": 42,
     }.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
+    ws.print_area = f"A1:L{print_note_row}"
 
 
 def write_management_chart_data(
@@ -7934,6 +10866,9 @@ def add_management_scorecard_charts(
     ws,
     weekly_location_rows: list[dict[str, Any]],
     weekly_group_rows: list[dict[str, Any]],
+    *,
+    sales_anchor: str = "I4",
+    guest_anchor: str = "I20",
 ) -> None:
     location_points, group_points = write_management_chart_data(
         wb, weekly_location_rows, weekly_group_rows
@@ -7967,8 +10902,10 @@ def add_management_scorecard_charts(
             series.tx = SeriesLabel(v=location.replace("RC ", ""))
             series.graphicalProperties.line.solidFill = color
             series.graphicalProperties.line.width = 28575
-        chart.legend.position = "r"
-        ws.add_chart(chart, "I4")
+        # Bottom placement keeps both store names inside the chart frame when
+        # the scorecard is exported or printed at one page wide.
+        chart.legend.position = "b"
+        ws.add_chart(chart, sales_anchor)
     if group_points:
         chart = LineChart()
         chart.title = "Complete-Week All-Stores Guest Trend"
@@ -7988,7 +10925,7 @@ def add_management_scorecard_charts(
             chart.series[0].graphicalProperties.line.solidFill = "7A1E1E"
             chart.series[0].graphicalProperties.line.width = 28575
         chart.legend = None
-        ws.add_chart(chart, "I20")
+        ws.add_chart(chart, guest_anchor)
 
 
 def signed_management_delta(field: str, value: float | None) -> str:
@@ -8063,12 +11000,16 @@ def deduplicated_dashboard_actions(
     candidates.sort(
         key=lambda row: (
             priority_order.get(str(row.get("Priority") or ""), 9),
+            1
+            if str(row.get("Entity Key") or "").casefold().startswith("group|")
+            else 0,
             str(row.get("Location") or ""),
             str(row.get("Person / Area") or ""),
         )
     )
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
+    seen_operational_topics: set[str] = set()
     for row in candidates:
         identity = str(row.get("Entity Key") or "").strip().casefold()
         if not identity:
@@ -8078,6 +11019,14 @@ def deduplicated_dashboard_actions(
             )
         if identity in seen:
             continue
+        if not identity.startswith("server|"):
+            topic = "|".join(
+                str(row.get(field) or "").strip().casefold()
+                for field in ("Action", "Signal")
+            )
+            if topic in seen_operational_topics:
+                continue
+            seen_operational_topics.add(topic)
         seen.add(identity)
         selected.append(row)
         if limit is not None and len(selected) >= limit:
@@ -8086,13 +11035,12 @@ def deduplicated_dashboard_actions(
 
 
 def dashboard_management_move(item: dict[str, Any]) -> str:
-    signal = str(item.get("Signal") or "").strip().rstrip(".:")
-    evidence = str(item.get("Why It Matters") or "").split(" | ")[0].strip().rstrip(".")
-    next_step = str(item.get("Recommended Next Step") or "").strip().rstrip(".")
-    context = ". ".join(part for part in (signal, evidence) if part)
+    next_step = (
+        str(item.get("Recommended Next Step") or "").strip().rstrip(".?")
+    )
     if next_step:
-        return f"{context}. Next: {next_step}." if context else f"Next: {next_step}."
-    return f"{context}." if context else "Review and assign the next management step."
+        return f"{next_step}?"
+    return "What evidence and operating context need review, and who owns the follow-up?"
 
 
 def write_dashboard_card(
@@ -8110,7 +11058,9 @@ def write_dashboard_card(
     title_cell = ws.cell(row=6, column=start_col, value=title)
     title_cell.fill = PatternFill("solid", fgColor=accent_color)
     title_cell.font = Font(bold=True, color="FFFFFF", size=10)
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    title_cell.alignment = Alignment(
+        horizontal="center", vertical="center", shrink_to_fit=True
+    )
     value_cell = ws.cell(row=7, column=start_col, value=value)
     value_cell.fill = PatternFill("solid", fgColor="F7F7F7")
     value_cell.font = Font(bold=True, color="7A1E1E", size=20)
@@ -8119,6 +11069,9 @@ def write_dashboard_card(
     note_cell.fill = PatternFill("solid", fgColor="F7F7F7")
     note_cell.font = Font(color="595959", size=9)
     note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_index, minimum_height in ((6, 20), (7, 24), (8, 24), (9, 32)):
+        current_height = ws.row_dimensions[row_index].height or 0
+        ws.row_dimensions[row_index].height = max(current_height, minimum_height)
 
 
 def write_management_dashboard_sheet(
@@ -8171,7 +11124,7 @@ def write_management_dashboard_sheet(
     ws["A3"].alignment = Alignment(vertical="center")
     ws.merge_cells("A4:L4")
     ws["A4"] = (
-        "READY FOR MANAGEMENT REVIEW - comparisons, actions, and recognition are active"
+        "READY FOR HUMAN REVIEW - rule-based prompts are available for context checking"
         if latest_complete
         else f"PRELIMINARY - missing {missing_text or 'daily reports'}; comparisons, actions, and recognition are paused"
     )
@@ -8186,15 +11139,40 @@ def write_management_dashboard_sheet(
         action_rows, {"High", "Medium", "Review"}
     )
     selected_actions = all_action_items[:3]
-    reports_value = f"{len(received_dates)} of {len(expected_dates)}" if expected_dates else "0 of 0"
-    reports_note = (
-        "All Tuesday-Sunday reports received"
-        if latest_complete
-        else f"Missing {missing_text or 'daily reports'}"
-    )
+    sales_delta = None
+    sales_source = "benchmark"
+    if group:
+        sales_delta = safe_pct_delta(
+            group["latest"]["gross_sales"],
+            group["benchmark_values"].get("gross_sales"),
+        )
+        sales_source = str(
+            group.get("benchmark_sources", {}).get("gross_sales") or "benchmark"
+        )
+    if not latest_complete:
+        sales_value, sales_note, sales_color = (
+            "PAUSED",
+            f"Missing {missing_text or 'daily reports'}",
+            "7F7F7F",
+        )
+    elif sales_delta is None:
+        sales_value, sales_note, sales_color = (
+            "NO BASELINE",
+            "Sales benchmark is not available",
+            "7F7F7F",
+        )
+    else:
+        sales_value = f"{sales_delta:+.1%}"
+        sales_note = f"Gross sales vs {sales_source.lower()}"
+        sales_color = (
+            "548235"
+            if sales_delta >= 0
+            else "C00000"
+            if sales_delta <= -0.05
+            else "BF9000"
+        )
     write_dashboard_card(
-        ws, 1, "Reports Received", reports_value, reports_note,
-        "548235" if latest_complete else "C00000",
+        ws, 1, "Sales vs Benchmark", sales_value, sales_note, sales_color
     )
 
     traffic_delta = None
@@ -8212,24 +11190,26 @@ def write_management_dashboard_sheet(
         traffic_value = f"{traffic_delta:+.1%}"
         traffic_note = f"Guest traffic vs {traffic_source.lower()}"
         traffic_color = "548235" if traffic_delta >= 0 else "C00000" if traffic_delta <= -0.05 else "BF9000"
-    write_dashboard_card(ws, 5, "Traffic vs Benchmark", traffic_value, traffic_note, traffic_color)
+    write_dashboard_card(
+        ws, 5, "Guests vs Benchmark", traffic_value, traffic_note, traffic_color
+    )
 
     if latest_complete:
         action_value: str | int = len(all_action_items)
-        action_note = "Open coaching and review items"
+        action_note = "Open coaching-context review items"
         action_color = "C00000" if all_action_items else "548235"
     else:
         action_value, action_note, action_color = "PAUSED", f"Missing {missing_text or 'daily reports'}", "7F7F7F"
     write_dashboard_card(
-        ws, 9, "High-Priority Actions", action_value, action_note, action_color
+        ws, 9, "Review Items", action_value, action_note, action_color
     )
 
     ws.merge_cells("A11:L11")
-    ws["A11"] = "TOP THREE ACTIONS"
+    ws["A11"] = "TOP THREE REVIEW ITEMS"
     ws["A11"].fill = PatternFill("solid", fgColor="E7E6E6")
     ws["A11"].font = Font(bold=True, color="7A1E1E")
     action_headers = [
-        (1, 2, "Priority"), (3, 5, "Person / Location"), (6, 10, "Management Move"),
+        (1, 2, "Priority"), (3, 5, "Person / Location"), (6, 10, "Manager Question"),
         (11, 11, "Owner"), (12, 12, "Due"),
     ]
     for start_col, end_col, header in action_headers:
@@ -8296,7 +11276,8 @@ def write_management_dashboard_sheet(
     ws["A17"].font = Font(bold=True, color="7A1E1E")
     store_headers = [
         (1, 2, "Location"), (3, 4, "Status"), (5, 5, "Sales"), (6, 6, "Guests"),
-        (7, 7, "Check Avg"), (8, 9, "Service Pace"), (10, 12, "Management Focus"),
+        (7, 7, "Checks"), (8, 8, "Sales / Guest"), (9, 9, "Sales / Check"),
+        (10, 10, "Guests / Check"), (11, 12, "Manager Question"),
     ]
     for start_col, end_col, header in store_headers:
         if end_col > start_col:
@@ -8315,8 +11296,7 @@ def write_management_dashboard_sheet(
         item = current_store_rows.get(location) if location else None
         ws.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=2)
         ws.merge_cells(start_row=row_index, start_column=3, end_row=row_index, end_column=4)
-        ws.merge_cells(start_row=row_index, start_column=8, end_row=row_index, end_column=9)
-        ws.merge_cells(start_row=row_index, start_column=10, end_row=row_index, end_column=12)
+        ws.merge_cells(start_row=row_index, start_column=11, end_row=row_index, end_column=12)
         if item:
             latest = item["latest"]
             status = item["status"] if latest_complete else "Preliminary"
@@ -8327,27 +11307,53 @@ def write_management_dashboard_sheet(
             ws.cell(row=row_index, column=3, value=status)
             ws.cell(row=row_index, column=5, value=latest["gross_sales"]).number_format = "$#,##0"
             ws.cell(row=row_index, column=6, value=latest["guest_count"]).number_format = "#,##0"
-            ws.cell(row=row_index, column=7, value=latest["check_average"]).number_format = "$0.00"
-            ws.cell(row=row_index, column=8, value=latest["average_ticket_time_seconds"] / 60).number_format = '0.0 "min"'
-            ws.cell(row=row_index, column=10, value=focus)
+            if latest.get("check_count_available"):
+                ws.cell(
+                    row=row_index, column=7, value=latest.get("check_count", 0)
+                ).number_format = "#,##0"
+                ws.cell(
+                    row=row_index, column=9, value=latest.get("sales_per_check", 0)
+                ).number_format = "$0.00"
+                ws.cell(
+                    row=row_index,
+                    column=10,
+                    value=latest.get("guests_per_check", 0),
+                ).number_format = "0.00"
+            else:
+                for col in (7, 9, 10):
+                    ws.cell(row=row_index, column=col, value="n/a")
+            ws.cell(
+                row=row_index, column=8, value=latest["check_average"]
+            ).number_format = "$0.00"
+            ws.cell(row=row_index, column=11, value=focus)
             fill = priority_fill(item["priority"] if latest_complete else "Review")
             if fill:
                 ws.cell(row=row_index, column=3).fill = fill
         else:
             ws.cell(row=row_index, column=1, value=location or "No store data")
             ws.cell(row=row_index, column=3, value="Missing")
-            ws.cell(row=row_index, column=10, value="No current-week data; comparisons are paused.")
+            ws.cell(
+                row=row_index,
+                column=11,
+                value="What source data is missing, and who will confirm it?",
+            )
             fill = priority_fill("Review")
             if fill:
                 ws.cell(row=row_index, column=3).fill = fill
-        for col in (1, 3, 5, 6, 7, 8, 10):
+        for col in (1, 3, 5, 6, 7, 8, 9, 10, 11):
             ws.cell(row=row_index, column=col).alignment = Alignment(
-                wrap_text=True, vertical="center"
+                wrap_text=True,
+                vertical="center",
+                horizontal="center" if col in {5, 6, 7, 8, 9, 10} else None,
             )
-        ws.row_dimensions[row_index].height = 36
+        for col in range(5, 11):
+            ws.cell(row=row_index, column=col).border = Border(
+                right=Side(style="thin", color="D9E1F2")
+            )
+        ws.row_dimensions[row_index].height = 60
 
     ws.merge_cells("A22:L22")
-    ws["A22"] = "RECOGNITION / REPLICATE"
+    ws["A22"] = "RECOGNITION REVIEW"
     ws["A22"].fill = PatternFill("solid", fgColor="E7E6E6")
     ws["A22"].font = Font(bold=True, color="7A1E1E")
     ws.merge_cells("A23:L23")
@@ -8377,9 +11383,14 @@ def write_management_dashboard_sheet(
     ws.row_dimensions[23].height = 34
 
     ws.merge_cells("A24:L24")
+    check_covered_locations = sum(
+        bool(row.get("check_count_available")) for row in latest_location_rows
+    )
     ws["A24"] = (
         f"Data quality: {len(received_dates)} of {len(expected_dates)} reports received; "
-        f"{len(global_full)} complete all-store weeks available; incomplete weeks are excluded from comparisons."
+        f"Check Count complete for {check_covered_locations} of "
+        f"{len(latest_location_rows)} current store rows; {len(global_full)} complete "
+        "all-store weeks available."
         if latest_complete
         else f"Data quality: {len(received_dates)} of {len(expected_dates)} reports received; missing {missing_text or 'daily reports'}."
     )
@@ -8409,12 +11420,20 @@ def write_management_run_notes(
     style_management_title(ws, "Red Onion Server Master", 2)
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 96
+    ws.freeze_panes = "A3"
+    ws.sheet_view.zoomScale = 85
     report_audit = config.get("_report_audit", {})
     integrity = config.get("_integrity", {})
     provenance = integrity.get("provenance", {})
     git_provenance = provenance.get("git", {})
     config_provenance = provenance.get("config", {})
     requirements_provenance = provenance.get("requirements", {})
+    business_dates = {record.report_date for record in records}
+    check_count_dates = {
+        record.report_date
+        for record in records
+        if record.check_count_available
+    }
     note_rows = [
         ("Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Run ID", integrity.get("run_id", "Standalone workbook generation")),
@@ -8428,32 +11447,53 @@ def write_management_run_notes(
         ("Source Folder", str(source_dir)),
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed."),
         ("Raw Reports Read", len({record.source_file for record in records})),
-        ("Unique Business Days Used", report_audit.get("unique_business_days", len({record.report_date for record in records}))),
+        ("Unique Business Days Used", report_audit.get("unique_business_days", len(business_dates))),
+        (
+            "Check Count Coverage",
+            (
+                f"{len(check_count_dates)} of {len(business_dates)} business days. "
+                "Ticket Time totals are available only where every active row in the "
+                "rollup has Check Count."
+            ),
+        ),
         ("Semantic Duplicates Ignored", report_audit.get("duplicate_files_ignored", 0)),
         ("Canonical History Folder", report_audit.get("canonical_archive", "Not recorded")),
         ("Report Conflicts", "None; conflicting same-date reports stop the run before output or archiving."),
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
-        ("Recent Momentum", f"Latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete weeks. Partial latest weeks and low current samples are Not Scored."),
-        ("Recent Momentum Confidence", f"Latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests."),
+        ("Recent Movement", f"Latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete person-weeks. Partial weeks, limited samples, missing metrics, and insufficient references are Not Evaluated."),
+        ("Evidence Status", f"Eligibility requires latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests. This is not statistical confidence."),
         ("8-Week Direction", f"Compares the most recent {config.get('dashboard_long_term_block_weeks', 4)} complete weeks with the preceding {config.get('dashboard_long_term_block_weeks', 4)}. Full uses eight server weeks with at least {config.get('dashboard_long_term_full_min_recent_guests', 100)} recent / {config.get('dashboard_long_term_full_min_earlier_guests', 100)} earlier guests; Developing requires at least {config.get('dashboard_long_term_developing_min_total_weeks', 6)} usable weeks, {config.get('dashboard_long_term_developing_min_recent_weeks', 3)} recent / {config.get('dashboard_long_term_developing_min_earlier_weeks', 2)} earlier weeks, and {config.get('dashboard_long_term_developing_min_recent_guests', 75)} recent / {config.get('dashboard_long_term_developing_min_earlier_guests', 50)} earlier guests."),
-        ("Targets", "Management Setup targets take precedence; blank targets use the rolling baseline. Edits apply on the next run."),
-        ("Trend Scoring", "Both trend horizons use four metric families scored from -2 to +2 using materiality bands; average rank movement contributes only -1, 0, or +1."),
-        ("Performance Level", "Latest metrics are assessed separately as Above Benchmark, On Track, or Below Benchmark."),
-        ("Technical Trend Detail", "Server Week-over-Week Detail shows adjacent-week changes for audit use. Management coaching uses Recent Momentum and 8-Week Direction instead."),
-        ("Action Tracking", "Owner, due date, status, and manager notes carry forward between weekly runs. Cleared signals move to Action History."),
+        ("Peer Comparison", "Person-level comparison uses a leave-one-person-out same-store median pooled across the prior four complete weeks. It fails closed when cohort sufficiency gates are not met. Store totals are never a person fallback."),
+        ("Targets", "Management Setup targets apply only to store/group operational context. They do not create person-level coaching prompts."),
+        ("Signal Scoring", "Person-level movement and peer comparison use separately calibrated Sales / Guest and Wine % bands only. Check Count, Rate of Sale, and Ticket Time are context only. Rank is display-only and contributes no points. A prompt requires aligned movement and peer context, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
+        ("Review Gate", "Generated rows start at Review Needed. A later workflow state requires Review Disposition, Reviewed By, and Review Date; the signal cannot be the sole basis for an adverse employment decision."),
+        ("Technical Trend Detail", "Server Week-over-Week Detail is descriptive audit context. Generated coaching prompts use Recent Movement, peer comparison, evidence stability, and two-week persistence."),
+        ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward between weekly runs. Cleared signals move to Action History."),
         (
             "Evidence Contract",
             "Action and reason codes, exact evidence weeks, source hashes/parser "
-            f"provenance, and metric inputs use methodology {MANAGEMENT_METHODOLOGY_VERSION}.",
+            f"provenance, comparator/cohort metadata, review disposition, and metric inputs use methodology {MANAGEMENT_METHODOLOGY_VERSION}.",
         ),
-        ("Metric Rule", "Check average and wine percent are recalculated from rolled-up sales, guests, and wine sales."),
-        ("Metric Rule", "Rate of sale and ticket time are guest-weighted averages."),
+        ("Metric Rule", "Sales / Guest and Wine % are recalculated from rolled-up sales, guests, and wine sales. Sales / Check and Guests / Check are shown only with complete Check Count coverage."),
+        ("Metric Caveat", "Red Onion defines Rate of Sale as opportunities divided by qualifying sales, where lower is better; totals use opportunities divided by inferred qualifying sales. Ticket Time is Check Count-weighted only and is unavailable for legacy periods without Check Count. Both are descriptive context and cannot create person-level prompts."),
     ]
     for row, (label, value) in enumerate(note_rows, start=4):
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 45 if label == "8-Week Direction" else 30
+        ws.row_dimensions[row].height = (
+            60
+            if label
+            in {
+                "8-Week Direction",
+                "Peer Comparison",
+                "Signal Scoring",
+                "Metric Caveat",
+            }
+            else 42
+            if label in {"Check Count Coverage", "Metric Rule"}
+            else 30
+        )
 
 
 def protect_worksheet(ws, password: str) -> None:
@@ -8478,6 +11518,7 @@ def finalize_management_workbook(wb: Workbook) -> None:
         if sheet.title in VISIBLE_MANAGEMENT_SHEETS:
             sheet.sheet_state = "visible"
             add_management_navigation(sheet)
+            configure_management_print_layout(sheet)
         else:
             sheet.sheet_state = "veryHidden"
         protect_worksheet(sheet, protection_password)
@@ -8486,9 +11527,10 @@ def finalize_management_workbook(wb: Workbook) -> None:
     wb._sheets = ordered
     wb.active = 0
     tab_colors = {
+        "How to Use": "FFD966",
         "Dashboard": "7A1E1E", "Action Focus": "C00000",
         "Action Board": "C00000", "Server Scorecard": "5B9BD5",
-        "Store & Group Scorecards": "70AD47", "Rising & Falling Stars": "FFC000",
+        "Store & Group Scorecards": "70AD47", "Recent Movement Signals": "FFC000",
         "Evidence Detail": "8064A2", "Action History": "A5A5A5",
         "Data Quality": "5B9BD5", "Management Setup": "4472C4",
         "Run Notes": "7F7F7F",
@@ -8556,7 +11598,8 @@ def write_master_workbook(
             remove_sheet_if_present(wb, "_Data Quality Detail")
             wb["Data Quality"].title = "_Data Quality Detail"
         for name in (
-            "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars", "Run Notes",
+            "How to Use", "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars",
+            "Recent Movement Signals", "Run Notes",
             "Server Scorecard", "Store & Group Scorecards", "Action History", "Management Setup",
             "Evidence Detail",
         ):
@@ -8600,6 +11643,7 @@ def write_master_workbook(
             wb, records, weekly_location_rows, weekly_group_rows, visible_server_rows,
             store_rows, group_rows, current_actions, config, readiness,
         )
+        write_how_to_use_sheet(wb)
         finalize_management_workbook(wb)
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
@@ -9409,7 +12453,7 @@ def verify_integrity_state(
         )
         payload["_legacy_master_upgrade_pending"] = (
             allow_legacy_master_upgrade
-            and pre_contract_management_workbook(master_path)
+            and management_workbook_upgrade_pending(master_path)
         )
     elif os.path.lexists(master_path):
         raise IntegrityError(
@@ -9928,6 +12972,8 @@ def run(args: argparse.Namespace) -> list[Path]:
         if bool(getattr(args, "initialize_integrity_baseline", False))
         else "history-migration"
         if bool(getattr(args, "migrate_history_only", False))
+        else "history-rebuild"
+        if bool(getattr(args, "rebuild_from_history", False))
         else "weekly-run"
     )
     run_id = str(uuid.uuid4())
@@ -10012,6 +13058,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         Path(path).resolve() for path in (getattr(args, "migrate_history_from", None) or [])
     ]
     migration_only = bool(getattr(args, "migrate_history_only", False))
+    rebuild_from_history = bool(getattr(args, "rebuild_from_history", False))
     initialize_baseline = bool(
         getattr(args, "initialize_integrity_baseline", False)
     )
@@ -10020,6 +13067,16 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     if initialize_baseline and (migration_only or migration_sources):
         raise ValueError(
             "--initialize-integrity-baseline cannot be combined with history migration options."
+        )
+    if rebuild_from_history and (migration_only or initialize_baseline):
+        raise ValueError(
+            "--rebuild-from-history cannot be combined with "
+            "--migrate-history-only or --initialize-integrity-baseline."
+        )
+    if rebuild_from_history and (args.week_start or args.week_end):
+        raise ValueError(
+            "--rebuild-from-history selects the latest complete historical week "
+            "and cannot be combined with --week-start or --week-end."
         )
 
     record_run_stage(
@@ -10040,12 +13097,12 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         return [latest]
 
     active_paths: list[Path] = []
-    if not migration_only:
+    if not migration_only and not rebuild_from_history:
         active_paths = daily_report_paths(input_dir)
         if not active_paths:
             raise FileNotFoundError(
                 f"No active daily reports ({DAILY_REPORT_FORMAT_LABEL}) found in {input_dir}. "
-                "Drop current Toast reports into 01 Daily Reports - Drop Here and rerun."
+                "Drop current Red Onion daily reports into 01 Daily Reports - Drop Here and rerun."
             )
 
     previous_manifest, previous_payload, previous_manifest_hash = ensure_integrity_preflight(
@@ -10061,8 +13118,8 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     if migration_only and legacy_master_upgrade_pending:
         raise IntegrityError(
             "History-only migration is blocked while the manifest-pinned master workbook "
-            "awaits its one-way protection-contract upgrade. Run the next ordinary weekly "
-            "snapshot first; no files were changed."
+            "awaits its one-way workbook-contract upgrade. Run the next ordinary weekly "
+            "snapshot or an approved combined history rebuild; no files were changed."
         )
 
     migration_plan = (
@@ -10150,30 +13207,44 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             raise
         return copied_paths
 
-    record_run_stage(
-        args,
-        RunStage.READING_INPUTS,
-        "Capturing and validating the active weekly input files.",
-    )
-    active_captures = capture_active_inputs(active_paths, input_dir)
-    with tempfile.TemporaryDirectory(
-        prefix=".weekly-input-", dir=str(integrity_manifest_dir(archive_dir))
-    ) as input_stage_name:
-        input_stage = Path(input_stage_name)
-        captured_parse_paths: list[Path] = []
-        for capture in active_captures:
-            staged_input = input_stage / capture.source.name
-            written_hash = verified_write_bytes(capture.content, staged_input)
-            if written_hash != capture.fingerprint.sha256:
-                raise IntegrityError(
-                    f"Input staging verification failed for {capture.source.name}."
-                )
-            captured_parse_paths.append(staged_input)
-        raw_active_records_by_path = read_reports_by_path(captured_parse_paths, config)
-    active_resolution = resolve_report_duplicates(raw_active_records_by_path)
-    active_records_by_path = active_resolution.records_by_path
-    _, active_week_end = active_week_for_paths(active_records_by_path)
-    active_records = flatten_report_records(active_records_by_path)
+    active_captures: tuple[CapturedActiveInput, ...] = ()
+    active_resolution = ReportResolution({}, (), ())
+    active_records_by_path: dict[Path, list[MetricRecord]] = {}
+    active_records: list[MetricRecord] = []
+    active_week_end: date | None = None
+    if rebuild_from_history:
+        record_run_stage(
+            args,
+            RunStage.READING_INPUTS,
+            "Reading only manifest-pinned history for a protected rebuild.",
+        )
+    else:
+        record_run_stage(
+            args,
+            RunStage.READING_INPUTS,
+            "Capturing and validating the active weekly input files.",
+        )
+        active_captures = tuple(capture_active_inputs(active_paths, input_dir))
+        with tempfile.TemporaryDirectory(
+            prefix=".weekly-input-", dir=str(integrity_manifest_dir(archive_dir))
+        ) as input_stage_name:
+            input_stage = Path(input_stage_name)
+            captured_parse_paths: list[Path] = []
+            for capture in active_captures:
+                staged_input = input_stage / capture.source.name
+                written_hash = verified_write_bytes(capture.content, staged_input)
+                if written_hash != capture.fingerprint.sha256:
+                    raise IntegrityError(
+                        f"Input staging verification failed for {capture.source.name}."
+                    )
+                captured_parse_paths.append(staged_input)
+            raw_active_records_by_path = read_reports_by_path(
+                captured_parse_paths, config
+            )
+        active_resolution = resolve_report_duplicates(raw_active_records_by_path)
+        active_records_by_path = active_resolution.records_by_path
+        _, active_week_end = active_week_for_paths(active_records_by_path)
+        active_records = flatten_report_records(active_records_by_path)
 
     if migration_plan is not None:
         historical_records_by_path = migration_plan.effective_records_by_path
@@ -10196,6 +13267,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
     combined_records_by_path.update(active_records_by_path)
     combined_resolution = resolve_report_duplicates(combined_records_by_path)
     records = flatten_report_records(combined_resolution.records_by_path)
+    validate_daily_location_reconciliation(records, config)
 
     duplicate_paths = sorted(
         {
@@ -10213,29 +13285,89 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         "conflicts": 0,
     }
 
-    public_start, public_end = selected_public_dates(
-        active_records, args.week_start, args.week_end
-    )
-    validated_data_quality_coverage(records, public_start, public_end)
-    selected_records = [
+    if rebuild_from_history:
+        _, weekly_location_rows = weekly_rollups(records)
+        full_by_location, _ = full_week_ends_by_location(weekly_location_rows)
+        configured_locations = set(config["locations"])
+        missing_locations = sorted(
+            configured_locations - set(full_by_location),
+            key=str.casefold,
+        )
+        complete_week_ends = (
+            set.intersection(
+                *(full_by_location[location] for location in configured_locations)
+            )
+            if not missing_locations
+            else set()
+        )
+        if not complete_week_ends:
+            missing_detail = (
+                " Missing all history for: " + ", ".join(missing_locations) + "."
+                if missing_locations
+                else ""
+            )
+            raise ValueError(
+                "History rebuild requires at least one complete Tuesday-Sunday "
+                "week for every configured location."
+                f"{missing_detail} No files were changed."
+            )
+        active_week_end = max(complete_week_ends)
+        public_start, public_end = week_period_for(active_week_end)
+    else:
+        public_start, public_end = selected_public_dates(
+            active_records, args.week_start, args.week_end
+        )
+    output_history_records = [
         record
         for record in records
+        if not rebuild_from_history or record.report_date <= public_end
+    ]
+    validated_data_quality_coverage(
+        output_history_records, public_start, public_end
+    )
+    selected_records = [
+        record
+        for record in output_history_records
         if public_start <= record.report_date <= public_end and is_operating_day(record.report_date)
     ]
     if not selected_records:
         raise ValueError(f"No records found between {public_start} and {public_end}.")
 
+    assert active_week_end is not None
     required_staging_bytes = assert_staging_capacity(
         output_dir, archive_dir, active_captures
     )
     print("Preflight summary:")
     print(f"  Snapshot dates: {public_start:%Y-%m-%d} through {public_end:%Y-%m-%d}")
-    print(f"  Active input files: {len(active_captures)}")
+    print(
+        "  Active input files: "
+        + (
+            "0 (protected history rebuild)"
+            if rebuild_from_history
+            else str(len(active_captures))
+        )
+    )
     print(f"  Unique business days in history: {len(combined_resolution.business_dates)}")
     print(f"  Semantic duplicate files ignored: {len(duplicate_paths)}")
     print(
-        "  Latest-week readiness: "
-        + ("Ready" if latest_week_readiness(records, weekly_rollups(records)[1], config).ready else "Preliminary")
+        "  Selected-week readiness: "
+        + (
+            "Ready"
+            if latest_week_readiness(
+                [
+                    record
+                    for record in records
+                    if record.report_date <= public_end
+                ],
+                [
+                    row
+                    for row in weekly_rollups(records)[1]
+                    if row["week_end"] <= public_end
+                ],
+                config,
+            ).ready
+            else "Preliminary"
+        )
     )
     print(
         f"  Staging capacity reserved: {required_staging_bytes / (1024 ** 2):.0f} MiB minimum"
@@ -10308,10 +13440,14 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 expected_existing_hashes[current_master.name.casefold()] = None
             staged_paths.append(
                 write_master_workbook(
-                    records,
+                    output_history_records,
                     staged_master,
                     config,
-                    input_dir,
+                    (
+                        canonical_daily_archive_dir(archive_dir)
+                        if rebuild_from_history
+                        else input_dir
+                    ),
                     public_start,
                     public_end,
                 )
@@ -10323,8 +13459,13 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 args,
                 RunStage.PUBLISHING,
                 "Staged workbooks validated; rechecking inputs and publishing exact bytes.",
+                readiness={
+                    "workbook": RunReadiness.READY,
+                    "distribution": RunReadiness.RUNNING,
+                },
             )
-            verify_captured_active_inputs(active_captures, input_dir)
+            if not rebuild_from_history:
+                verify_captured_active_inputs(active_captures, input_dir)
             assert_manifest_head(
                 archive_dir,
                 previous_manifest,
@@ -10343,9 +13484,10 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 migration_copied_hashes = history_migration_expected_hashes(
                     migration_plan, migration_copied
                 )
-            active_copies = copy_captured_active_files_verified(
-                active_captures, archive_dir, active_week_end
-            )
+            if not rebuild_from_history:
+                active_copies = copy_captured_active_files_verified(
+                    active_captures, archive_dir, active_week_end
+                )
             (
                 final_paths,
                 snapshot_run,
@@ -10362,7 +13504,8 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 expected_existing_hashes=expected_existing_hashes,
             )
 
-            verify_captured_active_inputs(active_captures, input_dir)
+            if not rebuild_from_history:
+                verify_captured_active_inputs(active_captures, input_dir)
             input_inventory = tuple(capture.fingerprint for capture in active_captures)
             raw_root = canonical_daily_archive_dir(archive_dir).resolve()
             archived_destinations = [
@@ -10408,19 +13551,28 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 output_dir=output_dir,
                 config_path=config_path,
                 config=config,
-                kind="weekly-run",
+                kind=(
+                    "history-rebuild"
+                    if rebuild_from_history
+                    else "weekly-run"
+                ),
                 run_id=run_id,
                 previous_manifest=previous_manifest,
                 expected_previous_sha256=previous_manifest_hash,
                 integrity_state=expected_state,
                 details={
                     "source_manifest_sha256": previous_manifest_hash,
+                    "rebuild_from_history": rebuild_from_history,
                     "active_input_inventory": inventory_dicts(input_inventory),
                     "archived_destinations": archived_destinations,
                     "history_migration_files": [path.name for path in migration_copied],
                     "public_snapshot_start": public_start.isoformat(),
                     "public_snapshot_end": public_end.isoformat(),
-                    "active_week_end": active_week_end.isoformat(),
+                    (
+                        "history_week_end"
+                        if rebuild_from_history
+                        else "active_week_end"
+                    ): active_week_end.isoformat(),
                     "published_workbooks": [path.name for path in final_paths],
                 },
             )
@@ -10435,10 +13587,23 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 new_manifest_hash,
                 anchor_dir,
             )
+            # The manifest and trusted anchor now form the committed state. Any later
+            # status-reporting or intake-cleanup failure must not roll back outputs while
+            # leaving the independently stored anchor pointed at a removed manifest.
             manifest_committed = True
-            quarantine_and_delete_captured_inputs(
-                active_captures, active_copies, input_dir, run_id
+            record_run_stage(
+                args,
+                RunStage.COMMITTING_MANIFEST,
+                (
+                    "Integrity manifest and trusted anchor verified; exact local "
+                    "publication is complete."
+                ),
+                readiness={"distribution": RunReadiness.READY},
             )
+            if not rebuild_from_history:
+                quarantine_and_delete_captured_inputs(
+                    active_captures, active_copies, input_dir, run_id
+                )
             return final_paths
         except Exception as exc:
             if not manifest_committed:
@@ -10502,6 +13667,46 @@ def parse_json_cell(value: Any, *, label: str, expected_type: type) -> Any:
     return parsed
 
 
+def validate_v2_management_evidence_workbook(
+    workbook_path: Path,
+    expected_digest: str,
+) -> str:
+    """Accept only current or protected pre-guide workbooks with the V2 action schema."""
+
+    wb = load_workbook(workbook_path, data_only=False)
+    try:
+        protection_contract = stamped_workbook_protection_contract(wb)
+        action_headers = (
+            {
+                str(cell.value)
+                for cell in wb["Action Board"][4]
+                if cell.value is not None
+            }
+            if "Action Board" in wb.sheetnames
+            else set()
+        )
+        has_v2_action_schema = {
+            "Context Notes",
+            "Review Disposition",
+            "Evidence Status",
+        }.issubset(action_headers)
+        has_guide = "How to Use" in wb.sheetnames
+    finally:
+        wb.close()
+
+    if (
+        protection_contract != WORKBOOK_PROTECTION_CONTRACT
+        or not has_v2_action_schema
+    ):
+        raise IntegrityError(
+            "Management Evidence Package V2 requires the protected V2 action schema; "
+            "legacy workbook evidence cannot be relabeled or promoted as V2."
+        )
+    if has_guide:
+        return validate_management_workbook(workbook_path, expected_digest)
+    return validate_pre_guide_management_workbook(workbook_path, expected_digest)
+
+
 def verified_evidence_source(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Path]:
@@ -10538,11 +13743,19 @@ def verified_evidence_source(
         raise IntegrityError(
             "The current manifest does not record a management workbook digest."
         )
-    validate_management_workbook(workbook_path, expected_digest)
+    validate_v2_management_evidence_workbook(workbook_path, expected_digest)
     wb = load_workbook(workbook_path, data_only=False)
     try:
+        allowed_reviewers = (
+            active_owner_names(
+                owner_roster_from_sheet(wb["Management Setup"])
+            )
+            if "Management Setup" in wb.sheetnames
+            else None
+        )
         action_rows = validate_action_board_records(
-            records_from_sheet(wb["Action Board"], "Action ID")
+            records_from_sheet(wb["Action Board"], "Action ID"),
+            allowed_reviewers=allowed_reviewers,
         )
         evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
     finally:
@@ -10588,7 +13801,7 @@ def verified_evidence_source(
 
 def build_management_evidence_package(
     args: argparse.Namespace,
-) -> ManagementEvidencePackageV1:
+) -> ManagementEvidencePackageV2:
     source, rows, _ = verified_evidence_source(args)
     created_text = str(source.get("manifest_created_at_utc") or "")
     try:
@@ -10597,11 +13810,11 @@ def build_management_evidence_package(
         raise IntegrityError(
             "The trusted manifest has an invalid creation timestamp."
         ) from exc
-    records: list[EvidenceRecord] = []
+    records: list[EvidenceRecordV2] = []
     for row in rows:
         due_date = as_date(row.get("Due Date"))
         records.append(
-            EvidenceRecord(
+            EvidenceRecordV2(
                 action_id=str(row.get("Action ID") or ""),
                 evidence_id=str(row.get("Evidence ID") or ""),
                 action_code=str(row.get("Action Code") or ""),
@@ -10631,10 +13844,32 @@ def build_management_evidence_package(
                     row.get("Methodology Version")
                     or MANAGEMENT_METHODOLOGY_VERSION
                 ),
+                comparator_type=str(
+                    row.get("Comparator Type")
+                    or "Same-store prior-four-week median"
+                ),
+                peer_cohort_size=int(row.get("Peer Cohort Size") or 0),
+                peer_cohort_weeks=int(row.get("Peer Cohort Weeks") or 0),
+                threshold_version=str(
+                    row.get("Threshold Version")
+                    or MANAGEMENT_METHODOLOGY_VERSION
+                ),
+                evidence_status=str(row.get("Evidence Status") or ""),
+                recurring_drivers=str(row.get("Recurring Drivers") or ""),
+                stability_result=str(row.get("Stability Result") or ""),
+                review_disposition=str(
+                    row.get("Review Disposition") or "Pending Review"
+                ),
+                reviewed_by=str(row.get("Reviewed By") or ""),
+                review_date=(
+                    as_date(row.get("Review Date")).isoformat()
+                    if as_date(row.get("Review Date"))
+                    else None
+                ),
             )
         )
     records.sort(key=lambda item: (item.priority, item.location, item.action_id))
-    return ManagementEvidencePackageV1(
+    return ManagementEvidencePackageV2(
         source=source,
         records=tuple(records),
         retention_delete_after=(created + timedelta(days=365)).date().isoformat(),
@@ -10657,8 +13892,8 @@ def stage_management_evidence(
     candidate_sha256 = sha256_file(candidate_path)
     fingerprint_path = evidence_fingerprint_path(candidate_path)
     fingerprint = {
-        "schema_version": 1,
-        "contract": "ManagementEvidenceCandidateFingerprintV1",
+        "schema_version": 2,
+        "contract": "ManagementEvidenceCandidateFingerprintV2",
         "candidate_file": candidate_path.name,
         "candidate_sha256": candidate_sha256,
         "candidate_size": candidate_path.stat().st_size,
@@ -10675,7 +13910,7 @@ def stage_management_evidence(
     write_json_atomic(
         template_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "decision": "APPROVE",
             "candidate_sha256": candidate_sha256,
             "fingerprint_sha256": fingerprint_sha256,
@@ -10707,9 +13942,9 @@ def promote_approved_management_evidence(
     approval_sha256 = sha256_file(approval_path)
     fingerprint = read_json_manifest(fingerprint_path)
     approval = read_json_manifest(approval_path)
-    if approval.get("schema_version") != 1 or approval.get("decision") != "APPROVE":
+    if approval.get("schema_version") != 2 or approval.get("decision") != "APPROVE":
         raise IntegrityError(
-            "Approval must use schema_version 1 and the exact decision APPROVE."
+            "Approval must use schema_version 2 and the exact decision APPROVE."
         )
     for field, actual in (
         ("candidate_sha256", candidate_sha256),
@@ -10734,10 +13969,18 @@ def promote_approved_management_evidence(
         str(fingerprint.get("candidate_sha256") or ""), candidate_sha256
     ):
         raise IntegrityError("The fingerprint does not bind the candidate bytes.")
-    package = read_json_manifest(candidate_path)
     if (
-        package.get("contract") != "ManagementEvidencePackageV1"
-        or package.get("schema_version") != 1
+        fingerprint.get("schema_version") != 2
+        or fingerprint.get("contract")
+        != "ManagementEvidenceCandidateFingerprintV2"
+    ):
+        raise IntegrityError(
+            "The fingerprint must use ManagementEvidenceCandidateFingerprintV2."
+        )
+    package = read_json_manifest(candidate_path)
+    package_contract = (package.get("contract"), package.get("schema_version"))
+    if (
+        package_contract != ("ManagementEvidencePackageV2", 2)
         or package.get("retention", {}).get("days") != 365
         or package.get("distribution", {}).get("automatic_upload") is not False
         or package.get("distribution", {}).get("automatic_send") is not False
@@ -10779,8 +14022,8 @@ def promote_approved_management_evidence(
     write_json_atomic(
         receipt_path,
         {
-            "schema_version": 1,
-            "contract": "ManagementEvidenceApprovalReceiptV1",
+            "schema_version": 2,
+            "contract": "ManagementEvidenceApprovalReceiptV2",
             "candidate_sha256": candidate_sha256,
             "fingerprint_sha256": fingerprint_sha256,
             "approval_sha256": approval_sha256,
@@ -10859,6 +14102,7 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
     integrity_status = "Attention"
     integrity_detail = "Archive and finished-report folders must exist."
     latest_manifest: Path | None = None
+    verified_manifest_payload: dict[str, Any] = {}
     if archive_dir.is_dir() and output_dir.is_dir() and config is not None:
         try:
             latest_manifest = latest_integrity_manifest_path(archive_dir)
@@ -10877,7 +14121,7 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
                 raise IntegrityError(
                     "The latest manifest does not match the machine-local trusted head."
                 )
-            _, verified_sha256 = verify_integrity_state(
+            verified_manifest_payload, verified_sha256 = verify_integrity_state(
                 archive_dir, output_dir, latest_manifest
             )
             if not secrets.compare_digest(verified_sha256, anchored_sha256):
@@ -10891,6 +14135,53 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             integrity_detail = str(exc)
     add("Integrity", integrity_status, integrity_detail)
+
+    recorded_master_digest = verified_manifest_payload.get(
+        "master_generated_content_sha256"
+    )
+    workbook_status = (
+        "Ready"
+        if integrity_status == "Ready"
+        and isinstance(recorded_master_digest, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", recorded_master_digest)
+        else "Attention"
+    )
+    workbook_detail = (
+        "Protected generated master content matches the manifest-recorded digest."
+        if workbook_status == "Ready"
+        else (
+            "The verified manifest does not record a protected management workbook."
+            if integrity_status == "Ready"
+            else integrity_detail
+        )
+    )
+    add("Workbook", workbook_status, workbook_detail)
+
+    published_inventory = verified_manifest_payload.get(
+        "published_output_inventory"
+    )
+    publication_status = (
+        "Ready"
+        if workbook_status == "Ready"
+        and isinstance(published_inventory, list)
+        and bool(published_inventory)
+        else "Attention"
+    )
+    publication_detail = (
+        "Exact managed per-location workbook bytes and protected generated master "
+        f"content are verified by {latest_manifest.name}."
+        if publication_status == "Ready" and latest_manifest is not None
+        else (
+            "The verified manifest does not record managed per-location published workbooks."
+            if integrity_status == "Ready"
+            else integrity_detail
+        )
+    )
+    add(
+        "Local publication",
+        publication_status,
+        publication_detail,
+    )
 
     overall = (
         "Ready"
@@ -10917,17 +14208,21 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "workbook": (
                 RunReadiness.READY.value
-                if integrity_status == "Ready"
+                if workbook_status == "Ready"
                 else RunReadiness.ATTENTION.value
             ),
-            "distribution": RunReadiness.NOT_EVALUATED.value,
-            "recovery": RunReadiness.NOT_CHECKED.value,
+            "distribution": (
+                RunReadiness.READY.value
+                if publication_status == "Ready"
+                else RunReadiness.ATTENTION.value
+            ),
+            "recovery": RunReadiness.EXTERNAL_CHECK_REQUIRED.value,
         },
         "latest_manifest": latest_manifest.name if latest_manifest else None,
         "checks": checks,
         "note": (
-            "Independent Google Drive backup freshness is NotChecked by this local, "
-            "read-only command."
+            "Independent Google Drive backup freshness and restore-test evidence require "
+            "a separate external verification; this local command does not access Drive."
         ),
     }
 
@@ -10936,7 +14231,10 @@ def print_health_check(payload: dict[str, Any]) -> None:
     print(f"Red Onion health: {payload['overall']}")
     for check in payload["checks"]:
         print(f"  [{check['status']}] {check['name']}: {check['detail']}")
-    print(f"  [NotChecked] Recovery: {payload['note']}")
+    print(
+        "  "
+        f"[{payload['readiness']['recovery']}] Independent recovery: {payload['note']}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -10983,6 +14281,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Perform the copy-only history migration without generating weekly workbooks.",
     )
     parser.add_argument(
+        "--rebuild-from-history",
+        action="store_true",
+        help=(
+            "Maintainer-only: rebuild and publish the latest complete week from "
+            "manifest-pinned history without reading, moving, or deleting active "
+            "drop-folder files. May be combined with --migrate-history-from."
+        ),
+    )
+    parser.add_argument(
         "--initialize-integrity-baseline",
         action="store_true",
         help=(
@@ -11018,7 +14325,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-management-evidence",
         metavar="CANDIDATE_JSON",
         help=(
-            "Stage a local ManagementEvidencePackageV1 candidate and exact fingerprint. "
+            "Stage a local ManagementEvidencePackageV2 candidate and exact fingerprint. "
             "With --approval-file, promote the already-reviewed exact bytes into the "
             "local approved-evidence archive."
         ),
@@ -11026,7 +14333,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--approval-file",
         help=(
-            "Explicit schema-v1 approval bound to the staged candidate and fingerprint. "
+            "Explicit schema-v2 approval bound to the staged candidate and fingerprint. "
             "This never uploads or sends the evidence."
         ),
     )
@@ -11035,6 +14342,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.rebuild_from_history:
+        incompatible_rebuild = (
+            args.validate_config
+            or args.health_check
+            or args.health_check_json
+            or args.initialize_integrity_baseline
+            or args.migrate_history_only
+            or bool(args.rebind_restored_integrity_anchor)
+            or bool(args.export_management_evidence)
+            or bool(args.approval_file)
+            or bool(args.week_start)
+            or bool(args.week_end)
+        )
+        if incompatible_rebuild:
+            raise SystemExit(
+                "ERROR: --rebuild-from-history may be combined only with "
+                "--migrate-history-from and normal path/config options."
+            )
     if args.rebind_restored_integrity_anchor:
         incompatible = (
             args.validate_config
@@ -11042,6 +14367,7 @@ def main() -> None:
             or args.health_check_json
             or args.initialize_integrity_baseline
             or args.migrate_history_only
+            or args.rebuild_from_history
             or bool(args.migrate_history_from)
             or bool(args.export_management_evidence)
             or bool(args.approval_file)
@@ -11119,6 +14445,10 @@ def main() -> None:
                 print(f"  {path}")
         else:
             print("History migration complete: the canonical archive is already up to date.")
+    elif args.rebuild_from_history:
+        print("History rebuilt and published:")
+        for path in generated:
+            print(f"  {path}")
     else:
         print("Generated:")
         for path in generated:

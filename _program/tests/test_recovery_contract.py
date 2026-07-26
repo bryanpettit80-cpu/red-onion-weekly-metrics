@@ -33,11 +33,18 @@ def test_recovery_bundle_defaults_to_released_source_only() -> None:
     assert "Operational source state changed during recovery capture" in script
     assert "Test-UnsafeReparsePoint" in script
     assert "Test-SafeCloudReparsePoint" in script
+<<<<<<< HEAD
     assert '$Entry.PSObject.Properties["LinkType"]' in script
     assert '$Entry.PSObject.Properties["Target"]' in script
     assert "ReparsePointHelper" in script
     assert "DeviceIoControl" in script
     assert 'ToUInt32("9000001A", 16)' in script
+=======
+    assert "NativeReparsePoint" in script
+    assert '$Entry.PSObject.Properties["LinkType"]' in script
+    assert '$Entry.PSObject.Properties["Target"]' in script
+    assert "0x9000001A" in script
+>>>>>>> origin/main
     assert "NameSurrogateBit" in script
 
 

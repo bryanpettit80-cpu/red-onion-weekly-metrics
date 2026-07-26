@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from datetime import date
 import json
 import math
 from pathlib import Path
@@ -32,19 +33,57 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dashboard_exclude_name_contains": ["Banquet", "Server"],
     "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout"],
     "management_score_thresholds": {
-        "check_average": {"neutral": 2.5, "strong": 5.0, "lower_is_better": False},
-        "wine_pct": {"neutral": 0.005, "strong": 0.01, "lower_is_better": False},
+        "check_average": {"neutral": 11.5, "strong": 17.5, "lower_is_better": False},
+        "wine_pct": {"neutral": 0.041, "strong": 0.057, "lower_is_better": False},
         "rate_of_sale_by_guest_count": {
-            "neutral": 0.005,
-            "strong": 0.01,
+            "neutral": 0.019,
+            "strong": 0.027,
             "lower_is_better": True,
         },
         "average_ticket_time_seconds": {
-            "neutral": 150.0,
-            "strong": 300.0,
+            "neutral": 720.0,
+            "strong": 1140.0,
             "lower_is_better": True,
         },
     },
+    "management_peer_score_thresholds": {
+        "check_average": {"neutral": 11.0, "strong": 16.5, "lower_is_better": False},
+        "wine_pct": {"neutral": 0.039, "strong": 0.054, "lower_is_better": False},
+        "rate_of_sale_by_guest_count": {
+            "neutral": 0.019,
+            "strong": 0.028,
+            "lower_is_better": True,
+        },
+        "average_ticket_time_seconds": {
+            "neutral": 840.0,
+            "strong": 1080.0,
+            "lower_is_better": True,
+        },
+    },
+    "management_peer_reference": {
+        "prior_full_weeks": 4,
+        "min_prior_full_weeks": 3,
+        "min_distinct_peers_per_week": 5,
+        "min_peer_server_weeks": 20,
+        "statistic": "median",
+        "leave_one_person_out": True,
+    },
+    "management_signal_persistence": {
+        "qualified_weeks": 2,
+        "require_recurring_driver": True,
+        "require_leave_one_active_day_stability": True,
+    },
+    "management_threshold_calibration": {
+        "method": "r7-absolute-deviation",
+        "neutral_quantile": 0.75,
+        "strong_quantile": 0.9,
+        "calibration_start": "2026-03-24",
+        "calibration_end": "2026-07-19",
+        "movement_observation_count": 454,
+        "peer_observation_count": 404,
+        "version": "2026.07-v3",
+    },
+    "management_min_entity_baseline_weeks": 2,
     "management_materiality": {
         "sales_pct": 0.05,
         "guest_pct": 0.05,
@@ -91,6 +130,7 @@ POSITIVE_INTEGER_FIELDS = {
     "dashboard_long_term_developing_min_earlier_weeks",
     "dashboard_long_term_developing_min_recent_guests",
     "dashboard_long_term_developing_min_earlier_guests",
+    "management_min_entity_baseline_weeks",
 }
 
 
@@ -247,46 +287,184 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
             _require_string(source, "public_name_aliases key")
             _require_string(target, f"public_name_aliases.{source}")
 
-    if "management_score_thresholds" in payload:
-        thresholds = _require_mapping(
-            payload["management_score_thresholds"], "management_score_thresholds"
-        )
-        allowed_metrics = set(DEFAULT_CONFIG["management_score_thresholds"])
-        _reject_unknown_fields(thresholds, allowed_metrics, "management_score_thresholds")
+    for threshold_family in (
+        "management_score_thresholds",
+        "management_peer_score_thresholds",
+    ):
+        if threshold_family not in payload:
+            continue
+        thresholds = _require_mapping(payload[threshold_family], threshold_family)
+        allowed_metrics = set(DEFAULT_CONFIG[threshold_family])
+        _reject_unknown_fields(thresholds, allowed_metrics, threshold_family)
         for metric, settings_value in thresholds.items():
             settings = _require_mapping(
-                settings_value, f"management_score_thresholds.{metric}"
+                settings_value, f"{threshold_family}.{metric}"
             )
             _reject_unknown_fields(
                 settings,
                 {"neutral", "strong", "lower_is_better"},
-                f"management_score_thresholds.{metric}",
+                f"{threshold_family}.{metric}",
             )
             effective_settings = _deep_merge(
-                DEFAULT_CONFIG["management_score_thresholds"][metric], settings
+                DEFAULT_CONFIG[threshold_family][metric], settings
             )
             neutral = _require_finite_number(
                 effective_settings["neutral"],
-                f"management_score_thresholds.{metric}.neutral",
+                f"{threshold_family}.{metric}.neutral",
                 positive=True,
             )
             strong = _require_finite_number(
                 effective_settings["strong"],
-                f"management_score_thresholds.{metric}.strong",
+                f"{threshold_family}.{metric}.strong",
                 positive=True,
             )
-            if strong < neutral:
+            if strong <= neutral:
                 raise ConfigError(
-                    f"management_score_thresholds.{metric}.strong must be at least neutral."
+                    f"{threshold_family}.{metric}.strong must be greater than neutral."
                 )
             if metric in {"wine_pct", "rate_of_sale_by_guest_count"} and strong > 1:
                 raise ConfigError(
-                    f"management_score_thresholds.{metric}.strong cannot exceed 1."
+                    f"{threshold_family}.{metric}.strong cannot exceed 1."
                 )
             if not isinstance(effective_settings["lower_is_better"], bool):
                 raise ConfigError(
-                    f"management_score_thresholds.{metric}.lower_is_better must be boolean."
+                    f"{threshold_family}.{metric}.lower_is_better must be boolean."
                 )
+
+    if "management_peer_reference" in payload:
+        peer = _require_mapping(
+            payload["management_peer_reference"], "management_peer_reference"
+        )
+        allowed = set(DEFAULT_CONFIG["management_peer_reference"])
+        _reject_unknown_fields(peer, allowed, "management_peer_reference")
+        effective_peer = _deep_merge(DEFAULT_CONFIG["management_peer_reference"], peer)
+        for field in (
+            "prior_full_weeks",
+            "min_prior_full_weeks",
+            "min_distinct_peers_per_week",
+            "min_peer_server_weeks",
+        ):
+            _require_positive_integer(
+                effective_peer[field], f"management_peer_reference.{field}"
+            )
+        if (
+            effective_peer["min_prior_full_weeks"]
+            > effective_peer["prior_full_weeks"]
+        ):
+            raise ConfigError(
+                "management_peer_reference.min_prior_full_weeks cannot exceed "
+                "prior_full_weeks."
+            )
+        if effective_peer["statistic"] != "median":
+            raise ConfigError(
+                "management_peer_reference.statistic must be 'median'."
+            )
+        if not isinstance(effective_peer["leave_one_person_out"], bool):
+            raise ConfigError(
+                "management_peer_reference.leave_one_person_out must be boolean."
+            )
+        if effective_peer["leave_one_person_out"] is not True:
+            raise ConfigError(
+                "management_peer_reference.leave_one_person_out must be true for "
+                "methodology 2026.07-v3."
+            )
+
+    if "management_signal_persistence" in payload:
+        persistence = _require_mapping(
+            payload["management_signal_persistence"],
+            "management_signal_persistence",
+        )
+        allowed = set(DEFAULT_CONFIG["management_signal_persistence"])
+        _reject_unknown_fields(
+            persistence, allowed, "management_signal_persistence"
+        )
+        effective_persistence = _deep_merge(
+            DEFAULT_CONFIG["management_signal_persistence"], persistence
+        )
+        _require_positive_integer(
+            effective_persistence["qualified_weeks"],
+            "management_signal_persistence.qualified_weeks",
+        )
+        if effective_persistence["qualified_weeks"] != 2:
+            raise ConfigError(
+                "management_signal_persistence.qualified_weeks must be 2 for "
+                "methodology 2026.07-v3."
+            )
+        for field in (
+            "require_recurring_driver",
+            "require_leave_one_active_day_stability",
+        ):
+            if not isinstance(effective_persistence[field], bool):
+                raise ConfigError(
+                    f"management_signal_persistence.{field} must be boolean."
+                )
+            if effective_persistence[field] is not True:
+                raise ConfigError(
+                    f"management_signal_persistence.{field} must be true for "
+                    "methodology 2026.07-v3."
+                )
+
+    if "management_threshold_calibration" in payload:
+        calibration = _require_mapping(
+            payload["management_threshold_calibration"],
+            "management_threshold_calibration",
+        )
+        allowed = set(DEFAULT_CONFIG["management_threshold_calibration"])
+        _reject_unknown_fields(
+            calibration, allowed, "management_threshold_calibration"
+        )
+        effective_calibration = _deep_merge(
+            DEFAULT_CONFIG["management_threshold_calibration"], calibration
+        )
+        if effective_calibration["method"] != "r7-absolute-deviation":
+            raise ConfigError(
+                "management_threshold_calibration.method must be "
+                "'r7-absolute-deviation'."
+            )
+        neutral_q = _require_finite_number(
+            effective_calibration["neutral_quantile"],
+            "management_threshold_calibration.neutral_quantile",
+            positive=True,
+        )
+        strong_q = _require_finite_number(
+            effective_calibration["strong_quantile"],
+            "management_threshold_calibration.strong_quantile",
+            positive=True,
+        )
+        if not (neutral_q < strong_q < 1):
+            raise ConfigError(
+                "management_threshold_calibration quantiles must satisfy "
+                "0 < neutral_quantile < strong_quantile < 1."
+            )
+        for count_field in (
+            "movement_observation_count",
+            "peer_observation_count",
+        ):
+            observation_count = effective_calibration[count_field]
+            if (
+                isinstance(observation_count, bool)
+                or not isinstance(observation_count, int)
+                or observation_count < 0
+            ):
+                raise ConfigError(
+                    f"management_threshold_calibration.{count_field} must be a "
+                    "non-negative integer."
+                )
+        for field in ("calibration_start", "calibration_end"):
+            value = _require_string(
+                effective_calibration[field],
+                f"management_threshold_calibration.{field}",
+            )
+            try:
+                date.fromisoformat(value)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"management_threshold_calibration.{field} must be YYYY-MM-DD."
+                ) from exc
+        _require_string(
+            effective_calibration["version"],
+            "management_threshold_calibration.version",
+        )
 
     if "management_materiality" in payload:
         materiality = _require_mapping(
