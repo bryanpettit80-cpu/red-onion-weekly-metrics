@@ -33,10 +33,10 @@ def test_recovery_bundle_defaults_to_released_source_only() -> None:
     assert "Operational source state changed during recovery capture" in script
     assert "Test-UnsafeReparsePoint" in script
     assert "Test-SafeCloudReparsePoint" in script
-    assert 'if (-not ("ReparseTag" -as [type]))' in script
+    assert "NativeReparsePoint" in script
+    assert "if (-not ([System.Management.Automation.PSTypeName]'NativeReparsePoint').Type)" in script
     assert '$Entry.PSObject.Properties["LinkType"]' in script
     assert '$Entry.PSObject.Properties["Target"]' in script
-    assert "GetFileInformationByHandleEx" in script
     assert "0x9000001A" in script
     assert "NameSurrogateBit" in script
 
