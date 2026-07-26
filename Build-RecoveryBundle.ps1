@@ -64,7 +64,11 @@ function Get-TextSha256 {
     }
 }
 
+<<<<<<< HEAD
 if (-not ("ReparseTag" -as [type])) {
+=======
+if (-not ([System.Management.Automation.PSTypeName]"ReparseTag").Type) {
+>>>>>>> origin/copilot/do-not-key-tag-parsing-to-english-fsutil-output
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
