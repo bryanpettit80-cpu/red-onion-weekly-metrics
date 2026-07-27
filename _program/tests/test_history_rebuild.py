@@ -146,7 +146,9 @@ def test_history_rebuild_ignores_active_intake_and_commits_one_manifest(
     assert output_dir / "Red_Onion_Server_Master.xlsx" in generated
     workbook = load_workbook(output_dir / "Red_Onion_Server_Master.xlsx")
     try:
-        assert "Recent Movement Signals" in workbook.sheetnames
+        assert "Team Trends" in workbook.sheetnames
+        assert "Action Focus" not in workbook.sheetnames
+        assert "Recent Movement Signals" not in workbook.sheetnames
         assert "Rising & Falling Stars" not in workbook.sheetnames
     finally:
         workbook.close()

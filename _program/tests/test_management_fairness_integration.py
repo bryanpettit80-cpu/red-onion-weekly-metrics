@@ -232,6 +232,75 @@ def test_context_only_metrics_cannot_change_a_person_action() -> None:
     )
 
 
+def test_low_volume_server_keeps_descriptive_wow_but_remains_monitor() -> None:
+    rows, locations, config = synthetic_history()
+    latest_week_end = max(row["week_end"] for row in locations)
+    latest = next(
+        row
+        for row in rows
+        if row["raw_user_name"] == "entity-focus"
+        and row["week_end"] == latest_week_end
+    )
+    latest.update(
+        {
+            "gross_sales": 800.0,
+            "guest_count": 20.0,
+            "check_average": 40.0,
+            "wine_sales": 200.0,
+            "wine_pct": 0.25,
+            "active_days": 2,
+        }
+    )
+
+    result = focal_result(rows, locations, config)
+
+    assert result["confidence"] == "Limited Volume"
+    assert result["momentum"] == "Not Evaluated"
+    assert result["descriptive_recent_movement"] == "Upward"
+    assert result["previous_week_end"] == latest_week_end - timedelta(days=7)
+    assert result["week_over_week_changes"] == pytest.approx(
+        {
+            "check_average": 5.0,
+            "wine_pct": 0.05,
+        }
+    )
+    assert result["week_over_week_movement"] == "Improving"
+    assert result["action"] == "Monitor"
+    assert result["prominent"] is False
+    assert (
+        metrics.build_management_action_signals(
+            [result],
+            [],
+            [],
+            locations,
+        )
+        == []
+    )
+
+
+def test_missing_immediately_prior_calendar_week_leaves_wow_blank() -> None:
+    rows, locations, config = synthetic_history()
+    latest_week_end = max(row["week_end"] for row in locations)
+    immediately_prior = latest_week_end - timedelta(days=7)
+    rows = [
+        row
+        for row in rows
+        if not (
+            row["raw_user_name"] == "entity-focus"
+            and row["week_end"] == immediately_prior
+        )
+    ]
+
+    result = focal_result(rows, locations, config)
+
+    assert result["previous_week_end"] is None
+    assert result["week_over_week_changes"] == {
+        "check_average": None,
+        "wine_pct": None,
+    }
+    assert result["week_over_week_movement"] == "No prior week"
+
+
 @pytest.mark.parametrize(
     "value",
     [None, "", "not-a-number", float("nan"), float("inf")],

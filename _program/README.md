@@ -183,13 +183,15 @@ scheduling, discipline, promotion, or termination. See
 [MODEL_CARD.md](../MODEL_CARD.md) and
 [DATA_GOVERNANCE.md](../DATA_GOVERNANCE.md).
 
-The management `Server Scorecard` shows current sample, peer comparison,
-recent movement, evidence status, and exact history used. The protected
-`Evidence Detail` sheet records the comparator, cohort size, threshold version,
-stability result, evidence weeks, and source lineage.
+The management `Team Trends` sheet shows every current non-excluded server with
+current sample, exact consecutive-week Sales/Guest and Wine % changes,
+descriptive four-week movement, peer comparison, eight-week direction, evidence
+status, gated action outcome, and exact history used. Descriptive movement is
+visible even when action gates are not met; it does not create or strengthen a
+person-level prompt.
 
-`Action Focus` is the single execution view and links to editable fields on
-`Action Board`. `Evidence Detail` is protected/read-only and records stable
+`Action Board` is the single execution view and retains the seven editable
+management fields. `Evidence Detail` is protected/read-only and records stable
 codes, exact evidence weeks, source SHA-256/format/parser/date-source,
 methodology version, and metric evidence.
 

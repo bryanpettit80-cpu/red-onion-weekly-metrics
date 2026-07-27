@@ -66,8 +66,9 @@ Excel temporary files whose names start with `~$` are ignored.
 ```
 
 - The master workbook opens to a protected `How to Use` guide with the weekly workflow, signal meanings, required evidence review, editable-field rules, prohibited uses, and links to every visible sheet.
-- Every visible sheet uses the same Guide-to-Run navigation order and highlights the current sheet.
-- `Action Focus` presents current context reviews and coaching/recognition prompts and links each row back to the editable `Action Board`.
+- Every visible sheet has one consistent menu link back to the protected `How to Use` workbook map.
+- `Action Board` is the single current execution queue. Its blue Status, Owner, Due Date, Context Notes, Review Disposition, Reviewed By, and Review Date fields remain editable.
+- `Team Trends` shows every current non-excluded server with exact consecutive-week Sales/Guest and Wine % changes, descriptive four-week movement, eight-week direction, evidence status, and the separate gated action outcome. Descriptive movement does not bypass the coaching-signal gates.
 - `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, peer-reference details, metric inputs, stability results, review disposition, and methodology version.
 - `Data Quality` includes a latest-first 16-week location completeness matrix with explicit Complete, Partial, and Missing labels before the detailed exception and provenance sections.
 - Person-level signals require at least 25 guests, 3 active days, 2 prior full self-weeks, and 50 prior-period guests.

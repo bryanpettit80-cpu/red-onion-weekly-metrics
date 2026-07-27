@@ -136,20 +136,25 @@ def test_context_only_change_updates_audit_evidence_without_resetting_review() -
     assert current[0]["Review Date"] == date(2026, 7, 20)
 
 
-def test_action_focus_links_to_editable_board_and_evidence_is_read_only() -> None:
+def test_action_board_is_single_queue_and_evidence_links_to_it() -> None:
     wb = Workbook()
     wb.remove(wb.active)
     action = current_action()
     metrics.write_action_tracking_sheet(
         wb, "Action Board", [action], editable=True
     )
-    metrics.write_action_focus_sheet(wb, [action])
     metrics.write_evidence_detail_sheet(wb, [action], [])
 
-    focus = wb["Action Focus"]
+    board = wb["Action Board"]
     evidence = wb["Evidence Detail"]
-    assert focus["A6"].value == "Medium"
-    assert focus["M6"].hyperlink.target == "#'Action Board'!C5"
+    assert "Action Focus" not in wb.sheetnames
+    assert board["C3"].value.startswith("Single action queue:")
+    assert "C3:W3" in {str(merged) for merged in board.merged_cells.ranges}
+    assert board["C5"].value == "Medium"
+    assert all(
+        board.column_dimensions[column].hidden is True
+        for column in ("A", "B", "J", "M", "O", "P", "Q", "R", "T")
+    )
     assert evidence["A5"].value == action["Evidence ID"]
     assert evidence["A5"].hyperlink.target == "#'Action Board'!C5"
     assert evidence.column_dimensions["L"].hidden is True

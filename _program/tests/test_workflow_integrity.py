@@ -99,9 +99,177 @@ def install_synthetic_parser(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(metrics, "parse_daily_report", parse)
 
 
+def downgrade_master_to_pre_consolidation_layout(path: Path) -> str:
+    """Model the manifest-bound workbook before action/trend consolidation."""
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        if "Team Trends" in workbook.sheetnames:
+            current_actions = metrics.records_from_sheet(
+                workbook["Action Board"],
+                "Action ID",
+            )
+            workbook["Team Trends"].title = "Server Scorecard"
+            workbook["Server Scorecard"]["A1"] = "Server Scorecard"
+            metrics.write_action_focus_sheet(workbook, current_actions)
+            metrics.write_rising_falling_sheet(workbook, [])
+        else:
+            missing = [
+                name
+                for name in metrics.PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+                if name not in workbook.sheetnames
+            ]
+            assert not missing
+
+        guide = workbook["How to Use"]
+        for merged in list(guide.merged_cells.ranges):
+            if merged.min_row <= 57 and merged.max_row >= 46:
+                guide.unmerge_cells(str(merged))
+        for row in range(46, 58):
+            for column in range(1, 13):
+                cell = guide.cell(row=row, column=column)
+                cell.value = None
+                cell.hyperlink = None
+
+        workbook_map = {
+            "How to Use": (
+                "start-here workflow, interpretation, controls, and limitations",
+                "No - locked",
+            ),
+            "Dashboard": ("aggregate weekly brief", "No - locked"),
+            "Action Focus": (
+                "prioritized current prompts",
+                "No - locked",
+            ),
+            "Action Board": (
+                "current review and task-tracking queue",
+                "Yes - seven blue fields only",
+            ),
+            "Server Scorecard": (
+                "full server performance review",
+                "No - locked",
+            ),
+            "Store & Group Scorecards": (
+                "operational context only",
+                "No - locked",
+            ),
+            "Recent Movement Signals": (
+                "prominent recent movement signals",
+                "No - locked",
+            ),
+            "Evidence Detail": (
+                "evidence weeks, cohort, thresholds, and stability",
+                "No - locked",
+            ),
+            "Action History": (
+                "preserved closed and dismissed items",
+                "No - locked",
+            ),
+            "Data Quality": (
+                "completeness, reconciliation, and provenance",
+                "No - locked",
+            ),
+            "Management Setup": (
+                "custodian-maintained targets and owner roster",
+                "Yes - blue cells only",
+            ),
+            "Run Notes": (
+                "release, integrity, methodology, and assumptions",
+                "No - locked",
+            ),
+        }
+        for row, (_, target) in enumerate(
+            metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
+            start=46,
+        ):
+            guide.merge_cells(
+                start_row=row,
+                start_column=1,
+                end_row=row,
+                end_column=2,
+            )
+            guide.merge_cells(
+                start_row=row,
+                start_column=3,
+                end_row=row,
+                end_column=10,
+            )
+            guide.merge_cells(
+                start_row=row,
+                start_column=11,
+                end_row=row,
+                end_column=12,
+            )
+            sheet_cell = guide.cell(row=row, column=1, value=target)
+            sheet_cell.hyperlink = f"#'{target}'!A1"
+            sheet_cell.font = Font(
+                bold=True,
+                color="7A1E1E",
+                underline="single",
+            )
+            purpose, editable = workbook_map[target]
+            guide.cell(row=row, column=3, value=purpose)
+            guide.cell(row=row, column=11, value=editable)
+            for column in (1, 3, 11):
+                guide.cell(row=row, column=column).alignment = Alignment(
+                    wrap_text=True,
+                    vertical="center",
+                )
+            guide.row_dimensions[row].height = 42 if target in {
+                "How to Use",
+                "Server Scorecard",
+                "Evidence Detail",
+                "Data Quality",
+                "Management Setup",
+                "Run Notes",
+            } else 36
+
+        visible_sheets = set(
+            metrics.PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+        )
+        for worksheet in workbook.worksheets:
+            if worksheet.title in visible_sheets:
+                worksheet.sheet_state = "visible"
+                row_two_merges = [
+                    str(merged)
+                    for merged in worksheet.merged_cells.ranges
+                    if merged.min_row <= 2 <= merged.max_row
+                ]
+                for merged_range in row_two_merges:
+                    worksheet.unmerge_cells(merged_range)
+                metrics.add_management_navigation(worksheet)
+                metrics.configure_management_print_layout(worksheet)
+            else:
+                worksheet.sheet_state = "veryHidden"
+            metrics.protect_worksheet(worksheet, "test-pass")
+        workbook._sheets = [
+            *[
+                workbook[name]
+                for name in metrics.PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+            ],
+            *[
+                worksheet
+                for worksheet in workbook.worksheets
+                if worksheet.title not in visible_sheets
+            ],
+        ]
+        workbook.active = 0
+        workbook.save(path)
+    finally:
+        workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
 def downgrade_master_to_pre_protection_contract(path: Path) -> str:
     """Model the protected owner-roster workbook deployed before PR #10."""
 
+    current = load_workbook(path, data_only=False, read_only=True)
+    try:
+        needs_layout_downgrade = "Team Trends" in current.sheetnames
+    finally:
+        current.close()
+    if needs_layout_downgrade:
+        downgrade_master_to_pre_consolidation_layout(path)
     workbook = load_workbook(path, data_only=False)
     if "How to Use" in workbook.sheetnames:
         workbook.remove(workbook["How to Use"])
@@ -137,7 +305,7 @@ def replace_menu_with_legacy_tabs(
 ) -> None:
     """Replace the current merged menu with the exact prior multi-link bar."""
 
-    for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
+    for sheet_name in metrics.PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS:
         worksheet = workbook[sheet_name]
         row_two_merges = [
             str(merged)
@@ -146,10 +314,13 @@ def replace_menu_with_legacy_tabs(
         ]
         for merged_range in row_two_merges:
             worksheet.unmerge_cells(merged_range)
-        navigation_columns = metrics.management_navigation_columns(worksheet)
+        navigation_columns = metrics.management_navigation_columns(
+            worksheet,
+            metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
+        )
         for column, (label, target) in zip(
             navigation_columns,
-            metrics.MANAGEMENT_NAVIGATION_LINKS,
+            metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
             strict=True,
         ):
             cell = worksheet.cell(row=2, column=column, value=label)
@@ -201,6 +372,7 @@ def replace_menu_with_legacy_tabs(
 def downgrade_master_to_v2_usability_contract(path: Path) -> str:
     """Model the manifest-bound v0.3.2 workbook deployed before v3."""
 
+    downgrade_master_to_pre_consolidation_layout(path)
     workbook = load_workbook(path, data_only=False)
     try:
         guide = workbook["How to Use"]
@@ -228,6 +400,7 @@ def downgrade_master_to_v2_usability_contract(path: Path) -> str:
 def downgrade_master_to_legacy_v3_navigation(path: Path) -> str:
     """Model the manifest-bound v3 workbook emitted before the single menu."""
 
+    downgrade_master_to_pre_consolidation_layout(path)
     workbook = load_workbook(path, data_only=False)
     try:
         replace_menu_with_legacy_tabs(workbook, previous_v2=False)
@@ -240,6 +413,7 @@ def downgrade_master_to_legacy_v3_navigation(path: Path) -> str:
 def downgrade_master_to_v1_action_focus(path: Path) -> str:
     """Model the protected 20-column Action Focus workbook from v0.2.x."""
 
+    downgrade_master_to_pre_consolidation_layout(path)
     workbook = load_workbook(path, data_only=False)
     try:
         if "How to Use" in workbook.sheetnames:
@@ -335,6 +509,7 @@ def downgrade_master_to_v1_action_focus(path: Path) -> str:
 def downgrade_master_to_pre_guide_v031(path: Path) -> str:
     """Model the protected v0.3.1 workbook immediately before the guide."""
 
+    downgrade_master_to_pre_consolidation_layout(path)
     workbook = load_workbook(path, data_only=False)
     try:
         workbook.remove(workbook["How to Use"])
@@ -568,6 +743,7 @@ def test_adopted_pre_contract_master_is_regenerated_with_strict_protection(
     output_dir.mkdir(parents=True)
     master = output_dir / "Red_Onion_Server_Master.xlsx"
     shutil.copy2(valid_master_template, master)
+    downgrade_master_to_pre_consolidation_layout(master)
     workbook = load_workbook(master, data_only=False)
     try:
         roster = workbook["Management Setup"]
@@ -944,6 +1120,130 @@ def test_manifest_pinned_legacy_v3_navigation_is_regenerated_with_menu(
         upgraded.close()
 
 
+def test_manifest_pinned_pre_consolidation_layout_requires_upgrade_and_regenerates(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = downgrade_master_to_pre_consolidation_layout(master)
+
+    legacy = load_workbook(master, data_only=False)
+    try:
+        assert [
+            worksheet.title
+            for worksheet in legacy.worksheets
+            if worksheet.sheet_state == "visible"
+        ] == metrics.PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+        assert "Team Trends" not in legacy.sheetnames
+        assert all(
+            name in legacy.sheetnames
+            for name in (
+                "Action Focus",
+                "Server Scorecard",
+                "Recent Movement Signals",
+            )
+        )
+        metrics.require_management_menu_contract(
+            legacy,
+            visible_sheets=(
+                metrics.PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+            ),
+            navigation_links=metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
+        )
+    finally:
+        legacy.close()
+
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="pre-consolidation-layout",
+        previous_manifest=None,
+    )
+    assert integrity.read_json_manifest(existing)[
+        "master_generated_content_sha256"
+    ] == legacy_digest
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="predates the current action and trend layout",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=legacy_digest,
+        )
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="predates the current action and trend layout",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            allow_legacy_protection_upgrade=True,
+        )
+    assert (
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=legacy_digest,
+            allow_legacy_protection_upgrade=True,
+        )
+        == legacy_digest
+    )
+
+    adopted, adopted_payload, adopted_sha256 = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+    assert adopted == existing
+    assert adopted_payload["_legacy_master_upgrade_pending"] is True
+    assert metrics.verify_integrity_anchor(archive_dir) == (
+        existing.resolve(),
+        adopted_sha256,
+    )
+
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    (input_dir / "Daily Report - TM - 07-21-2026.xlsx").write_bytes(
+        b"captured active report"
+    )
+    install_synthetic_parser(monkeypatch)
+
+    generated = metrics.run(args)
+
+    assert master in generated
+    assert metrics.validate_management_workbook(master)
+    upgraded = load_workbook(master, data_only=False)
+    try:
+        assert [
+            worksheet.title
+            for worksheet in upgraded.worksheets
+            if worksheet.sheet_state == "visible"
+        ] == metrics.VISIBLE_MANAGEMENT_SHEETS
+        assert "Team Trends" in upgraded.sheetnames
+        assert all(
+            name not in upgraded.sheetnames
+            for name in (
+                "Action Focus",
+                "Server Scorecard",
+                "Recent Movement Signals",
+            )
+        )
+    finally:
+        upgraded.close()
+
+
 def test_manifest_pinned_legacy_v3_navigation_rejects_style_tampering(
     tmp_path: Path,
     valid_master_template: Path,
@@ -957,8 +1257,11 @@ def test_manifest_pinned_legacy_v3_navigation_rejects_style_tampering(
         current_column = next(
             column
             for column, (_, target) in zip(
-                metrics.management_navigation_columns(dashboard),
-                metrics.MANAGEMENT_NAVIGATION_LINKS,
+                metrics.management_navigation_columns(
+                    dashboard,
+                    metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
+                ),
+                metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
                 strict=True,
             )
             if target == "Dashboard"
@@ -1033,8 +1336,11 @@ def test_manifest_pinned_v2_usability_upgrade_rejects_navigation_tampering(
         current_column = next(
             column
             for column, (_, target) in zip(
-                metrics.management_navigation_columns(dashboard),
-                metrics.MANAGEMENT_NAVIGATION_LINKS,
+                metrics.management_navigation_columns(
+                    dashboard,
+                    metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
+                ),
+                metrics.PRE_CONSOLIDATION_NAVIGATION_LINKS,
                 strict=True,
             )
             if target == "Dashboard"
