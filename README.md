@@ -69,6 +69,7 @@ Excel temporary files whose names start with `~$` are ignored.
 - Every visible sheet uses the same Guide-to-Run navigation order and highlights the current sheet.
 - `Action Focus` presents current context reviews and coaching/recognition prompts and links each row back to the editable `Action Board`.
 - `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, peer-reference details, metric inputs, stability results, review disposition, and methodology version.
+- `Data Quality` includes a latest-first 16-week location completeness matrix with explicit Complete, Partial, and Missing labels before the detailed exception and provenance sections.
 - Person-level signals require at least 25 guests, 3 active days, 2 prior full self-weeks, and 50 prior-period guests.
 - Partial weeks stay visible in Data Quality but are excluded from management baselines and prominent server actions.
 - Management can record Status, Owner, Due Date, Context Notes, Review Disposition, Reviewed By, and Review Date in the master workbook. Those fields carry forward on the next successful run.
