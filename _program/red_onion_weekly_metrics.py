@@ -10424,8 +10424,8 @@ def write_team_trends_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     ws = write_table_sheet(
         wb, "Team Trends", headers, data, "TeamTrends",
         widths={
-            "A": 20, "B": 24, "C": 13, "D": 15, "E": 24, "F": 15,
-            "G": 18, "H": 12, "I": 15, "J": 17, "K": 20, "L": 18,
+            "A": 20, "B": 24, "C": 15, "D": 17, "E": 24, "F": 17,
+            "G": 18, "H": 12, "I": 17, "J": 20, "K": 23, "L": 22,
             "M": 23, "N": 20, "O": 18, "P": 42, "Q": 52,
         },
     )

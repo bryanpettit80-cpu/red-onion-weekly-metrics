@@ -1230,7 +1230,17 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for page_break in wb["Store & Group Scorecards"].row_breaks.brk
     ] == [16, 29, 42]
     for sheet_name, widths in {
-        "Team Trends": {"C": 13, "E": 24, "P": 42, "Q": 52},
+        "Team Trends": {
+            "C": 15,
+            "D": 17,
+            "F": 17,
+            "I": 17,
+            "J": 20,
+            "K": 23,
+            "L": 22,
+            "P": 42,
+            "Q": 52,
+        },
         "Data Quality": {"D": 13, "F": 69},
         "Management Setup": {"D": 25, "E": 48},
         "Run Notes": {"A": 30, "B": 96},
