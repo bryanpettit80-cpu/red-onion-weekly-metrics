@@ -1232,9 +1232,9 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     for sheet_name, widths in {
         "Team Trends": {
             "C": 15,
-            "D": 17,
-            "F": 17,
-            "I": 17,
+            "D": 20,
+            "F": 20,
+            "I": 20,
             "J": 20,
             "K": 23,
             "L": 22,
