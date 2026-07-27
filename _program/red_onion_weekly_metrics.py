@@ -7994,9 +7994,7 @@ def workbook_uses_pre_consolidation_layout(wb: Workbook) -> bool:
     for ws in (
         wb[name] for name in PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
     ):
-        start_column, end_column = management_menu_bounds(
-            ws, PRE_CONSOLIDATION_NAVIGATION_LINKS
-        )
+        start_column, end_column = management_menu_bounds(ws)
         if (
             ws.sheet_state != "visible"
             or ws.cell(row=2, column=start_column).value != MANAGEMENT_MENU_LABEL
@@ -9020,10 +9018,7 @@ def management_navigation_columns(
     return tuple(columns)
 
 
-def management_menu_bounds(
-    ws,
-    navigation_links: tuple[tuple[str, str], ...] | None = None,
-) -> tuple[int, int]:
+def management_menu_bounds(ws) -> tuple[int, int]:
     """Return the visible start and end columns for the uniform workbook menu."""
 
     columns: list[int] = []
@@ -9202,7 +9197,7 @@ def require_management_menu_contract(
             )
 
     for ws in (wb[name] for name in visible_sheet_names):
-        start_column, end_column = management_menu_bounds(ws, links)
+        start_column, end_column = management_menu_bounds(ws)
         expected_range = (
             f"{get_column_letter(start_column)}2:"
             f"{get_column_letter(end_column)}2"
