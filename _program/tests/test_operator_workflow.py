@@ -993,12 +993,15 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     for choice in (*metrics.ACTION_STATUS_CHOICES, *metrics.REVIEW_DISPOSITION_CHOICES):
         assert choice in "\n".join(guide_values)
     assert guide["A45"].value == "Sheet - click to open"
+    workbook_map_rows = range(
+        46, 46 + len(metrics.VISIBLE_MANAGEMENT_SHEETS)
+    )
     assert [
-        guide.cell(row=row, column=1).value for row in range(46, 58)
+        guide.cell(row=row, column=1).value for row in workbook_map_rows
     ] == list(metrics.VISIBLE_MANAGEMENT_SHEETS)
     assert [
         guide.cell(row=row, column=1).hyperlink.target
-        for row in range(46, 58)
+        for row in workbook_map_rows
     ] == [
         f"#'{sheet_name}'!A1"
         for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS
@@ -1006,7 +1009,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert all(
         guide.cell(row=row, column=1).font.underline == "single"
         and guide.cell(row=row, column=1).protection.locked is True
-        for row in range(46, 58)
+        for row in workbook_map_rows
     )
 
     for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
@@ -1075,9 +1078,12 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         frozen_at = worksheet.freeze_panes
         assert frozen_at is not None
         assert int("".join(character for character in str(frozen_at) if character.isdigit())) >= 3
-    assert metrics.management_menu_bounds(wb["Action Board"]) == (3, 14)
+    assert metrics.management_menu_bounds(wb["Action Board"]) == (3, 21)
     assert metrics.management_menu_bounds(wb["Action History"]) == (3, 14)
     assert metrics.management_menu_bounds(wb["Evidence Detail"]) == (1, 14)
+    assert "Action Focus" not in wb.sheetnames
+    assert "Server Scorecard" not in wb.sheetnames
+    assert "Recent Movement Signals" not in wb.sheetnames
 
     dashboard_values = {
         value
@@ -1107,6 +1113,15 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert "Recommended Next Step" in action_values
     assert len(wb["Action Board"].data_validations.dataValidation) == 3
     assert len(wb["Action Board"].conditional_formatting) >= 3
+    assert wb["Action Board"]["C3"].value.startswith("Single action queue:")
+    assert "C3:W3" in {
+        str(merged) for merged in wb["Action Board"].merged_cells.ranges
+    }
+    assert wb["Action Board"].row_dimensions[3].height == 36
+    assert all(
+        wb["Action Board"].column_dimensions[column].hidden is True
+        for column in ("A", "B", "J", "M", "O", "P", "Q", "R", "T")
+    )
     assert wb["Action Board"].row_dimensions[4].height == 30
     assert wb["Action Board"].row_dimensions[5].height == 60
     assert wb["Action Board"]["L5"].alignment.wrap_text is True
@@ -1182,12 +1197,31 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Dashboard"]["K19"].alignment.wrap_text is True
     assert wb["Dashboard"]["K20"].alignment.wrap_text is True
     assert wb["Dashboard"].row_dimensions[9].height == 32
-    assert wb["Action Focus"].row_dimensions[3].height == 48
-    assert wb["Action Focus"].page_setup.fitToWidth == 2
-    assert wb["Server Scorecard"].row_dimensions[3].height == 30
-    assert wb["Server Scorecard"].row_dimensions[4].height == 66
-    assert wb["Recent Movement Signals"].row_dimensions[3].height == 30
-    assert wb["Recent Movement Signals"].max_row == 3
+    trends = wb["Team Trends"]
+    assert trends.row_dimensions[1].height == 42
+    assert trends.row_dimensions[3].height == 30
+    assert trends.row_dimensions[4].height == 54
+    assert trends.freeze_panes == "E4"
+    assert trends.page_setup.fitToWidth == 2
+    assert trends.max_row == 5
+    assert "TeamTrends" in trends.tables
+    assert [trends.cell(row=row, column=1).value for row in (4, 5)] == [
+        "RC Richmond",
+        "RC Virginia Beach",
+    ]
+    assert [trends.cell(row=row, column=2).value for row in (4, 5)] == [
+        "Alex Rising",
+        "Alex Rising",
+    ]
+    assert trends["C4"].value.date() == date(2026, 6, 21)
+    assert trends["D4"].value.date() == date(2026, 6, 14)
+    assert trends["F4"].value == pytest.approx(10.0)
+    assert trends["G4"].value == pytest.approx(10.0 - (1100 / 60))
+    assert trends["H4"].value == pytest.approx(20 / 600)
+    assert trends["I4"].value == pytest.approx((20 / 600) - (110 / 1100))
+    assert trends["J4"].value == "Watch"
+    assert trends["N4"].value == "Reference Unavailable"
+    assert trends["O4"].value == "Monitor"
     assert wb["Data Quality"].row_dimensions[3].height == 48
     assert "$A$1:$L$" in str(wb["Data Quality"].print_area)
     assert len(wb["Store & Group Scorecards"].row_breaks.brk) == 3
@@ -1196,9 +1230,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         for page_break in wb["Store & Group Scorecards"].row_breaks.brk
     ] == [16, 29, 42]
     for sheet_name, widths in {
-        "Action Focus": {"B": 15, "J": 50, "M": 21},
-        "Server Scorecard": {"E": 21, "F": 23, "G": 23, "H": 22},
-        "Recent Movement Signals": {"A": 26, "F": 23},
+        "Team Trends": {"C": 13, "E": 24, "P": 42, "Q": 52},
         "Data Quality": {"D": 13, "F": 69},
         "Management Setup": {"D": 25, "E": 48},
         "Run Notes": {"A": 30, "B": 96},
@@ -1211,14 +1243,14 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             )
     assert "ManagementTargets" in wb["Management Setup"].tables
     assert "Alex Rising" in {
-        cell.value for row in wb["Server Scorecard"].iter_rows() for cell in row
+        cell.value for row in trends.iter_rows() for cell in row
     }
     assert "Reference Unavailable" in {
-        cell.value for row in wb["Server Scorecard"].iter_rows() for cell in row
+        cell.value for row in trends.iter_rows() for cell in row
     }
 
 
-def test_incomplete_latest_week_hides_server_scorecards_and_stars(tmp_path: Path) -> None:
+def test_incomplete_latest_week_hides_team_trends_and_server_actions(tmp_path: Path) -> None:
     config = metrics.load_config(tmp_path / "missing-config.json")
     records: list[metrics.MetricRecord] = []
     for week_end in (date(2026, 6, 14), date(2026, 6, 21), date(2026, 6, 28)):
@@ -1253,8 +1285,10 @@ def test_incomplete_latest_week_hides_server_scorecards_and_stars(tmp_path: Path
     )
 
     workbook = load_workbook(output_path, data_only=False)
-    assert workbook["Server Scorecard"].max_row == 3
-    assert workbook["Recent Movement Signals"].max_row == 3
+    assert workbook["Team Trends"].max_row == 3
+    assert "Action Focus" not in workbook.sheetnames
+    assert "Server Scorecard" not in workbook.sheetnames
+    assert "Recent Movement Signals" not in workbook.sheetnames
     dashboard_values = {
         cell.value for row in workbook["Dashboard"].iter_rows() for cell in row
     }

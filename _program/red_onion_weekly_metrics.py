@@ -286,11 +286,23 @@ PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS = [
     "Management Setup",
     "Run Notes",
 ]
-VISIBLE_MANAGEMENT_SHEETS = [
+PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS = [
     "How to Use",
     *PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS,
 ]
-MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
+VISIBLE_MANAGEMENT_SHEETS = [
+    "How to Use",
+    "Dashboard",
+    "Action Board",
+    "Team Trends",
+    "Store & Group Scorecards",
+    "Evidence Detail",
+    "Action History",
+    "Data Quality",
+    "Management Setup",
+    "Run Notes",
+]
+PRE_CONSOLIDATION_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Guide", "How to Use"),
     ("Dashboard", "Dashboard"),
     ("Focus", "Action Focus"),
@@ -304,16 +316,27 @@ MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Setup", "Management Setup"),
     ("Run", "Run Notes"),
 )
+MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
+    ("Guide", "How to Use"),
+    ("Dashboard", "Dashboard"),
+    ("Actions", "Action Board"),
+    ("Trends", "Team Trends"),
+    ("Stores", "Store & Group Scorecards"),
+    ("Evidence", "Evidence Detail"),
+    ("History", "Action History"),
+    ("Quality", "Data Quality"),
+    ("Setup", "Management Setup"),
+    ("Run", "Run Notes"),
+)
 MANAGEMENT_MENU_LABEL = "Workbook Menu - click to choose a sheet on How to Use"
 MANAGEMENT_MENU_TARGET = "#'How to Use'!A44"
+MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT = 12
 MANAGEMENT_PRINT_WIDTHS: dict[str, int] = {
     "How to Use": 1,
     "Dashboard": 1,
-    "Action Focus": 2,
-    "Action Board": 3,
-    "Server Scorecard": 2,
+    "Action Board": 2,
+    "Team Trends": 2,
     "Store & Group Scorecards": 1,
-    "Recent Movement Signals": 2,
     "Evidence Detail": 3,
     "Action History": 3,
     "Data Quality": 1,
@@ -3669,8 +3692,8 @@ def priority_fill(value: Any) -> PatternFill | None:
     }:
         return soft_fill("D9EAF7")
     if text in {
-        "monitor", "stable", "stable / mixed", "on track", "not scored",
-        "not evaluated", "within peer range",
+        "monitor", "stable", "mixed", "stable / mixed", "on track", "not scored",
+        "not evaluated", "no prior week", "within peer range",
     }:
         return soft_fill("EDEDED")
     return None
@@ -5745,6 +5768,7 @@ def evaluate_server_week_signal(
         "changes": changes,
         "metric_scores": metric_scores,
         "composite_score": composite_score,
+        "descriptive_movement": movement,
         "movement": movement if base_qualified else RecentMovement.NOT_EVALUATED.value,
         "peer_comparison": (
             peer_score_label
@@ -5950,6 +5974,22 @@ def management_server_rows(
             ),
             None,
         )
+        week_over_week_changes = {
+            field: (
+                float(current[field]) - float(previous_row[field])
+                if previous_row is not None
+                and management_metric_available(current, field)
+                and management_metric_available(previous_row, field)
+                else None
+            )
+            for field in SERVER_TREND_FIELDS
+        }
+        week_over_week_movement = trend_note(
+            week_over_week_changes["check_average"],
+            week_over_week_changes["wine_pct"],
+            None,
+            None,
+        )
         previous_evaluation = evaluation_for(previous_row) if previous_row else None
         current_candidate = evaluated["candidate"]
         current_week_signal = WeeklyCandidateSignal(
@@ -6012,6 +6052,12 @@ def management_server_rows(
             "average_rank_movement": None,
             "composite_score": evaluated["composite_score"],
             "momentum": movement,
+            "descriptive_recent_movement": evaluated["descriptive_movement"],
+            "week_over_week_changes": week_over_week_changes,
+            "week_over_week_movement": week_over_week_movement,
+            "previous_week_end": (
+                previous_row["week_end"] if previous_row is not None else None
+            ),
             "long_term_direction": long_term_direction,
             "long_term_history_label": history_label,
             "history_used": history_used,
@@ -7511,6 +7557,8 @@ def require_current_workbook_usability_contract(
     *,
     previous_v2: bool = False,
     previous_tab_navigation: bool = False,
+    visible_sheets: Iterable[str] | None = None,
+    navigation_links: tuple[tuple[str, str], ...] | None = None,
 ) -> None:
     """Require the exact current or immediately preceding usability contract."""
 
@@ -7596,9 +7644,18 @@ def require_current_workbook_usability_contract(
         )
 
     if previous_v2 or previous_tab_navigation:
-        require_legacy_tab_navigation_contract(wb, previous_v2=previous_v2)
+        require_legacy_tab_navigation_contract(
+            wb,
+            previous_v2=previous_v2,
+            visible_sheets=visible_sheets,
+            navigation_links=navigation_links,
+        )
     else:
-        require_management_menu_contract(wb)
+        require_management_menu_contract(
+            wb,
+            visible_sheets=visible_sheets,
+            navigation_links=navigation_links,
+        )
 
 
 def validate_management_workbook(
@@ -7607,6 +7664,8 @@ def validate_management_workbook(
     *,
     previous_v2_usability: bool = False,
     previous_tab_navigation: bool = False,
+    visible_sheets: Iterable[str] | None = None,
+    navigation_links: tuple[tuple[str, str], ...] | None = None,
 ) -> str:
     """Validate protection, visibility, editable cells, tables, and digest."""
     reject_unapproved_workbook_drawings(path)
@@ -7618,13 +7677,22 @@ def validate_management_workbook(
                 "Generated master workbook has no supported protection contract marker."
             )
         setup, action_board = validate_management_workbook_controls(
-            wb, protect_objects_and_scenarios=True
+            wb,
+            protect_objects_and_scenarios=True,
+            visible_sheets=visible_sheets,
         )
-        if "How to Use" in VISIBLE_MANAGEMENT_SHEETS:
+        visible_sheet_names = tuple(
+            VISIBLE_MANAGEMENT_SHEETS
+            if visible_sheets is None
+            else visible_sheets
+        )
+        if "How to Use" in visible_sheet_names:
             require_current_workbook_usability_contract(
                 wb,
                 previous_v2=previous_v2_usability,
                 previous_tab_navigation=previous_tab_navigation,
+                visible_sheets=visible_sheet_names,
+                navigation_links=navigation_links,
             )
         expected_validations = expected_management_list_validations(wb)
         require_exact_validation_count(
@@ -7868,7 +7936,7 @@ def workbook_uses_legacy_multi_link_navigation(wb: Workbook) -> bool:
         or "How to Use" not in wb.sheetnames
         or any(
             name not in wb.sheetnames
-            for name in VISIBLE_MANAGEMENT_SHEETS
+            for name in PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
         )
     ):
         return False
@@ -7882,15 +7950,74 @@ def workbook_uses_legacy_multi_link_navigation(wb: Workbook) -> bool:
         or PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
     ):
         return False
-    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
+    expected_labels = [
+        label for label, _ in PRE_CONSOLIDATION_NAVIGATION_LINKS
+    ]
     return all(
         [
             ws.cell(row=2, column=column).value
-            for column in management_navigation_columns(ws)
+            for column in management_navigation_columns(
+                ws, PRE_CONSOLIDATION_NAVIGATION_LINKS
+            )
         ]
         == expected_labels
-        for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS)
+        for ws in (
+            wb[name] for name in PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+        )
     )
+
+
+def workbook_uses_pre_consolidation_layout(wb: Workbook) -> bool:
+    """Identify the protected menu layout before action/trend tab consolidation."""
+
+    if (
+        stamped_workbook_protection_contract(wb)
+        != WORKBOOK_PROTECTION_CONTRACT
+        or "How to Use" not in wb.sheetnames
+        or "Team Trends" in wb.sheetnames
+        or any(
+            name not in wb.sheetnames
+            for name in PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+        )
+    ):
+        return False
+    guide_text = "\n".join(
+        str(cell.value)
+        for cell in wb["How to Use"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    if (
+        MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+        or PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
+    ):
+        return False
+    for ws in (
+        wb[name] for name in PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+    ):
+        start_column, end_column = management_menu_bounds(ws)
+        if (
+            ws.sheet_state != "visible"
+            or ws.cell(row=2, column=start_column).value != MANAGEMENT_MENU_LABEL
+            or ws.cell(row=2, column=start_column).hyperlink is None
+            or ws.cell(row=2, column=start_column).hyperlink.target
+            != MANAGEMENT_MENU_TARGET
+            or str(
+                next(
+                    (
+                        merged
+                        for merged in ws.merged_cells.ranges
+                        if merged.min_row <= 2 <= merged.max_row
+                    ),
+                    "",
+                )
+            )
+            != (
+                f"{get_column_letter(start_column)}2:"
+                f"{get_column_letter(end_column)}2"
+            )
+        ):
+            return False
+    return True
 
 
 def management_workbook_upgrade_pending(path: Path) -> bool:
@@ -7901,6 +8028,7 @@ def management_workbook_upgrade_pending(path: Path) -> bool:
         return (
             workbook_uses_previous_v2_usability(wb)
             or workbook_uses_legacy_multi_link_navigation(wb)
+            or workbook_uses_pre_consolidation_layout(wb)
         )
     finally:
         wb.close()
@@ -7932,6 +8060,9 @@ def verify_existing_management_workbook_integrity(
         has_legacy_multi_link_navigation = (
             workbook_uses_legacy_multi_link_navigation(wb)
         )
+        has_pre_consolidation_layout = workbook_uses_pre_consolidation_layout(
+            wb
+        )
         action_headers = (
             {
                 str(cell.value)
@@ -7951,6 +8082,27 @@ def verify_existing_management_workbook_integrity(
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
         if has_v2_action_schema:
             if has_how_to_use_schema:
+                if has_pre_consolidation_layout:
+                    if (
+                        not allow_legacy_protection_upgrade
+                        or expected_digest is None
+                    ):
+                        raise IntegrityError(
+                            "The existing master workbook predates the current "
+                            "action and trend layout. It may be upgraded only when "
+                            "its exact digest is pinned by the verified integrity "
+                            "manifest."
+                        )
+                    return validate_management_workbook(
+                        path,
+                        expected_digest,
+                        visible_sheets=(
+                            PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+                        ),
+                        navigation_links=(
+                            PRE_CONSOLIDATION_NAVIGATION_LINKS
+                        ),
+                    )
                 if has_previous_v2_usability:
                     if (
                         not allow_legacy_protection_upgrade
@@ -7965,6 +8117,12 @@ def verify_existing_management_workbook_integrity(
                         path,
                         expected_digest,
                         previous_v2_usability=True,
+                        visible_sheets=(
+                            PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+                        ),
+                        navigation_links=(
+                            PRE_CONSOLIDATION_NAVIGATION_LINKS
+                        ),
                     )
                 if has_legacy_multi_link_navigation:
                     if (
@@ -7980,6 +8138,12 @@ def verify_existing_management_workbook_integrity(
                         path,
                         expected_digest,
                         previous_tab_navigation=True,
+                        visible_sheets=(
+                            PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+                        ),
+                        navigation_links=(
+                            PRE_CONSOLIDATION_NAVIGATION_LINKS
+                        ),
                     )
                 return validate_management_workbook(path, expected_digest or stamped)
             return validate_pre_guide_management_workbook(
@@ -8829,12 +8993,20 @@ def remove_sheet_if_present(wb: Workbook, name: str) -> None:
         wb.remove(wb[name])
 
 
-def management_navigation_columns(ws) -> tuple[int, ...]:
-    """Return the legacy 12-link columns and current menu-bar bounds."""
+def management_navigation_columns(
+    ws,
+    navigation_links: tuple[tuple[str, str], ...] | None = None,
+) -> tuple[int, ...]:
+    """Return the visible columns used by a legacy multi-link navigation bar."""
 
+    links = (
+        MANAGEMENT_NAVIGATION_LINKS
+        if navigation_links is None
+        else navigation_links
+    )
     columns: list[int] = []
     column = 1
-    while len(columns) < len(MANAGEMENT_NAVIGATION_LINKS):
+    while len(columns) < len(links):
         letter = get_column_letter(column)
         if ws.column_dimensions[letter].hidden is not True:
             columns.append(column)
@@ -8849,8 +9021,18 @@ def management_navigation_columns(ws) -> tuple[int, ...]:
 def management_menu_bounds(ws) -> tuple[int, int]:
     """Return the visible start and end columns for the uniform workbook menu."""
 
-    navigation_columns = management_navigation_columns(ws)
-    return navigation_columns[0], navigation_columns[-1]
+    columns: list[int] = []
+    column = 1
+    while len(columns) < MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT:
+        letter = get_column_letter(column)
+        if ws.column_dimensions[letter].hidden is not True:
+            columns.append(column)
+        column += 1
+        if column > 256:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} has too few visible columns for the workbook menu."
+            )
+    return columns[0], columns[-1]
 
 
 def require_management_title_and_freeze_contract(ws) -> None:
@@ -8879,12 +9061,22 @@ def require_legacy_tab_navigation_contract(
     wb: Workbook,
     *,
     previous_v2: bool,
+    visible_sheets: Iterable[str] | None = None,
+    navigation_links: tuple[tuple[str, str], ...] | None = None,
 ) -> None:
     """Validate the exact protected multi-link layout used before v0.4.0."""
 
-    expected_labels = [label for label, _ in MANAGEMENT_NAVIGATION_LINKS]
-    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
-        navigation_columns = management_navigation_columns(ws)
+    visible_sheet_names = tuple(
+        VISIBLE_MANAGEMENT_SHEETS if visible_sheets is None else visible_sheets
+    )
+    links = (
+        MANAGEMENT_NAVIGATION_LINKS
+        if navigation_links is None
+        else navigation_links
+    )
+    expected_labels = [label for label, _ in links]
+    for ws in (wb[name] for name in visible_sheet_names):
+        navigation_columns = management_navigation_columns(ws, links)
         actual_labels = [
             ws.cell(row=2, column=column).value
             for column in navigation_columns
@@ -8907,7 +9099,7 @@ def require_legacy_tab_navigation_contract(
             )
         require_management_title_and_freeze_contract(ws)
         for column, (_, target) in zip(
-            navigation_columns, MANAGEMENT_NAVIGATION_LINKS, strict=True
+            navigation_columns, links, strict=True
         ):
             cell = ws.cell(row=2, column=column)
             expected_target = f"#'{target}'!A1"
@@ -8944,7 +9136,12 @@ def require_legacy_tab_navigation_contract(
                 )
 
 
-def require_management_menu_contract(wb: Workbook) -> None:
+def require_management_menu_contract(
+    wb: Workbook,
+    *,
+    visible_sheets: Iterable[str] | None = None,
+    navigation_links: tuple[tuple[str, str], ...] | None = None,
+) -> None:
     """Validate the locked, width-independent current workbook menu."""
 
     guide = wb["How to Use"]
@@ -8964,7 +9161,15 @@ def require_management_menu_contract(wb: Workbook) -> None:
         raise IntegrityError(
             "How to Use is missing the approved workbook-map heading."
         )
-    for row, (_, target) in enumerate(MANAGEMENT_NAVIGATION_LINKS, start=46):
+    visible_sheet_names = tuple(
+        VISIBLE_MANAGEMENT_SHEETS if visible_sheets is None else visible_sheets
+    )
+    links = (
+        MANAGEMENT_NAVIGATION_LINKS
+        if navigation_links is None
+        else navigation_links
+    )
+    for row, (_, target) in enumerate(links, start=46):
         cell = guide.cell(row=row, column=1)
         if (
             cell.value != target
@@ -8991,7 +9196,7 @@ def require_management_menu_contract(wb: Workbook) -> None:
                 "How to Use contains an invalid workbook-map row layout."
             )
 
-    for ws in (wb[name] for name in VISIBLE_MANAGEMENT_SHEETS):
+    for ws in (wb[name] for name in visible_sheet_names):
         start_column, end_column = management_menu_bounds(ws)
         expected_range = (
             f"{get_column_letter(start_column)}2:"
@@ -9113,7 +9318,7 @@ def configure_management_print_layout(ws) -> None:
 
 def style_management_title(ws, title: str, end_col: int) -> None:
     ws.sheet_view.showGridLines = False
-    end_col = max(end_col, len(MANAGEMENT_NAVIGATION_LINKS))
+    end_col = max(end_col, 12, len(MANAGEMENT_NAVIGATION_LINKS))
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
     cell = ws.cell(
         row=1,
@@ -9211,12 +9416,14 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             "of Sale, and Ticket Time. Do not make a person-level decision from a card."
         ),
         (
-            "4. Use Action Focus to triage current items, then click Open in Action Board."
+            "4. Use Action Board as the single current queue. Review the generated "
+            "evidence, then complete only the blue management fields."
         ),
         (
-            "5. For the people-review layer, use only Sales / Guest and Wine % as "
-            "action inputs. Review Check Count, Rate of Sale, Ticket Time, Evidence "
-            "Detail, and store context before choosing a disposition."
+            "5. Use Team Trends to see every current server's exact WoW movement, "
+            "4-week descriptive direction, and 8-week trend. WoW visibility is not an "
+            "action signal. For people review, use only Sales / Guest and Wine % as "
+            "inputs and verify Evidence Detail plus operating context."
         ),
         (
             "6. Complete the blue Action Board fields. Track follow-up; completed or "
@@ -9373,25 +9580,22 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             "No — locked",
         ),
         ("Dashboard", "aggregate weekly brief", "No — locked"),
-        ("Action Focus", "current queue and links to Action Board", "No — locked"),
         (
             "Action Board",
-            "review and task tracking",
+            "single current review and task-tracking queue",
             "Yes — seven blue fields only",
         ),
         (
-            "Server Scorecard",
-            "person-level sample, peer, movement, and evidence context",
+            "Team Trends",
+            (
+                "all current servers with exact WoW deltas, descriptive 4-week "
+                "movement, 8-week direction, evidence status, and action gate"
+            ),
             "No — locked",
         ),
         (
             "Store & Group Scorecards",
             "operational context only",
-            "No — locked",
-        ),
-        (
-            "Recent Movement Signals",
-            "descriptive changes, not statistical significance",
             "No — locked",
         ),
         (
@@ -9442,8 +9646,7 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ws.row_dimensions[row].height = (
             42 if sheet_name in {
                 "How to Use",
-                "Server Scorecard",
-                "Recent Movement Signals",
+                "Team Trends",
                 "Evidence Detail",
                 "Data Quality",
                 "Management Setup",
@@ -9721,6 +9924,17 @@ def write_action_tracking_sheet(
     remove_sheet_if_present(wb, name)
     ws = wb.create_sheet(name)
     style_management_title(ws, name, len(ACTION_HEADERS))
+    if editable:
+        ws.merge_cells("C3:W3")
+        note = ws["C3"]
+        note.value = (
+            "Single action queue: start with the highest-priority row, review the "
+            "generated evidence, and complete only the blue management fields."
+        )
+        note.fill = PatternFill("solid", fgColor="FFF2CC")
+        note.font = Font(bold=True, color="7F6000")
+        note.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[3].height = 36
     header_row = 4
     for col, header in enumerate(ACTION_HEADERS, start=1):
         cell = ws.cell(row=header_row, column=col, value=header)
@@ -9757,6 +9971,9 @@ def write_action_tracking_sheet(
         ws.add_table(table)
     ws.column_dimensions["A"].hidden = True
     ws.column_dimensions["B"].hidden = True
+    if editable:
+        for column in ("J", "M", "O", "P", "Q", "R"):
+            ws.column_dimensions[column].hidden = True
     ws.column_dimensions["T"].hidden = True
     widths = {
         "C": 12, "D": 14, "E": 18, "F": 13, "G": 20, "H": 24, "I": 22,
@@ -10145,60 +10362,98 @@ def operational_sample_text(row: dict[str, Any]) -> str:
     )
 
 
-def write_server_scorecard_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
+def write_team_trends_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     remove_sheet_if_present(wb, "Server Scorecard")
+    remove_sheet_if_present(wb, "Team Trends")
     headers = [
-        "Action",
         "Location",
         "Server",
+        "Week End",
+        "Prior Week End",
         "Current Sample",
-        "Evidence Status",
-        "Peer Comparison",
-        "Recent Movement",
+        "Sales / Guest",
+        "WoW Sales / Guest Δ",
+        "Wine %",
+        "WoW Wine % Δ",
+        "WoW Movement",
+        "4-Week Movement",
         "8-Week Direction",
+        "Peer Comparison",
+        "Evidence Status",
+        "Action Gate",
+        "Trend Drivers",
         "History Used",
-        "Positive Drivers",
-        "Watch Drivers",
-        "Manager Question",
     ]
     data = []
-    for row in rows:
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("location") or ""),
+            str(item.get("display_name") or ""),
+        ),
+    ):
+        driver_parts = []
+        if row["positive_drivers"]:
+            driver_parts.append("Up: " + "; ".join(row["positive_drivers"]))
+        if row["negative_drivers"]:
+            driver_parts.append("Watch: " + "; ".join(row["negative_drivers"]))
+        if not driver_parts:
+            driver_parts.append("No material 4-week driver")
+        wow_changes = row.get("week_over_week_changes", {})
         data.append(
             [
-                row["action"],
                 row["location"],
                 excel_safe_text(row["display_name"]),
+                row["week_end"],
+                row.get("previous_week_end"),
                 operational_sample_text(row),
-                row["confidence"],
-                row["performance_level"],
-                row["momentum"],
+                row["check_average"],
+                wow_changes.get("check_average"),
+                row["wine_pct"],
+                wow_changes.get("wine_pct"),
+                row.get("week_over_week_movement", "No prior week"),
+                row.get("descriptive_recent_movement", row["momentum"]),
                 row["long_term_direction"],
+                row["performance_level"],
+                row["confidence"],
+                row["action"],
+                " | ".join(driver_parts),
                 row["history_used"],
-                "; ".join(row["positive_drivers"]),
-                "; ".join(row["negative_drivers"]),
-                row["recommended_next_step"],
             ]
         )
     ws = write_table_sheet(
-        wb, "Server Scorecard", headers, data, "ServerScorecard",
+        wb, "Team Trends", headers, data, "TeamTrends",
         widths={
-            "A": 24, "B": 20, "C": 24, "D": 22, "E": 21, "F": 23,
-            "G": 23, "H": 22, "I": 54, "J": 40, "K": 40, "L": 48,
+            "A": 20, "B": 24, "C": 13, "D": 15, "E": 24, "F": 15,
+            "G": 18, "H": 12, "I": 15, "J": 17, "K": 20, "L": 18,
+            "M": 23, "N": 20, "O": 18, "P": 42, "Q": 52,
         },
     )
-    style_management_title(ws, "Server Scorecard", len(headers))
-    ws.freeze_panes = "D4"
+    style_management_title(
+        ws,
+        "Team Trends — All Current Servers | Descriptive WoW + Gated Actions",
+        len(headers),
+    )
+    ws["A1"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[1].height = 42
+    ws.freeze_panes = "E4"
     ws.sheet_view.zoomScale = 80
     ws.print_title_rows = "1:3"
     ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
-        for col in (1, 5, 6, 7, 8):
+        ws.cell(row=row, column=3).number_format = "m/d/yyyy"
+        ws.cell(row=row, column=4).number_format = "m/d/yyyy"
+        ws.cell(row=row, column=6).number_format = "$0.00"
+        ws.cell(row=row, column=7).number_format = "+$0.00;[Red]-$0.00;$0.00"
+        ws.cell(row=row, column=8).number_format = "0.0%"
+        ws.cell(row=row, column=9).number_format = "+0.0%;[Red]-0.0%;0.0%"
+        for col in (10, 11, 12, 13, 14, 15):
             fill = priority_fill(ws.cell(row=row, column=col).value)
             if fill:
                 ws.cell(row=row, column=col).fill = fill
-        for col in (4, 9, 10, 11, 12):
+        for col in (5, 16, 17):
             ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[row].height = 66
+        ws.row_dimensions[row].height = 54
 
 
 def write_rising_falling_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
@@ -11679,7 +11934,13 @@ def write_management_run_notes(
         ("Targets", "Management Setup targets apply only to store/group operational context. They do not create person-level coaching prompts."),
         ("Signal Scoring", "Person-level movement and peer comparison use separately calibrated Sales / Guest and Wine % bands only. Check Count, Rate of Sale, and Ticket Time are context only. Rank is display-only and contributes no points. A prompt requires aligned movement and peer context, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
         ("Review Gate", "Generated rows start at Review Needed. A later workflow state requires Review Disposition, Reviewed By, and Review Date; the signal cannot be the sole basis for an adverse employment decision."),
-        ("Technical Trend Detail", "Server Week-over-Week Detail is descriptive audit context. Generated coaching prompts use Recent Movement, peer comparison, evidence stability, and two-week persistence."),
+        (
+            "Team Trends",
+            "Shows every current non-excluded server with exact consecutive-week "
+            "Sales / Guest and Wine % deltas plus descriptive 4-week and 8-week "
+            "direction. These visible movements do not bypass the action gates.",
+        ),
+        ("Technical Trend Detail", "Server Week-over-Week Detail remains protected descriptive audit context. Generated coaching prompts use qualified Recent Movement, peer comparison, evidence stability, and two-week persistence."),
         ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward between weekly runs. Cleared signals move to Action History."),
         (
             "Evidence Contract",
@@ -11702,7 +11963,7 @@ def write_management_run_notes(
                 "Metric Caveat",
             }
             else 42
-            if label in {"Check Count Coverage", "Metric Rule"}
+            if label in {"Check Count Coverage", "Metric Rule", "Team Trends"}
             else 30
         )
 
@@ -11739,9 +12000,9 @@ def finalize_management_workbook(wb: Workbook) -> None:
     wb.active = 0
     tab_colors = {
         "How to Use": "FFD966",
-        "Dashboard": "7A1E1E", "Action Focus": "C00000",
-        "Action Board": "C00000", "Server Scorecard": "5B9BD5",
-        "Store & Group Scorecards": "70AD47", "Recent Movement Signals": "FFC000",
+        "Dashboard": "7A1E1E",
+        "Action Board": "C00000", "Team Trends": "5B9BD5",
+        "Store & Group Scorecards": "70AD47",
         "Evidence Detail": "8064A2", "Action History": "A5A5A5",
         "Data Quality": "5B9BD5", "Management Setup": "4472C4",
         "Run Notes": "7F7F7F",
@@ -11811,7 +12072,7 @@ def write_master_workbook(
         for name in (
             "How to Use", "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars",
             "Recent Movement Signals", "Run Notes",
-            "Server Scorecard", "Store & Group Scorecards", "Action History", "Management Setup",
+            "Server Scorecard", "Team Trends", "Store & Group Scorecards", "Action History", "Management Setup",
             "Evidence Detail",
         ):
             remove_sheet_if_present(wb, name)
@@ -11828,8 +12089,7 @@ def write_master_workbook(
             state["owner_roster_capacity"],
         )
         write_action_tracking_sheet(wb, "Action Board", current_actions, editable=True)
-        write_action_focus_sheet(wb, current_actions)
-        write_server_scorecard_sheet(wb, visible_server_rows)
+        write_team_trends_sheet(wb, visible_server_rows)
         write_store_group_scorecards_sheet(
             wb,
             [*group_rows, *store_rows],
@@ -11838,7 +12098,6 @@ def write_master_workbook(
             weekly_group_rows,
             readiness,
         )
-        write_rising_falling_sheet(wb, visible_server_rows)
         write_action_tracking_sheet(wb, "Action History", action_history, editable=False)
         write_evidence_detail_sheet(wb, current_actions, action_history)
         write_management_data_quality_sheet(

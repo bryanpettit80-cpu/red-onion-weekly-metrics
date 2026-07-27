@@ -229,7 +229,7 @@ def test_incomplete_latest_week_suppresses_both_trends_and_server_actions() -> N
     assert all(signal["Action"] == "Data Quality" for signal in signals)
 
 
-def test_server_scorecard_uses_decision_first_12_columns() -> None:
+def test_team_trends_uses_all_person_17_column_schema_and_exact_wow_values() -> None:
     specs = [
         dict(check_average=20 + index, wine_pct=0.10, rate=0.20, ticket_seconds=4800, rank=5)
         for index in range(8)
@@ -238,21 +238,39 @@ def test_server_scorecard_uses_decision_first_12_columns() -> None:
     rows = metrics.management_server_rows(servers, locations, ranked, {}, config)
     workbook = Workbook()
 
-    metrics.write_server_scorecard_sheet(workbook, rows)
-    headers = [cell.value for cell in workbook["Server Scorecard"][3]]
+    metrics.write_team_trends_sheet(workbook, rows)
+    trends = workbook["Team Trends"]
+    headers = [cell.value for cell in trends[3]]
 
     assert headers == [
-        "Action",
         "Location",
         "Server",
+        "Week End",
+        "Prior Week End",
         "Current Sample",
-        "Evidence Status",
-        "Peer Comparison",
-        "Recent Movement",
+        "Sales / Guest",
+        "WoW Sales / Guest Δ",
+        "Wine %",
+        "WoW Wine % Δ",
+        "WoW Movement",
+        "4-Week Movement",
         "8-Week Direction",
+        "Peer Comparison",
+        "Evidence Status",
+        "Action Gate",
+        "Trend Drivers",
         "History Used",
-        "Positive Drivers",
-        "Watch Drivers",
-        "Manager Question",
     ]
     assert "Score" not in headers
+    assert trends.max_row == 4
+    assert trends["A4"].value == "RC Richmond"
+    assert trends["B4"].value == "Alex Example"
+    assert trends["C4"].value == date(2026, 6, 21)
+    assert trends["D4"].value == date(2026, 6, 14)
+    assert trends["F4"].value == 27
+    assert trends["G4"].value == 1
+    assert trends["H4"].value == 0.10
+    assert trends["I4"].value == 0
+    assert trends["J4"].value == "Mixed"
+    assert trends["N4"].value == rows[0]["confidence"]
+    assert trends["O4"].value == rows[0]["action"]
