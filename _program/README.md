@@ -193,6 +193,11 @@ stability result, evidence weeks, and source lineage.
 codes, exact evidence weeks, source SHA-256/format/parser/date-source,
 methodology version, and metric evidence.
 
+`Data Quality` begins with the latest-week detail and a latest-first 16-week
+location completeness matrix. The matrix labels every location-week as
+Complete, Partial, or Missing before the historical exception, owner review,
+and source-provenance sections.
+
 Before recording a disposition, the manager should ask whether the source and
 identity are correct, whether the work was reasonably comparable, whether
 check volume or a common store condition explains the movement, and what

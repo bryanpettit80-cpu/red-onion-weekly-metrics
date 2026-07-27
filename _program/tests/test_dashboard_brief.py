@@ -212,6 +212,123 @@ def test_missing_configured_location_pauses_dashboard_without_stale_metrics() ->
     assert data_quality["G7"].value == "Missing"
 
 
+def test_data_quality_heatmap_shows_latest_16_weeks_and_gaps() -> None:
+    workbook = Workbook()
+    first_week_end = date(2026, 3, 22)
+    week_ends = [
+        first_week_end + timedelta(days=7 * offset) for offset in range(18)
+    ]
+    partial_week_end = week_ends[-2]
+    location_missing_week_end = week_ends[-3]
+    global_missing_week_end = week_ends[-4]
+    weekly_locations = []
+    for week_end in week_ends:
+        for location in ("RC Richmond", "RC Virginia Beach"):
+            if week_end == global_missing_week_end:
+                continue
+            if (
+                week_end == location_missing_week_end
+                and location == "RC Virginia Beach"
+            ):
+                continue
+            source_days = (
+                3
+                if week_end == partial_week_end and location == "RC Richmond"
+                else metrics.OPERATING_WEEK_DAYS
+            )
+            weekly_locations.append(
+                weekly_location_row(week_end, location, source_days)
+            )
+
+    metrics.write_management_data_quality_sheet(
+        workbook,
+        weekly_locations,
+        metrics.DEFAULT_CONFIG,
+    )
+
+    quality = workbook["Data Quality"]
+    assert quality["A10"].value == "Source Completeness - Latest 16 Weeks"
+    assert "Latest week appears first" in quality["A11"].value
+    assert quality["A12"].value == "Week Ending"
+    assert quality["B12"].value == "RC Richmond"
+    assert quality["C12"].value == "RC Virginia Beach"
+    assert quality["A13"].value == week_ends[-1]
+    assert quality["A28"].value == week_ends[2]
+    displayed_dates = {
+        quality.cell(row=row, column=1).value for row in range(13, 29)
+    }
+    assert week_ends[0] not in displayed_dates
+    assert week_ends[1] not in displayed_dates
+
+    status_rows = {
+        quality.cell(row=row, column=1).value: row for row in range(13, 29)
+    }
+    partial_row = status_rows[partial_week_end]
+    location_missing_row = status_rows[location_missing_week_end]
+    global_missing_row = status_rows[global_missing_week_end]
+    assert quality.cell(row=partial_row, column=2).value == "Partial"
+    assert quality.cell(row=partial_row, column=3).value == "Complete"
+    assert quality.cell(row=location_missing_row, column=2).value == "Complete"
+    assert quality.cell(row=location_missing_row, column=3).value == "Missing"
+    assert quality.cell(row=global_missing_row, column=2).value == "Missing"
+    assert quality.cell(row=global_missing_row, column=3).value == "Missing"
+    assert quality.cell(row=partial_row, column=2).fill.fgColor.rgb[-6:] == "FFF2CC"
+    assert (
+        quality.cell(row=location_missing_row, column=3).fill.fgColor.rgb[-6:]
+        == "F4CCCC"
+    )
+    assert quality.cell(row=13, column=2).fill.fgColor.rgb[-6:] == "D9EAD3"
+    assert quality["A30"].value == "Historical Exceptions"
+
+
+def test_data_quality_heatmap_handles_empty_history() -> None:
+    workbook = Workbook()
+
+    metrics.write_management_data_quality_sheet(
+        workbook,
+        [],
+        metrics.DEFAULT_CONFIG,
+    )
+
+    quality = workbook["Data Quality"]
+    assert quality["A10"].value == "Source Completeness - No Weekly History"
+    assert quality["A13"].value == (
+        "No weekly location history is available for the completeness view."
+    )
+    assert quality["A15"].value == "Historical Exceptions"
+
+
+def test_data_quality_heatmap_scales_past_default_location_count() -> None:
+    workbook = Workbook()
+    locations = [f"RC Location {index:02d}" for index in range(1, 13)]
+    config = {
+        **metrics.DEFAULT_CONFIG,
+        "locations": {
+            location: {"short_code": f"L{index:02d}"}
+            for index, location in enumerate(locations, start=1)
+        },
+    }
+    week_end = date(2026, 7, 19)
+    weekly_locations = [
+        weekly_location_row(week_end, location, metrics.OPERATING_WEEK_DAYS)
+        for location in locations
+    ]
+
+    metrics.write_management_data_quality_sheet(
+        workbook,
+        weekly_locations,
+        config,
+    )
+
+    quality = workbook["Data Quality"]
+    assert quality["B17"].value == locations[-1]
+    assert quality["A20"].value == "Source Completeness - Latest 1 Week"
+    assert quality["M22"].value == locations[-1]
+    assert quality["M23"].value == "Complete"
+    assert "A20:M20" in {str(merged) for merged in quality.merged_cells.ranges}
+    assert "$A$1:$M$" in str(quality.print_area)
+
+
 def test_scorecard_charts_use_latest_eight_complete_weeks() -> None:
     wb = Workbook()
     first_week_end = date(2026, 5, 10)

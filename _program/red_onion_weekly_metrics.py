@@ -335,6 +335,7 @@ OPERATING_WEEK_START_WEEKDAY = 1  # Tuesday; date.weekday() uses Monday=0.
 OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
 OPERATING_WEEK_DAYS = 6
 OPERATING_WEEK_LABEL = "Tuesday-Sunday"
+DATA_QUALITY_COMPLETENESS_WEEKS = 16
 FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS = 1
 DAILY_REPORT_PREFIX = "daily report"
 DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
@@ -10549,6 +10550,163 @@ def latest_location_completeness(
     return latest_rows, configured_locations, location_gaps, complete
 
 
+def recent_completeness_week_ends(
+    weekly_location_rows: list[dict[str, Any]],
+    max_weeks: int = DATA_QUALITY_COMPLETENESS_WEEKS,
+) -> list[date]:
+    """Return a latest-first, continuous completeness window without prehistory."""
+    observed_week_ends = {
+        parsed
+        for row in weekly_location_rows
+        if (parsed := as_date(row.get("week_end"))) is not None
+    }
+    if not observed_week_ends or max_weeks < 1:
+        return []
+    earliest_week_end = min(observed_week_ends)
+    latest_week_end = max(observed_week_ends)
+    available_span = ((latest_week_end - earliest_week_end).days // 7) + 1
+    return [
+        latest_week_end - timedelta(days=7 * offset)
+        for offset in range(min(max_weeks, available_span))
+    ]
+
+
+def write_data_quality_completeness_heatmap(
+    ws,
+    weekly_location_rows: list[dict[str, Any]],
+    configured_locations: list[str],
+    *,
+    start_row: int,
+) -> int:
+    """Write a compact categorical matrix and return its final occupied row."""
+    week_ends = recent_completeness_week_ends(weekly_location_rows)
+    locations = list(configured_locations) or sorted(
+        {
+            str(row.get("location") or "").strip()
+            for row in weekly_location_rows
+            if str(row.get("location") or "").strip()
+        }
+    )
+    title_row = start_row
+    note_row = start_row + 1
+    header_row = start_row + 2
+    data_start_row = start_row + 3
+    heatmap_end_column = max(12, 1 + len(locations))
+
+    ws.merge_cells(
+        start_row=title_row,
+        start_column=1,
+        end_row=title_row,
+        end_column=heatmap_end_column,
+    )
+    week_label = (
+        f"Latest {len(week_ends)} Week{'s' if len(week_ends) != 1 else ''}"
+        if week_ends
+        else "No Weekly History"
+    )
+    ws.cell(
+        row=title_row,
+        column=1,
+        value=f"Source Completeness - {week_label}",
+    )
+    ws.cell(row=title_row, column=1).fill = PatternFill(
+        "solid", fgColor="D9EAF7"
+    )
+    ws.cell(row=title_row, column=1).font = Font(bold=True, color="7A1E1E")
+
+    ws.merge_cells(
+        start_row=note_row,
+        start_column=1,
+        end_row=note_row,
+        end_column=heatmap_end_column,
+    )
+    ws.cell(
+        row=note_row,
+        column=1,
+        value=(
+            f"Each cell represents one {OPERATING_WEEK_LABEL} location-week. "
+            f"Complete = {OPERATING_WEEK_DAYS} source days; Partial = 1-"
+            f"{OPERATING_WEEK_DAYS - 1}; Missing = no usable location-week row. "
+            "Latest week appears first."
+        ),
+    )
+    ws.cell(row=note_row, column=1).fill = PatternFill(
+        "solid", fgColor="F7F7F7"
+    )
+    ws.cell(row=note_row, column=1).font = Font(color="595959", size=9)
+    ws.cell(row=note_row, column=1).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[note_row].height = 30
+
+    headers = ["Week Ending", *locations]
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+    ws.row_dimensions[header_row].height = 30
+
+    if not week_ends or not locations:
+        ws.merge_cells(
+            start_row=data_start_row,
+            start_column=1,
+            end_row=data_start_row,
+            end_column=heatmap_end_column,
+        )
+        ws.cell(
+            row=data_start_row,
+            column=1,
+            value="No weekly location history is available for the completeness view.",
+        )
+        ws.cell(row=data_start_row, column=1).alignment = Alignment(
+            wrap_text=True, vertical="center"
+        )
+        return data_start_row
+
+    row_lookup = {
+        (as_date(row.get("week_end")), str(row.get("location") or "")): row
+        for row in weekly_location_rows
+    }
+    status_styles = {
+        "Complete": ("D9EAD3", "274E13"),
+        "Partial": ("FFF2CC", "7F6000"),
+        "Missing": ("F4CCCC", "9C0006"),
+    }
+    matrix_border = Border(
+        left=Side(style="thin", color="D9E1F2"),
+        right=Side(style="thin", color="D9E1F2"),
+        top=Side(style="thin", color="D9E1F2"),
+        bottom=Side(style="thin", color="D9E1F2"),
+    )
+    for row_index, week_end in enumerate(week_ends, start=data_start_row):
+        date_cell = ws.cell(row=row_index, column=1, value=week_end)
+        date_cell.number_format = "m/d/yyyy"
+        date_cell.fill = PatternFill("solid", fgColor="F3F4F6")
+        date_cell.alignment = Alignment(horizontal="center", vertical="center")
+        date_cell.border = matrix_border
+        for col, location in enumerate(locations, start=2):
+            item = row_lookup.get((week_end, location))
+            source_days = int(item.get("source_days", 0) or 0) if item else 0
+            status = (
+                "Complete"
+                if source_days >= OPERATING_WEEK_DAYS
+                else "Partial"
+                if source_days > 0
+                else "Missing"
+            )
+            fill_color, font_color = status_styles[status]
+            cell = ws.cell(row=row_index, column=col, value=status)
+            cell.fill = PatternFill("solid", fgColor=fill_color)
+            cell.font = Font(bold=True, color=font_color)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = matrix_border
+        ws.row_dimensions[row_index].height = 24
+    return data_start_row + len(week_ends) - 1
+
+
 def write_management_data_quality_sheet(
     wb: Workbook,
     weekly_location_rows: list[dict[str, Any]],
@@ -10665,22 +10823,40 @@ def write_management_data_quality_sheet(
             ws.cell(row=row_index, column=7).fill = fill
         ws.row_dimensions[row_index].height = 72
 
-    ws["A10"] = "Historical Exceptions"
-    ws["A10"].font = Font(bold=True)
-    ws["A10"].fill = PatternFill("solid", fgColor="E7E6E6")
+    heatmap_start_row = max(10, 8 + len(configured_locations))
+    heatmap_end = write_data_quality_completeness_heatmap(
+        ws,
+        weekly_location_rows,
+        configured_locations,
+        start_row=heatmap_start_row,
+    )
+    historical_title_row = heatmap_end + 2
+    historical_header_row = historical_title_row + 1
+    historical_data_start = historical_title_row + 2
+    ws.cell(row=historical_title_row, column=1, value="Historical Exceptions")
+    ws.cell(row=historical_title_row, column=1).font = Font(bold=True)
+    ws.cell(row=historical_title_row, column=1).fill = PatternFill(
+        "solid", fgColor="E7E6E6"
+    )
     historical = [
         row for row in weekly_location_rows if row.get("source_days", 0) < OPERATING_WEEK_DAYS
     ]
     for col, header in enumerate(["Week End", "Location", "Active Days", "Source Days", "Status", "Benchmark Treatment"], start=1):
-        cell = ws.cell(row=11, column=col, value=header)
+        cell = ws.cell(row=historical_header_row, column=col, value=header)
         cell.fill = PatternFill("solid", fgColor="F3F4F6")
         cell.font = Font(bold=True)
-    for row_index, row in enumerate(sorted(historical, key=lambda item: (item["week_end"], item["location"])), start=12):
+    for row_index, row in enumerate(
+        sorted(historical, key=lambda item: (item["week_end"], item["location"])),
+        start=historical_data_start,
+    ):
         values = [row["week_end"], row["location"], row["active_days"], row["source_days"], "Short Week", "Excluded"]
         for col, value in enumerate(values, start=1):
             ws.cell(row=row_index, column=col, value=value)
         ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
-    warning_start = max(14, 13 + len(historical))
+    warning_start = max(
+        historical_title_row + 4,
+        historical_title_row + 3 + len(historical),
+    )
     ws.merge_cells(
         start_row=warning_start,
         start_column=1,
@@ -10857,7 +11033,10 @@ def write_management_data_quality_sheet(
     }.items():
         ws.column_dimensions[column].width = width
     ws.freeze_panes = "A5"
-    ws.print_area = f"A1:L{print_note_row}"
+    print_end_column = get_column_letter(
+        max(12, 1 + len(configured_locations))
+    )
+    ws.print_area = f"A1:{print_end_column}{print_note_row}"
 
 
 def write_management_chart_data(
