@@ -2,6 +2,49 @@
 
 This repository contains the Red Onion weekly metrics automation. In Dropbox it lives inside the operator workspace as `Red Onion Weekly Metrics Automation`; operators use the numbered folders and launcher one level above it.
 
+## Side-By-Side Management Redesign Preview
+
+The current branch can produce a separate, working management-layer preview for
+side-by-side evaluation. It is **preview-only and non-live**: it does not
+replace the deployed `Red_Onion_Server_Master.xlsx`, change the Dropbox
+operator workflow, or authorize use of the people-review signals. The existing
+analytics engine, source reconciliation, eligibility gates, thresholds,
+classifications, evidence lineage, integrity controls, and hidden analytical
+worksheets are unchanged.
+
+The preview branch also has an operational fail-safe: workbook generation
+requires the explicit `--management-redesign-preview` switch and refuses the
+configured live `02 Finished Reports` folder. The routine weekly workflow
+documented below remains the deployed `main` behavior, not a command to run from
+this preview branch.
+
+The preview reduces the management view to four visible sheets:
+
+- `Weekly Review`: the current-week management summary for every current
+  non-excluded server, including current and prior sample context, descriptive
+  watches, and the separate formal action gate.
+- `Follow-up Queue`: the current management workflow. Signal State and
+  Management Status are deliberately separate. If an analytical signal clears,
+  an unresolved review remains visible as `Cleared / Follow-up Required` until
+  a manager explicitly completes or dismisses it with the required disposition.
+- `Roster & Coverage`: the governed owner roster, latest source coverage, and
+  an eight-week evidence-coverage matrix. Missing evidence is shown as coverage
+  context and is not treated as poor performance or a coaching signal. Without
+  an authoritative employee roster, transaction-derived names begin as
+  `Needs Identity Review`; confirmed status, preferred names, gap reasons, and
+  coverage notes persist across regeneration. The first preview includes every
+  non-excluded name found in the selected eight complete weeks, including names
+  absent from the latest week. Managers can add active owners in the blue
+  Owner Roster cells so follow-ups can be assigned and resolved.
+- `Data Quality & Audit`: source readiness, exceptions, provenance, and the
+  interpretation boundaries needed before human review.
+
+The preview uses the plain-language label `Sales / Guest` for gross sales
+divided by guests. This is a display-label correction only; the established
+internal `check_average` field and its calculation are unchanged. The existing
+live workbook and its `How to Use` / `Action Board` workflow remain authoritative
+unless a separately reviewed, approved, and protected deployment replaces them.
+
 ## Folder Layout
 
 ```text
@@ -65,9 +108,9 @@ Excel temporary files whose names start with `~$` are ignored.
 02 Finished Reports\LAST RUN STATUS.txt
 ```
 
-- The master workbook opens to a protected `How to Use` guide with the weekly workflow, signal meanings, required evidence review, editable-field rules, prohibited uses, and links to every visible sheet.
-- Every visible sheet has one consistent menu link back to the protected `How to Use` workbook map.
-- `Action Board` is the single current execution queue. Its blue Status, Owner, Due Date, Context Notes, Review Disposition, Reviewed By, and Review Date fields remain editable.
+- The deployed master workbook opens to a protected `How to Use` guide with the weekly workflow, signal meanings, required evidence review, editable-field rules, prohibited uses, and links to every visible sheet.
+- Every visible sheet in the deployed workbook has one consistent menu link back to the protected `How to Use` workbook map.
+- `Action Board` is the deployed workbook's current execution queue. Its blue Status, Owner, Due Date, Context Notes, Review Disposition, Reviewed By, and Review Date fields remain editable.
 - `Team Trends` shows every current non-excluded server with exact consecutive-week Sales/Guest and Wine % changes, descriptive four-week movement, eight-week direction, evidence status, and the separate gated action outcome. Descriptive movement does not bypass the coaching-signal gates.
 - `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, peer-reference details, metric inputs, stability results, review disposition, and methodology version.
 - `Data Quality` includes a latest-first 16-week location completeness matrix with explicit Complete, Partial, and Missing labels before the detailed exception and provenance sections.
@@ -101,7 +144,7 @@ Before the first protected weekly run, a maintainer must explicitly confirm the 
 & '.\Run Weekly Snapshot.cmd' -InitializeIntegrityBaseline
 ```
 
-An ordinary run fails closed if that baseline, its manifest history, or the machine-local trusted head is missing; it never silently establishes a replacement baseline. On the first run after upgrading an older deployment that already has manifests but no local anchor, the same explicit initialization command verifies the complete current state and adopts that existing head once. A manifest-pinned owner-roster workbook from the immediately preceding protection contract is accepted only through that explicit adoption; it is not rewritten during adoption, history-only migration remains blocked, and the next ordinary weekly run regenerates it with the current strict controls. Each later run verifies the trusted head, full manifest chain, canonical raw archive, generated-workbook archive, published public workbooks, and the master workbook's generated-content digest before reading prior management state. Approved scalar values in blue cells and the Action Board remain editable, while their styles, validation, hyperlinks, and protection metadata stay covered; formulas or external links in editable cells and changes to generated content stop the run.
+An ordinary run fails closed if that baseline, its manifest history, or the machine-local trusted head is missing; it never silently establishes a replacement baseline. On the first run after upgrading an older deployment that already has manifests but no local anchor, the same explicit initialization command verifies the complete current state and adopts that existing head once. A manifest-pinned owner-roster workbook from the immediately preceding protection contract is accepted only through that explicit adoption; it is not rewritten during adoption, history-only migration remains blocked, and the next ordinary weekly run regenerates it with the current strict controls. Each later run verifies the trusted head, full manifest chain, canonical raw archive, generated-workbook archive, published public workbooks, and the master workbook's generated-content digest before reading prior management state. Approved scalar values in blue cells and the deployed Action Board remain editable, while their styles, validation, hyperlinks, and protection metadata stay covered; formulas or external links in editable cells and changes to generated content stop the run. The side-by-side preview applies the same control principle to its approved `Follow-up Queue` and `Roster & Coverage` inputs.
 
 ## Workbook Layers And Metric Use
 
@@ -295,9 +338,12 @@ store baselines remain store-level business context; person-level prompts use
 the qualified same-store peer reference described above. The visible Owner
 Roster begins at `A20` with `Owner Name` and `Active` columns. Add a manager
 once and mark departed managers inactive instead of deleting history. The
-`Action Board` Owner dropdown reflects active roster names immediately in
-Excel; the next successful run carries the roster forward and flags assignments
-that are inactive or no longer listed.
+deployed `Action Board` Owner dropdown reflects active roster names immediately
+in Excel; the next successful run carries the roster forward and flags
+assignments that are inactive or no longer listed. In the redesign preview,
+that governed roster is presented on `Roster & Coverage`, and its active names
+feed the `Follow-up Queue` Owner and Reviewed By fields without changing the
+underlying roster state.
 
 The frozen people-review thresholds identify their calibration dataset, date,
 quantile method, rounding rules, and methodology version. `2026.07-v3` uses
@@ -319,6 +365,9 @@ Workbook protection is designed to prevent accidental changes while preserving t
 - `Management Setup`: configured-entity target cells in `B:G` and the Owner Roster input table are editable.
 - `Action Board`: only Status, Owner, Due Date, Context Notes, Review
   Disposition, Reviewed By, and Review Date data cells are editable.
+- Redesign preview: `Follow-up Queue` exposes the equivalent approved workflow
+  fields, while `Roster & Coverage` exposes governed roster labels, status,
+  coverage reasons, and coverage notes. All other preview cells remain locked.
 - Other workbook cells are locked, technical sheets are `veryHidden`, and workbook structure is protected.
 
 Generated rows begin with `Pending Review`. A completed disposition requires a
@@ -351,7 +400,12 @@ validation limits are documented in [MODEL_CARD.md](MODEL_CARD.md).
 
 The tracked `Run Weekly Snapshot.cmd` also works when this repository is copied outside the named `Red Onion Weekly Metrics Automation` deployment folder. In that standalone layout, the numbered runtime folders are created in the repository root and a `.git` directory is not required. The deployed-release Git preflight is deliberately limited to the canonical named deployment; standalone mode does not claim that its code is a verified release.
 
-The management tabs are shown first. Raw daily, weekly, ranking, and calculation tabs remain in the workbook as `veryHidden` technical sheets for auditability and chart sources.
+In the deployed workbook, the management tabs are shown first. In the separate
+redesign preview, only `Weekly Review`, `Follow-up Queue`,
+`Roster & Coverage`, and `Data Quality & Audit` are visible. Raw daily, weekly,
+ranking, calculation, and legacy management tabs remain `veryHidden` for
+auditability, continuity, and chart sources; the analytics engine is not
+replaced.
 
 ## What Is Not Redundant
 

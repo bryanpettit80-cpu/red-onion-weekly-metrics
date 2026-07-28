@@ -107,11 +107,14 @@ STORE_GROUP_DISPLAY_METRICS: tuple[tuple[str, str, str], ...] = (
 TARGET_FIELDS: tuple[tuple[str, str], ...] = (
     ("gross_sales", "Weekly Sales Target"),
     ("guest_count", "Weekly Guest Target"),
-    ("check_average", "Check Average Target"),
+    ("check_average", "Sales / Guest Target"),
     ("wine_pct", "Wine % Target"),
     ("rate_of_sale_by_guest_count", "Rate Target"),
     ("average_ticket_time_seconds", "Ticket Time Target (Min)"),
 )
+LEGACY_TARGET_LABELS: dict[str, str] = {
+    "check_average": "Check Average Target",
+}
 
 SERVER_PERSON_ACTION_FIELDS: tuple[str, ...] = (
     "check_average",
@@ -194,6 +197,46 @@ REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
     "Context Explains",
     "Data Issue",
     "Monitor",
+)
+FOLLOW_UP_HEADERS: tuple[tuple[str, str], ...] = (
+    ("Management Status", "Status"),
+    ("Owner", "Owner"),
+    ("Due Date", "Due Date"),
+    ("Location", "Location"),
+    ("Person / Area", "Person / Area"),
+    ("Review Type", "Action"),
+    ("Signal State", "Signal State"),
+    ("Evidence Status", "Evidence Status"),
+    ("Manager Question", "Recommended Next Step"),
+    ("Why It Matters", "Why It Matters"),
+    ("Context Notes", "Context Notes"),
+    ("Review Disposition", "Review Disposition"),
+    ("Reviewed By", "Reviewed By"),
+    ("Review Date", "Review Date"),
+    ("Last Seen", "Last Seen"),
+    ("Weeks Open", "Weeks Open"),
+    ("Action ID", "Action ID"),
+    ("Entity Key", "Entity Key"),
+    ("Priority", "Priority"),
+    ("Signal", "Signal"),
+    ("Peer Comparison", "Peer Comparison"),
+    ("Recent Movement", "Recent Movement"),
+    ("First Seen", "First Seen"),
+    ("Methodology Version", "Methodology Version"),
+)
+FOLLOW_UP_VISIBLE_COLUMNS = 16
+ROSTER_STATUS_CHOICES: tuple[str, ...] = (
+    "Active Server",
+    "Inactive",
+    "Non-Server / Service Row",
+    "Needs Identity Review",
+)
+COVERAGE_REASON_CHOICES: tuple[str, ...] = (
+    "No shift",
+    "No sales",
+    "Name mismatch",
+    "Source missing",
+    "Unknown",
 )
 MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v3"
 PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v2"
@@ -290,7 +333,7 @@ PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS = [
     "How to Use",
     *PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS,
 ]
-VISIBLE_MANAGEMENT_SHEETS = [
+PRE_REDESIGN_VISIBLE_MANAGEMENT_SHEETS = [
     "How to Use",
     "Dashboard",
     "Action Board",
@@ -301,6 +344,12 @@ VISIBLE_MANAGEMENT_SHEETS = [
     "Data Quality",
     "Management Setup",
     "Run Notes",
+]
+VISIBLE_MANAGEMENT_SHEETS = [
+    "Weekly Review",
+    "Follow-up Queue",
+    "Roster & Coverage",
+    "Data Quality & Audit",
 ]
 PRE_CONSOLIDATION_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Guide", "How to Use"),
@@ -330,8 +379,14 @@ MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
 )
 MANAGEMENT_MENU_LABEL = "Workbook Menu - click to choose a sheet on How to Use"
 MANAGEMENT_MENU_TARGET = "#'How to Use'!A44"
+PREVIEW_MENU_LABEL = "Return to Weekly Review"
+PREVIEW_MENU_TARGET = "#'Weekly Review'!A1"
 MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT = 12
 MANAGEMENT_PRINT_WIDTHS: dict[str, int] = {
+    "Weekly Review": 2,
+    "Follow-up Queue": 2,
+    "Roster & Coverage": 2,
+    "Data Quality & Audit": 1,
     "How to Use": 1,
     "Dashboard": 1,
     "Action Board": 2,
@@ -371,12 +426,15 @@ INTEGRITY_ANCHOR_ENVIRONMENT_VARIABLE = "RED_ONION_INTEGRITY_ANCHOR_DIR"
 INTEGRITY_ANCHOR_SCHEMA_VERSION = 1
 GENERATED_WORKBOOK_ARCHIVE_FOLDER = "generated-workbooks"
 OWNER_ROSTER_TABLE_NAME = "OwnerRoster"
+PREVIEW_OWNER_ROSTER_TABLE_NAME = "PreviewOwnerRoster"
 OWNER_ROSTER_DEFINED_NAME = "ActiveOwnerChoices"
 OWNER_VALIDATION_SHEET = "_Validation Lists"
 OWNER_ROSTER_HEADERS = ("Owner Name", "Active")
 OWNER_ROSTER_MIN_EDIT_ROWS = 50
 OWNER_ROSTER_SPARE_ROWS = 10
 OWNER_ROSTER_MAX_ROWS = 200
+PREVIEW_OWNER_ROSTER_MIN_EDIT_ROWS = 12
+PREVIEW_OWNER_ROSTER_SPARE_ROWS = 3
 WORKBOOK_DIGEST_SCHEME = "red-onion-generated-content-v2"
 RUN_NOTES_DIGEST_LABEL = "Generated Content SHA-256"
 WORKBOOK_PROTECTION_CONTRACT_LABEL = "Protection Contract"
@@ -788,6 +846,19 @@ def excel_safe_text(value: Any) -> Any:
     if isinstance(value, str) and value.startswith(EXCEL_FORMULA_PREFIXES):
         return f"'{value}"
     return value
+
+
+def management_display_text(value: Any) -> Any:
+    """Use manager-facing terminology without changing the analytical schema."""
+
+    if isinstance(value, str):
+        value = re.sub(
+            r"\bcheck\s+(?:average|avg)\b",
+            "Sales / Guest",
+            value,
+            flags=re.IGNORECASE,
+        )
+    return excel_safe_text(value)
 
 
 def excel_safe_cell_value(cell) -> Any:
@@ -4957,6 +5028,12 @@ def _write_master_workbook_base(
         ("Raw Reports Read", len({record.source_file for record in records})),
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
+        (
+            "Management Layout",
+            "Working preview: Weekly Review, Follow-up Queue, Roster & Coverage, "
+            "and Data Quality & Audit. Technical and legacy management sheets remain "
+            "protected and hidden.",
+        ),
         ("Public Exclude Patterns", ", ".join(config.get("public_exclude_name_contains", []))),
         ("Dashboard Exclude Patterns", ", ".join(config.get("dashboard_exclude_name_contains", []))),
         ("Ranking Minimum Guest Count", rank_min_guest_count),
@@ -5254,7 +5331,7 @@ def full_week_ends_by_location(
 
 def metric_driver(field: str, change: float) -> str:
     if field == "check_average":
-        return f"Check avg {format_change(change, 'currency')}"
+        return f"Sales / Guest {format_change(change, 'currency')}"
     if field == "wine_pct":
         return f"Wine {format_change(change, 'pct_points')}"
     if field == "rate_of_sale_by_guest_count":
@@ -6058,6 +6135,22 @@ def management_server_rows(
             "previous_week_end": (
                 previous_row["week_end"] if previous_row is not None else None
             ),
+            "previous_guest_count": (
+                float(previous_row.get("guest_count", 0) or 0)
+                if previous_row is not None
+                else None
+            ),
+            "previous_active_days": (
+                int(previous_row.get("active_days", 0) or 0)
+                if previous_row is not None
+                else None
+            ),
+            "previous_check_count": (
+                float(previous_row.get("check_count", 0) or 0)
+                if previous_row is not None
+                and previous_row.get("check_count_available")
+                else None
+            ),
             "long_term_direction": long_term_direction,
             "long_term_history_label": history_label,
             "history_used": history_used,
@@ -6338,6 +6431,98 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
     return records
 
 
+def records_from_follow_up_sheet(ws) -> list[dict[str, Any]]:
+    records = records_from_sheet(ws, "Action ID")
+    aliases = {
+        "Management Status": "Status",
+        "Review Type": "Action",
+        "Manager Question": "Recommended Next Step",
+    }
+    for record in records:
+        for visible_header, canonical_header in aliases.items():
+            if is_blank(record.get(canonical_header)) and not is_blank(
+                record.get(visible_header)
+            ):
+                record[canonical_header] = record.get(visible_header)
+    return records
+
+
+def records_from_roster_coverage_sheet(ws) -> list[dict[str, Any]]:
+    """Read the redesign roster table, whose header intentionally sits below row 12."""
+
+    header_row = next(
+        (
+            row
+            for row in range(1, ws.max_row + 1)
+            if any(
+                ws.cell(row=row, column=column).value == "Source Name"
+                for column in range(1, ws.max_column + 1)
+            )
+        ),
+        None,
+    )
+    if header_row is None:
+        return []
+    headers = [
+        ws.cell(row=header_row, column=column).value
+        for column in range(1, ws.max_column + 1)
+    ]
+    records: list[dict[str, Any]] = []
+    for row in range(header_row + 1, ws.max_row + 1):
+        record = {
+            str(header): excel_safe_cell_value(
+                ws.cell(row=row, column=column)
+            )
+            for column, header in enumerate(headers, start=1)
+            if header
+        }
+        if record.get("Source Name"):
+            records.append(record)
+    return records
+
+
+def validate_roster_coverage_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reject roster or missing-week values outside the preview's controlled lists."""
+
+    canonical_statuses = {
+        status.casefold(): status for status in ROSTER_STATUS_CHOICES
+    }
+    canonical_reasons = {
+        reason.casefold(): reason for reason in COVERAGE_REASON_CHOICES
+    }
+    for row_number, record in enumerate(records, start=15):
+        raw_status = record.get("Roster Status")
+        status = canonical_statuses.get(
+            str(raw_status or "").strip().casefold()
+        )
+        if status is None:
+            raise ValueError(
+                f"Roster & Coverage row {row_number} must use an approved "
+                f"Roster Status; received {raw_status!r}. No workbooks were "
+                "created and no source files were moved."
+            )
+        record["Roster Status"] = status
+        for header, value in list(record.items()):
+            if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", str(header)):
+                continue
+            if is_blank(value) or re.fullmatch(
+                r"\d+d / [\d,]+g",
+                str(value).strip(),
+            ):
+                continue
+            reason = canonical_reasons.get(str(value).strip().casefold())
+            if reason is None:
+                raise ValueError(
+                    f"Roster & Coverage row {row_number} has an invalid "
+                    f"missing-week reason {value!r} under {header}. No "
+                    "workbooks were created and no source files were moved."
+                )
+            record[header] = reason
+    return records
+
+
 def validate_action_board_records(
     records: list[dict[str, Any]],
     *,
@@ -6405,11 +6590,9 @@ def validate_action_board_records(
             record.setdefault("Reviewed By", "")
             record.setdefault("Review Date", None)
             continue
+        status_key = canonical_status.casefold()
         review_completed = canonical_disposition != "Pending Review"
-        status_requires_review = canonical_status.casefold() not in {
-            "review needed",
-            "open",
-        }
+        status_requires_review = status_key in {"complete", "dismissed"}
         if review_completed or status_requires_review:
             reviewer = str(record.get("Reviewed By") or "").strip()
             review_date = as_date(record.get("Review Date"))
@@ -6432,6 +6615,22 @@ def validate_action_board_records(
                 )
             record["Reviewed By"] = excel_safe_text(reviewer)
             record["Review Date"] = review_date
+        if status_key == "in progress":
+            if is_blank(record.get("Owner")) or as_date(record.get("Due Date")) is None:
+                action_id = str(record.get("Action ID") or f"row {row_number}")
+                raise ValueError(
+                    f"Action {action_id!r} cannot move to In Progress until Owner "
+                    "and Due Date are complete. No workbooks were created and no "
+                    "source files were moved."
+                )
+        if status_key == "blocked":
+            if is_blank(record.get("Owner")) or is_blank(record.get("Context Notes")):
+                action_id = str(record.get("Action ID") or f"row {row_number}")
+                raise ValueError(
+                    f"Action {action_id!r} cannot move to Blocked until Owner and "
+                    "Context Notes are complete. No workbooks were created and no "
+                    "source files were moved."
+                )
     return records
 
 
@@ -6569,6 +6768,46 @@ def owner_roster_capacity_from_sheet(ws) -> int:
     return capacity
 
 
+def preview_owner_roster_from_sheet(ws) -> list[dict[str, str]]:
+    """Read the manager-editable owner roster from Roster & Coverage."""
+    if PREVIEW_OWNER_ROSTER_TABLE_NAME not in ws.tables:
+        return []
+    table = ws.tables[PREVIEW_OWNER_ROSTER_TABLE_NAME]
+    min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+    if max_col - min_col != 1:
+        raise ValueError(
+            "The preview Owner Roster must contain exactly Owner Name and Active. "
+            "No workbooks were created and no source files were moved."
+        )
+    if max_row - min_row > OWNER_ROSTER_MAX_ROWS:
+        raise ValueError(
+            f"Owner Roster supports at most {OWNER_ROSTER_MAX_ROWS} rows. "
+            "No workbooks were created and no source files were moved."
+        )
+    headers = tuple(
+        str(ws.cell(row=min_row, column=col).value or "")
+        for col in range(min_col, max_col + 1)
+    )
+    if headers != OWNER_ROSTER_HEADERS:
+        raise ValueError(
+            "The preview Owner Roster headers must be Owner Name and Active in that order. "
+            "No workbooks were created and no source files were moved."
+        )
+    entries: list[dict[str, Any]] = []
+    for row in range(min_row + 1, max_row + 1):
+        name = excel_safe_cell_value(ws.cell(row=row, column=min_col))
+        if is_blank(name):
+            continue
+        active_value = excel_safe_cell_value(ws.cell(row=row, column=max_col))
+        if is_blank(active_value):
+            raise ValueError(
+                f"Preview Owner Roster row {row} has a name but no Active value. "
+                "Choose Yes or No; no workbooks were created and no source files were moved."
+            )
+        entries.append({"Owner Name": name, "Active": active_value})
+    return normalize_owner_roster(entries)
+
+
 def read_management_state(
     output_path: Path,
     *,
@@ -6583,6 +6822,7 @@ def read_management_state(
         "active_actions": [],
         "action_history": [],
         "evidence_by_action_id": {},
+        "roster_coverage": [],
     }
     if not output_path.exists():
         return state
@@ -6619,7 +6859,16 @@ def read_management_state(
                         break
                     values: dict[str, float | None] = {}
                     for field, label in TARGET_FIELDS:
-                        value = ws.cell(row=row, column=headers[label]).value if label in headers else None
+                        source_label = (
+                            label
+                            if label in headers
+                            else LEGACY_TARGET_LABELS.get(field)
+                        )
+                        value = (
+                            ws.cell(row=row, column=headers[source_label]).value
+                            if source_label in headers
+                            else None
+                        )
                         if isinstance(value, (int, float)):
                             values[field] = float(value) * 60 if field == "average_ticket_time_seconds" else float(value)
                         else:
@@ -6629,7 +6878,21 @@ def read_management_state(
             state["owner_roster"] = owner_roster_from_sheet(ws)
             state["owners"] = active_owner_names(state["owner_roster"])
             state["owner_roster_capacity"] = owner_roster_capacity_from_sheet(ws)
-        if "Action Board" in wb.sheetnames:
+        if (
+            "Roster & Coverage" in wb.sheetnames
+            and PREVIEW_OWNER_ROSTER_TABLE_NAME
+            in wb["Roster & Coverage"].tables
+        ):
+            state["owner_roster"] = preview_owner_roster_from_sheet(
+                wb["Roster & Coverage"]
+            )
+            state["owners"] = active_owner_names(state["owner_roster"])
+        if "Follow-up Queue" in wb.sheetnames:
+            state["active_actions"] = validate_action_board_records(
+                records_from_follow_up_sheet(wb["Follow-up Queue"]),
+                allowed_reviewers=state["owners"],
+            )
+        elif "Action Board" in wb.sheetnames:
             state["active_actions"] = validate_action_board_records(
                 records_from_sheet(wb["Action Board"], "Action ID"),
                 allowed_reviewers=state["owners"],
@@ -6645,6 +6908,12 @@ def read_management_state(
                 for row in evidence_rows
                 if row.get("Action ID")
             }
+        if "Roster & Coverage" in wb.sheetnames:
+            state["roster_coverage"] = validate_roster_coverage_records(
+                records_from_roster_coverage_sheet(
+                    wb["Roster & Coverage"]
+                )
+            )
     finally:
         wb.close()
     return state
@@ -7030,7 +7299,13 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
                 for col in range(1, ws.max_column + 1)
                 if ws.cell(row=target_header_row, column=col).value
             }
-            target_columns = [headers[label] for _, label in TARGET_FIELDS if label in headers]
+            target_columns = []
+            for field, label in TARGET_FIELDS:
+                source_label = (
+                    label if label in headers else LEGACY_TARGET_LABELS.get(field)
+                )
+                if source_label in headers:
+                    target_columns.append(headers[source_label])
             row = target_header_row + 1
             while row <= ws.max_row and not is_blank(ws.cell(row=row, column=headers["Entity"]).value):
                 for col in target_columns:
@@ -7070,6 +7345,65 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
                     continue
                 for row in range(header_row + 1, ws.max_row + 1):
                     approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+    if "Follow-up Queue" in wb.sheetnames:
+        ws = wb["Follow-up Queue"]
+        header_row = find_sheet_header_row(ws, "Action ID")
+        if header_row:
+            headers = {
+                ws.cell(row=header_row, column=col).value: col
+                for col in range(1, ws.max_column + 1)
+                if ws.cell(row=header_row, column=col).value
+            }
+            for header in (
+                "Management Status",
+                "Owner",
+                "Due Date",
+                "Context Notes",
+                "Review Disposition",
+                "Reviewed By",
+                "Review Date",
+            ):
+                col = headers.get(header)
+                if col is None:
+                    continue
+                for row in range(header_row + 1, ws.max_row + 1):
+                    approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+    if "Roster & Coverage" in wb.sheetnames:
+        ws = wb["Roster & Coverage"]
+        if PREVIEW_OWNER_ROSTER_TABLE_NAME in ws.tables:
+            min_col, min_row, max_col, max_row = range_boundaries(
+                ws.tables[PREVIEW_OWNER_ROSTER_TABLE_NAME].ref
+            )
+            for row in range(min_row + 1, max_row + 1):
+                for col in range(min_col, max_col + 1):
+                    approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+        if "RosterCoverageTable" in ws.tables:
+            min_col, min_row, max_col, max_row = range_boundaries(
+                ws.tables["RosterCoverageTable"].ref
+            )
+            headers = {
+                ws.cell(row=min_row, column=col).value: col
+                for col in range(min_col, max_col + 1)
+                if ws.cell(row=min_row, column=col).value
+            }
+            for header in (
+                "Preferred Display Name",
+                "Roster Status",
+                "Coverage Note",
+            ):
+                col = headers.get(header)
+                if col is None:
+                    continue
+                for row in range(min_row + 1, max_row + 1):
+                    approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+            for col in range(min_col, max_col + 1):
+                header = str(ws.cell(row=min_row, column=col).value or "")
+                if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", header):
+                    continue
+                for row in range(min_row + 1, max_row + 1):
+                    cell = ws.cell(row=row, column=col)
+                    if str(cell.value or "") in COVERAGE_REASON_CHOICES:
+                        approved.add((ws.title, cell.coordinate))
     return approved
 
 
@@ -7315,7 +7649,8 @@ def require_stop_style_list_validation(
         validation.showErrorMessage is not True
         or validation.errorStyle != "stop"
         or bool(validation.allowBlank) is not allow_blank
-        or str(validation.sqref) != sqref
+        or sorted(str(validation.sqref).split())
+        != sorted(str(sqref).split())
         or not validation.errorTitle
         or not validation.error
     ):
@@ -7420,6 +7755,137 @@ def expected_management_list_validations(
             )
     elif records_from_sheet(action_board, "Action ID"):
         raise IntegrityError("The Action Board table is missing.")
+    if "Follow-up Queue" in wb.sheetnames:
+        follow_up = wb["Follow-up Queue"]
+        if "FollowUpQueueTable" in follow_up.tables:
+            min_col, min_row, max_col, max_row = range_boundaries(
+                follow_up.tables["FollowUpQueueTable"].ref
+            )
+            if (min_col, max_col) != (1, len(FOLLOW_UP_HEADERS)):
+                raise IntegrityError("The Follow-up Queue table has an unexpected shape.")
+            actual_headers = [
+                follow_up.cell(row=min_row, column=column).value
+                for column in range(min_col, max_col + 1)
+            ]
+            if actual_headers != [header for header, _ in FOLLOW_UP_HEADERS]:
+                raise IntegrityError(
+                    "The Follow-up Queue table headers do not match the redesign schema."
+                )
+            expected.extend(
+                [
+                    (
+                        "Follow-up Queue",
+                        f'"{",".join(ACTION_STATUS_CHOICES)}"',
+                        False,
+                        column_range("A", min_row + 1, max_row),
+                        "Follow-up Queue status",
+                    ),
+                    (
+                        "Follow-up Queue",
+                        f"={OWNER_ROSTER_DEFINED_NAME}",
+                        True,
+                        (
+                            column_range("B", min_row + 1, max_row)
+                            + " "
+                            + column_range("M", min_row + 1, max_row)
+                        ),
+                        "Follow-up Queue owner and reviewer",
+                    ),
+                    (
+                        "Follow-up Queue",
+                        f'"{",".join(REVIEW_DISPOSITION_CHOICES)}"',
+                        False,
+                        column_range("L", min_row + 1, max_row),
+                        "Follow-up Queue review disposition",
+                    ),
+                ]
+            )
+        elif records_from_follow_up_sheet(follow_up):
+            raise IntegrityError("The Follow-up Queue table is missing.")
+    if "Roster & Coverage" in wb.sheetnames:
+        roster_sheet = wb["Roster & Coverage"]
+        if PREVIEW_OWNER_ROSTER_TABLE_NAME in roster_sheet.tables:
+            owner_min_col, owner_min_row, owner_max_col, owner_max_row = (
+                range_boundaries(
+                    roster_sheet.tables[PREVIEW_OWNER_ROSTER_TABLE_NAME].ref
+                )
+            )
+            if owner_max_col - owner_min_col != 1:
+                raise IntegrityError(
+                    "The preview Owner Roster table has an unexpected shape."
+                )
+            owner_headers = [
+                roster_sheet.cell(row=owner_min_row, column=column).value
+                for column in range(owner_min_col, owner_max_col + 1)
+            ]
+            if owner_headers != list(OWNER_ROSTER_HEADERS):
+                raise IntegrityError(
+                    "The preview Owner Roster table headers do not match the redesign schema."
+                )
+            expected.append(
+                (
+                    "Roster & Coverage",
+                    '"Yes,No"',
+                    True,
+                    column_range(
+                        get_column_letter(owner_max_col),
+                        owner_min_row + 1,
+                        owner_max_row,
+                    ),
+                    "Preview Owner Roster Active",
+                )
+            )
+        if "RosterCoverageTable" in roster_sheet.tables:
+            min_col, min_row, max_col, max_row = range_boundaries(
+                roster_sheet.tables["RosterCoverageTable"].ref
+            )
+            headers = [
+                roster_sheet.cell(row=min_row, column=column).value
+                for column in range(min_col, max_col + 1)
+            ]
+            if headers[:6] != [
+                "Location",
+                "Source Name",
+                "Preferred Display Name",
+                "Roster Status",
+                "Weeks Present",
+                "Missing Weeks",
+            ] or headers[-1] != "Coverage Note":
+                raise IntegrityError(
+                    "The Roster & Coverage table headers do not match the redesign schema."
+                )
+            expected.append(
+                (
+                    "Roster & Coverage",
+                    f'"{",".join(ROSTER_STATUS_CHOICES)}"',
+                    False,
+                    column_range("D", min_row + 1, max_row),
+                    "Roster status",
+                )
+            )
+            missing_cells = [
+                roster_sheet.cell(row=row, column=col).coordinate
+                for row in range(min_row + 1, max_row + 1)
+                for col in range(min_col, max_col + 1)
+                if re.fullmatch(
+                    r"\d{2}/\d{2}/\d{4}",
+                    str(roster_sheet.cell(row=min_row, column=col).value or ""),
+                )
+                and str(roster_sheet.cell(row=row, column=col).value or "")
+                in COVERAGE_REASON_CHOICES
+            ]
+            if missing_cells:
+                expected.append(
+                    (
+                        "Roster & Coverage",
+                        f'"{",".join(COVERAGE_REASON_CHOICES)}"',
+                        False,
+                        " ".join(missing_cells),
+                        "Coverage reason",
+                    )
+                )
+        elif records_from_sheet(roster_sheet, "Source Name"):
+            raise IntegrityError("The Roster & Coverage table is missing.")
     return expected
 
 
@@ -7504,12 +7970,27 @@ def validate_management_workbook_controls(
         raise IntegrityError("Management Setup is missing a required protected input table.")
     if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
         raise IntegrityError("The active-owner workbook name is missing.")
-    owner_roster = owner_roster_from_sheet(setup)
+    owner_roster = (
+        preview_owner_roster_from_sheet(wb["Roster & Coverage"])
+        if "Roster & Coverage" in wb.sheetnames
+        and PREVIEW_OWNER_ROSTER_TABLE_NAME
+        in wb["Roster & Coverage"].tables
+        else owner_roster_from_sheet(setup)
+    )
     action_board = wb["Action Board"]
     validate_action_board_records(
         records_from_sheet(action_board, "Action ID"),
         allowed_reviewers=active_owner_names(owner_roster),
     )
+    if "Follow-up Queue" in wb.sheetnames:
+        validate_action_board_records(
+            records_from_follow_up_sheet(wb["Follow-up Queue"]),
+            allowed_reviewers=active_owner_names(owner_roster),
+        )
+    if "Roster & Coverage" in wb.sheetnames:
+        validate_roster_coverage_records(
+            records_from_roster_coverage_sheet(wb["Roster & Coverage"])
+        )
     return setup, action_board
 
 
@@ -7535,7 +8016,8 @@ def require_pre_contract_list_validations(wb: Workbook) -> None:
             raise IntegrityError(f"The pre-contract {label} validation is missing or duplicated.")
         validation = matches[0]
         if (
-            str(validation.sqref) != sqref
+            sorted(str(validation.sqref).split())
+            != sorted(str(sqref).split())
             or bool(validation.allowBlank) is not allow_blank
             or validation.showErrorMessage is not False
             or validation.errorStyle is not None
@@ -7686,7 +8168,22 @@ def validate_management_workbook(
             if visible_sheets is None
             else visible_sheets
         )
-        if "How to Use" in visible_sheet_names:
+        has_redesign_layout = all(
+            name in wb.sheetnames
+            for name in (
+                "Weekly Review",
+                "Follow-up Queue",
+                "Roster & Coverage",
+                "Data Quality & Audit",
+            )
+        )
+        if (
+            has_redesign_layout
+            and tuple(visible_sheet_names)
+            == tuple(VISIBLE_MANAGEMENT_SHEETS)
+        ):
+            require_redesign_usability_contract(wb)
+        elif "How to Use" in visible_sheet_names:
             require_current_workbook_usability_contract(
                 wb,
                 previous_v2=previous_v2_usability,
@@ -8056,6 +8553,9 @@ def verify_existing_management_workbook_integrity(
             name in wb.sheetnames for name in ("Action Focus", "Evidence Detail")
         )
         has_how_to_use_schema = "How to Use" in wb.sheetnames
+        has_redesign_layout = all(
+            name in wb.sheetnames for name in VISIBLE_MANAGEMENT_SHEETS
+        )
         has_previous_v2_usability = workbook_uses_previous_v2_usability(wb)
         has_legacy_multi_link_navigation = (
             workbook_uses_legacy_multi_link_navigation(wb)
@@ -8080,6 +8580,12 @@ def verify_existing_management_workbook_integrity(
     finally:
         wb.close()
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
+        if has_redesign_layout:
+            return validate_management_workbook(
+                path,
+                expected_digest or stamped,
+                visible_sheets=VISIBLE_MANAGEMENT_SHEETS,
+            )
         if has_v2_action_schema:
             if has_how_to_use_schema:
                 if has_pre_consolidation_layout:
@@ -8145,7 +8651,12 @@ def verify_existing_management_workbook_integrity(
                             PRE_CONSOLIDATION_NAVIGATION_LINKS
                         ),
                     )
-                return validate_management_workbook(path, expected_digest or stamped)
+                return validate_management_workbook(
+                    path,
+                    expected_digest or stamped,
+                    visible_sheets=PRE_REDESIGN_VISIBLE_MANAGEMENT_SHEETS,
+                    navigation_links=MANAGEMENT_NAVIGATION_LINKS,
+                )
             return validate_pre_guide_management_workbook(
                 path, expected_digest or stamped or ""
             )
@@ -8724,6 +9235,11 @@ def merge_management_actions(
     readiness: LatestWeekReadiness | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     evidence_by_action_id = state.get("evidence_by_action_id", {})
+    completed_statuses = {"complete", "dismissed"}
+
+    def unresolved(row: dict[str, Any]) -> bool:
+        return str(row.get("Status") or "").strip().casefold() not in completed_statuses
+
     prior_rows = []
     for row in state.get("active_actions", []):
         enriched_prior = dict(row)
@@ -8736,11 +9252,6 @@ def merge_management_actions(
             }
         )
         prior_rows.append(enriched_prior)
-    prior_active = {
-        str(row.get("Entity Key", "")).casefold(): row
-        for row in prior_rows
-        if row.get("Entity Key")
-    }
     history = []
     for row in state.get("action_history", []):
         enriched_history = dict(row)
@@ -8752,16 +9263,37 @@ def merge_management_actions(
                 if field in evidence
             }
         )
-        history.append(enriched_history)
+        if unresolved(enriched_history):
+            prior_rows.append(enriched_history)
+        else:
+            history.append(enriched_history)
+    prior_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in prior_rows:
+        key = str(row.get("Entity Key", "")).casefold()
+        if key:
+            prior_candidates[key].append(row)
+    prior_active = {
+        key: max(
+            candidates,
+            key=lambda row: (
+                str(row.get("Signal State") or "").casefold() == "current",
+                as_date(row.get("Last Seen")) or date.min,
+                as_date(row.get("First Seen")) or date.min,
+            ),
+        )
+        for key, candidates in prior_candidates.items()
+    }
     current: list[dict[str, Any]] = []
     matched_keys: set[str] = set()
-    completed_statuses = {"complete", "dismissed"}
+    matched_action_ids: set[str] = set()
     for signal in signals:
         key = str(signal["Entity Key"]).casefold()
         matched_keys.add(key)
         prior = prior_active.get(key)
         prior_status = str(prior.get("Status", "")).casefold() if prior else ""
         last_seen = as_date(signal.get("Last Seen")) or date.today()
+        if prior and prior.get("Action ID"):
+            matched_action_ids.add(str(prior["Action ID"]))
         if prior and prior_status not in completed_statuses:
             first_seen = as_date(prior.get("First Seen")) or last_seen
             action_id = str(prior.get("Action ID") or action_episode_id(key, first_seen))
@@ -8821,8 +9353,10 @@ def merge_management_actions(
                 "Review Date": review_date,
             }
         )
-    for key, prior in prior_active.items():
-        if key in matched_keys:
+    for prior in prior_rows:
+        key = str(prior.get("Entity Key", "")).casefold()
+        action_id = str(prior.get("Action ID") or "")
+        if action_id and action_id in matched_action_ids:
             continue
         prior_status = str(prior.get("Status", "")).casefold()
         is_data_quality = (
@@ -8910,6 +9444,48 @@ def merge_management_actions(
                     },
                 )
             )
+            continue
+        if prior_status not in completed_statuses:
+            follow_up = dict(prior)
+            if "Review Disposition" not in follow_up:
+                follow_up["Status"] = "Review Needed"
+                follow_up["Context Notes"] = (
+                    follow_up.get("Context Notes")
+                    or follow_up.get("Manager Notes")
+                    or ""
+                )
+                follow_up["Review Disposition"] = "Pending Review"
+                follow_up["Reviewed By"] = ""
+                follow_up["Review Date"] = None
+            first_seen = (
+                as_date(follow_up.get("First Seen"))
+                or as_date(follow_up.get("Last Seen"))
+                or date.today()
+            )
+            through_date = (
+                readiness.latest_week_end
+                if readiness is not None and readiness.latest_week_end
+                else date.today()
+            )
+            follow_up["First Seen"] = first_seen
+            follow_up["Weeks Open"] = max(
+                1, ((through_date - first_seen).days // 7) + 1
+            )
+            follow_up["Signal State"] = "Cleared / Follow-up Required"
+            follow_up["Recommended Next Step"] = (
+                "The analytical signal is no longer current, but the management review "
+                "was never resolved. Document the disposition before archiving this item."
+            )
+            methodology = str(
+                follow_up.get("Methodology Version")
+                or follow_up.get("Threshold Version")
+                or ""
+            )
+            if methodology != MANAGEMENT_METHODOLOGY_VERSION:
+                follow_up["Evidence Status"] = (
+                    "Legacy v2 — revalidate before action"
+                )
+            current.append(follow_up)
             continue
         cleared = dict(prior)
         cleared["Signal State"] = "Cleared"
@@ -9253,6 +9829,133 @@ def require_management_menu_contract(
             )
 
 
+def require_preview_navigation_contract(
+    wb: Workbook,
+    visible_sheets: Iterable[str],
+) -> None:
+    for ws in (wb[name] for name in visible_sheets):
+        start_column, end_column = management_menu_bounds(ws)
+        expected_range = (
+            f"{get_column_letter(start_column)}2:"
+            f"{get_column_letter(end_column)}2"
+        )
+        menu_merges = {
+            str(merged)
+            for merged in ws.merged_cells.ranges
+            if merged.min_row <= 2 <= merged.max_row
+        }
+        if menu_merges != {expected_range}:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} does not use the preview workbook-menu merge."
+            )
+        require_management_title_and_freeze_contract(ws)
+        cell = ws.cell(row=2, column=start_column)
+        if (
+            cell.value != PREVIEW_MENU_LABEL
+            or cell.hyperlink is None
+            or cell.hyperlink.target != PREVIEW_MENU_TARGET
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} has an invalid preview navigation target."
+            )
+        if (
+            ws.row_dimensions[2].height != 24
+            or workbook_color_suffix(cell.fill.fgColor) != "F2F2F2"
+            or workbook_color_suffix(cell.font.color) != "7A1E1E"
+            or cell.font.bold is not True
+            or cell.font.size != 9
+            or cell.font.underline != "single"
+            or cell.protection.locked is not True
+            or cell.alignment.horizontal != "left"
+            or cell.alignment.vertical != "center"
+            or cell.alignment.shrink_to_fit is not True
+            or cell.alignment.indent != 1
+            or cell.border.top.style != "thin"
+            or cell.border.bottom.style != "thin"
+        ):
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} preview navigation style does not match the contract."
+            )
+
+
+def require_redesign_usability_contract(wb: Workbook) -> None:
+    if wb.sheetnames[: len(VISIBLE_MANAGEMENT_SHEETS)] != VISIBLE_MANAGEMENT_SHEETS:
+        raise IntegrityError(
+            "The management redesign sheets must be first and remain in the approved order."
+        )
+    if wb.active.title != "Weekly Review":
+        raise IntegrityError("Weekly Review must be the active opening worksheet.")
+    require_preview_navigation_contract(wb, VISIBLE_MANAGEMENT_SHEETS)
+    weekly_review = wb["Weekly Review"]
+    review_header_row = next(
+        (
+            row
+            for row in range(1, weekly_review.max_row + 1)
+            if weekly_review.cell(row=row, column=1).value == "Review Level"
+        ),
+        None,
+    )
+    if review_header_row is None:
+        raise IntegrityError("Weekly Review is missing its review header.")
+    if "WeeklyReviewTable" in weekly_review.tables:
+        review_table = weekly_review.tables["WeeklyReviewTable"]
+        min_col, min_row, max_col, _ = range_boundaries(review_table.ref)
+    else:
+        min_col, min_row, max_col = 1, review_header_row, 13
+    review_headers = [
+        weekly_review.cell(row=min_row, column=column).value
+        for column in range(min_col, max_col + 1)
+    ]
+    required_review_headers = {
+        "Review Level",
+        "Current Sample",
+        "Prior Sample",
+        "Sales / Guest",
+        "WoW Sales / Guest Δ",
+        "Manager Guidance",
+    }
+    if not required_review_headers.issubset(set(review_headers)):
+        raise IntegrityError("Weekly Review is missing required review columns.")
+    if not any(
+        cell.value == "Action ID"
+        for cell in wb["Follow-up Queue"]._cells.values()
+    ):
+        raise IntegrityError("Follow-up Queue is missing its action header.")
+    if not any(
+        cell.value == "Source Name"
+        for cell in wb["Roster & Coverage"]._cells.values()
+    ):
+        raise IntegrityError("Roster & Coverage is missing its roster header.")
+    quality_text = "\n".join(
+        str(cell.value)
+        for cell in wb["Data Quality & Audit"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    for phrase in (
+        "LATEST-WEEK SOURCE STATUS",
+        "AUDIT AND USE BOUNDARIES",
+        "Sales / Guest is gross sales divided by guests",
+    ):
+        if phrase not in quality_text:
+            raise IntegrityError(
+                f"Data Quality & Audit is missing required guidance: {phrase}."
+            )
+    visible_text = "\n".join(
+        str(cell.value)
+        for sheet_name in VISIBLE_MANAGEMENT_SHEETS
+        for cell in wb[sheet_name]._cells.values()
+        if cell.value not in (None, "")
+        and not wb[sheet_name].column_dimensions[
+            get_column_letter(cell.column)
+        ].hidden
+        and cell.protection.locked is not False
+    )
+    if re.search(r"\bCheck Average\b|\bCheck avg\b", visible_text, re.IGNORECASE):
+        raise IntegrityError(
+            "The visible management redesign must label check_average as Sales / Guest."
+        )
+
+
 def add_management_navigation(ws) -> None:
     """Add one consistent menu link without changing data-column widths."""
 
@@ -9275,6 +9978,41 @@ def add_management_navigation(ws) -> None:
     )
     cell = ws.cell(row=2, column=start_column, value=MANAGEMENT_MENU_LABEL)
     cell.hyperlink = MANAGEMENT_MENU_TARGET
+    cell.fill = neutral_fill
+    cell.font = Font(
+        color="7A1E1E",
+        bold=True,
+        underline="single",
+        size=9,
+    )
+    cell.alignment = Alignment(
+        horizontal="left",
+        vertical="center",
+        shrink_to_fit=True,
+        indent=1,
+    )
+    cell.border = navigation_border
+    ws.row_dimensions[2].height = 24
+
+
+def add_preview_navigation(ws) -> None:
+    """Add the compact redesign navigation without exposing technical sheets."""
+
+    neutral_fill = PatternFill("solid", fgColor="F2F2F2")
+    navigation_border = Border(
+        top=Side(style="thin", color="B7B7B7"),
+        bottom=Side(style="thin", color="B7B7B7"),
+    )
+    start_column, end_column = management_menu_bounds(ws)
+    ws.cell(row=2, column=start_column).border = navigation_border
+    ws.merge_cells(
+        start_row=2,
+        start_column=start_column,
+        end_row=2,
+        end_column=end_column,
+    )
+    cell = ws.cell(row=2, column=start_column, value=PREVIEW_MENU_LABEL)
+    cell.hyperlink = PREVIEW_MENU_TARGET
     cell.fill = neutral_fill
     cell.font = Font(
         color="7A1E1E",
@@ -9770,7 +10508,7 @@ def write_management_setup_sheet(
         cell.fill = PatternFill("solid", fgColor="E7E6E6")
         cell.font = Font(bold=True)
     metric_labels = {
-        "check_average": "Check Average",
+        "check_average": "Sales / Guest",
         "wine_pct": "Wine %",
         "rate_of_sale_by_guest_count": "Rate of Sale",
         "average_ticket_time_seconds": "Ticket Time",
@@ -9889,15 +10627,43 @@ def write_owner_validation_sheet(
     remove_sheet_if_present(wb, OWNER_VALIDATION_SHEET)
     ws = wb.create_sheet(OWNER_VALIDATION_SHEET)
     ws["A1"] = "Active Owners"
+    preview_table_bounds: tuple[int, int, int, int] | None = None
+    if (
+        "Roster & Coverage" in wb.sheetnames
+        and PREVIEW_OWNER_ROSTER_TABLE_NAME
+        in wb["Roster & Coverage"].tables
+    ):
+        preview_table_bounds = range_boundaries(
+            wb["Roster & Coverage"].tables[
+                PREVIEW_OWNER_ROSTER_TABLE_NAME
+            ].ref
+        )
+        preview_capacity = preview_table_bounds[3] - preview_table_bounds[1]
+        capacity = max(capacity, preview_capacity)
     for offset in range(capacity):
-        setup_row = 21 + offset
+        if preview_table_bounds is not None:
+            preview_min_col, preview_min_row, _, preview_max_row = (
+                preview_table_bounds
+            )
+            preview_row = preview_min_row + 1 + offset
+            owner_column = get_column_letter(preview_min_col)
+            active_column = get_column_letter(preview_min_col + 1)
+            value = (
+                f'=IF(\'Roster & Coverage\'!${active_column}${preview_row}="Yes",'
+                f'\'Roster & Coverage\'!${owner_column}${preview_row},"")'
+                if preview_row <= preview_max_row
+                else '=""'
+            )
+        else:
+            setup_row = 21 + offset
+            value = (
+                f'=IF(\'Management Setup\'!$B${setup_row}="Yes",'
+                f'\'Management Setup\'!$A${setup_row},"")'
+            )
         ws.cell(
             row=2 + offset,
             column=1,
-            value=(
-                f'=IF(\'Management Setup\'!$B${setup_row}="Yes",'
-                f'\'Management Setup\'!$A${setup_row},"")'
-            ),
+            value=value,
         )
     end_row = capacity + 1
     wb.defined_names.pop(OWNER_ROSTER_DEFINED_NAME, None)
@@ -10351,6 +11117,7 @@ def write_evidence_detail_sheet(
 
 
 def operational_sample_text(row: dict[str, Any]) -> str:
+    active_days = int(row.get("active_days", 0) or 0)
     check_text = (
         f"{float(row.get('check_count', 0) or 0):,.0f} checks"
         if row.get("check_count_available")
@@ -10358,8 +11125,1307 @@ def operational_sample_text(row: dict[str, Any]) -> str:
     )
     return (
         f"{float(row.get('guest_count', 0) or 0):,.0f} guests / "
-        f"{check_text} / {int(row.get('active_days', 0) or 0)} days"
+        f"{check_text} / {active_days} day{'s' if active_days != 1 else ''}"
     )
+
+
+def prior_operational_sample_text(row: dict[str, Any]) -> str:
+    if row.get("previous_week_end") is None:
+        return "No prior week"
+    active_days = int(row.get("previous_active_days", 0) or 0)
+    return (
+        f"{float(row.get('previous_guest_count', 0) or 0):,.0f} guests / "
+        f"{active_days} day{'s' if active_days != 1 else ''}"
+    )
+
+
+def weekly_review_classification(row: dict[str, Any]) -> str:
+    action = str(row.get("action") or PromptAction.MONITOR.value)
+    if action in {
+        PromptAction.CONTEXT_REVIEW.value,
+        PromptAction.COACHING_PROMPT.value,
+        PromptAction.RECOGNITION_PROMPT.value,
+    }:
+        return "Formal Review"
+    descriptive_movement = str(
+        row.get("descriptive_recent_movement") or row.get("momentum") or ""
+    )
+    peer_comparison = str(row.get("performance_level") or "")
+    material_driver = bool(
+        row.get("positive_drivers") or row.get("negative_drivers")
+    )
+    if (
+        str(row.get("week_over_week_movement") or "") == "Watch"
+        or descriptive_movement
+        in {RecentMovement.UPWARD.value, RecentMovement.DOWNWARD.value}
+        or (
+            peer_comparison
+            in {
+                PeerComparison.ABOVE.value,
+                PeerComparison.BELOW.value,
+            }
+            and material_driver
+        )
+    ):
+        return "Watch"
+    evidence_status = str(row.get("confidence") or "")
+    if (
+        evidence_status
+        in {
+            "Limited Volume",
+            "Limited History",
+            "Reference Unavailable",
+        }
+        or row.get("previous_week_end") is None
+        or descriptive_movement == RecentMovement.NOT_EVALUATED.value
+        or str(row.get("long_term_direction") or "")
+        == RecentMovement.NOT_EVALUATED.value
+        or peer_comparison == PeerComparison.UNAVAILABLE.value
+    ):
+        return "Insufficient Data"
+    return "No Current Concern"
+
+
+def weekly_review_guidance(row: dict[str, Any], classification: str) -> str:
+    action = str(row.get("action") or "")
+    if action == PromptAction.CONTEXT_REVIEW.value:
+        return (
+            "Investigate comparable work context. This is not a coaching or "
+            "recognition conclusion."
+        )
+    if action == PromptAction.COACHING_PROMPT.value:
+        return (
+            "Document the review. Coach only if comparable work context and "
+            "independent manager observations support it."
+        )
+    if action == PromptAction.RECOGNITION_PROMPT.value:
+        return (
+            "Document the review. Recognize only if comparable work context and "
+            "independent manager observations support it."
+        )
+    if classification == "Watch":
+        return (
+            "Descriptive pattern only; no formal review was generated. Observe the "
+            "next complete, qualified week."
+        )
+    if classification == "Insufficient Data":
+        return (
+            "Do not compare or coach from this row. Confirm roster and coverage, "
+            "then wait for sufficient evidence."
+        )
+    return (
+        "No generated review this week; routine management observation continues."
+    )
+
+
+def build_roster_coverage_rows(
+    weekly_server_rows: list[dict[str, Any]],
+    server_rows: list[dict[str, Any]],
+    weekly_location_rows: list[dict[str, Any]],
+    prior_roster_rows: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> tuple[list[date], list[dict[str, Any]]]:
+    _, global_full = full_week_ends_by_location(weekly_location_rows)
+    coverage_weeks = sorted(global_full)[-8:]
+    coverage_week_set = set(coverage_weeks)
+    effective_config = config or {}
+    weekly_index = {
+        (
+            str(row.get("location") or "").casefold(),
+            str(row.get("raw_user_name") or "").casefold(),
+            row.get("week_end"),
+        ): row
+        for row in weekly_server_rows
+    }
+    prior_index = {
+        (
+            str(row.get("Location") or "").casefold(),
+            str(row.get("Source Name") or "").casefold(),
+        ): row
+        for row in (prior_roster_rows or [])
+        if not is_blank(row.get("Location"))
+        and not is_blank(row.get("Source Name"))
+    }
+    candidates = {
+        (
+            str(row.get("location") or "").casefold(),
+            str(row.get("raw_user_name") or "").casefold(),
+        ): {
+            "location": row.get("location"),
+            "raw_user_name": row.get("raw_user_name"),
+            "display_name": row.get("display_name"),
+        }
+        for row in weekly_server_rows
+        if row.get("week_end") in coverage_week_set
+        and not dashboard_excluded(row, effective_config)
+    }
+    for row in server_rows:
+        key = (
+            str(row.get("location") or "").casefold(),
+            str(row.get("raw_user_name") or "").casefold(),
+        )
+        if key in candidates:
+            candidates[key] = {
+                "location": row.get("location"),
+                "raw_user_name": row.get("raw_user_name"),
+                "display_name": row.get("display_name"),
+            }
+    for key, prior in prior_index.items():
+        candidates.setdefault(
+            key,
+            {
+                "location": prior.get("Location"),
+                "raw_user_name": prior.get("Source Name"),
+                "display_name": (
+                    prior.get("Preferred Display Name")
+                    or prior.get("Source Name")
+                ),
+            },
+        )
+    coverage_rows: list[dict[str, Any]] = []
+    for current in sorted(
+        candidates.values(),
+        key=lambda row: (
+            str(row.get("location") or ""),
+            str(row.get("display_name") or ""),
+        ),
+    ):
+        key = (
+            str(current.get("location") or "").casefold(),
+            str(current.get("raw_user_name") or "").casefold(),
+        )
+        prior = prior_index.get(key, {})
+        presence: dict[date, str] = {}
+        missing_weeks = 0
+        for week_end in coverage_weeks:
+            week_row = weekly_index.get(
+                (
+                    key[0],
+                    key[1],
+                    week_end,
+                )
+            )
+            if week_row is None:
+                prior_reason = prior.get(week_end.strftime("%m/%d/%Y"))
+                presence[week_end] = (
+                    str(prior_reason)
+                    if str(prior_reason or "") in COVERAGE_REASON_CHOICES
+                    else "Unknown"
+                )
+                missing_weeks += 1
+            else:
+                presence[week_end] = (
+                    f"{int(week_row.get('active_days', 0) or 0)}d / "
+                    f"{float(week_row.get('guest_count', 0) or 0):,.0f}g"
+                )
+        coverage_rows.append(
+            {
+                "Location": current.get("location"),
+                "Source Name": current.get("raw_user_name"),
+                "Preferred Display Name": (
+                    prior.get("Preferred Display Name")
+                    or current.get("display_name")
+                ),
+                "Roster Status": (
+                    prior.get("Roster Status")
+                    if prior.get("Roster Status") in ROSTER_STATUS_CHOICES
+                    else "Needs Identity Review"
+                ),
+                "Weeks Present": len(coverage_weeks) - missing_weeks,
+                "Missing Weeks": missing_weeks,
+                "Coverage": presence,
+                "Coverage Note": prior.get("Coverage Note") or "",
+            }
+        )
+    return coverage_weeks, coverage_rows
+
+
+def sorted_follow_up_actions(
+    current_actions: list[dict[str, Any]],
+    *,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """Return the manager-facing queue order used by both rows and hyperlinks."""
+
+    comparison_date = today or date.today()
+
+    def follow_up_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        status = str(row.get("Status") or "")
+        due_date = as_date(row.get("Due Date"))
+        overdue = due_date is not None and due_date < comparison_date
+        if status == "Blocked":
+            workflow_bucket = 0
+        elif overdue:
+            workflow_bucket = 1
+        else:
+            workflow_bucket = {
+                "Review Needed": 2,
+                "In Progress": 3,
+                "Open": 4,
+            }.get(status, 5)
+        signal_state = str(row.get("Signal State") or "")
+        signal_bucket = (
+            0
+            if signal_state == "Current"
+            else 1
+            if signal_state.startswith("Paused")
+            else 2
+        )
+        return (
+            workflow_bucket,
+            due_date or date.max,
+            signal_bucket,
+            str(row.get("Location") or ""),
+            str(row.get("Person / Area") or ""),
+            str(row.get("Action ID") or ""),
+        )
+
+    return sorted(
+        (
+            row
+            for row in current_actions
+            if str(row.get("Status") or "").casefold()
+            not in {"complete", "dismissed"}
+        ),
+        key=follow_up_sort_key,
+    )
+
+
+def write_weekly_review_sheet(
+    wb: Workbook,
+    server_rows: list[dict[str, Any]],
+    store_rows: list[dict[str, Any]],
+    current_actions: list[dict[str, Any]],
+    readiness: LatestWeekReadiness,
+    coverage_gap_count: int,
+    complete_week_count: int,
+) -> None:
+    remove_sheet_if_present(wb, "Weekly Review")
+    ws = wb.create_sheet("Weekly Review")
+    headers = [
+        "Review Level",
+        "Location",
+        "Server",
+        "Current Sample",
+        "Prior Sample",
+        "Sales / Guest",
+        "WoW Sales / Guest Δ",
+        "Wine %",
+        "WoW Wine % Δ",
+        "Trend Context",
+        "Peer Comparison",
+        "Evidence / History",
+        "Manager Guidance",
+    ]
+    style_management_title(
+        ws,
+        (
+            "Red Onion Weekly Review"
+            " — Management Redesign Preview"
+            + (
+                f" — Week Ending {readiness.latest_week_end:%m/%d/%Y}"
+                if readiness.latest_week_end
+                else ""
+            )
+        ),
+        len(headers),
+    )
+    ws.merge_cells("A3:M3")
+    status = "Source Ready" if readiness.ready else "Attention"
+    ws["A3"] = (
+        f"{status} · {len(readiness.received_dates)} of "
+        f"{len(readiness.expected_dates)} source days · "
+        f"{complete_week_count} complete weeks available"
+    )
+    ws["A3"].fill = PatternFill(
+        "solid", fgColor="D9EAD3" if readiness.ready else "FCE8E6"
+    )
+    ws["A3"].font = Font(
+        bold=True, color="274E13" if readiness.ready else "990000"
+    )
+    ws["A3"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[3].height = 28
+    ws.merge_cells("A4:M5")
+    ws["A4"] = (
+        "Preview only; the live workbook is unchanged. Every current "
+        "transaction-derived server appears once. Formal Review means "
+        "the evidence gate opened a documented human review; it is not a coaching or "
+        "recognition conclusion. Watch is descriptive only and does not create a "
+        "follow-up. Insufficient Data means the sample or history cannot support review."
+    )
+    ws["A4"].fill = PatternFill("solid", fgColor="FFF2CC")
+    ws["A4"].font = Font(color="7F6000", bold=True)
+    ws["A4"].alignment = Alignment(wrap_text=True, vertical="center")
+
+    classified = [
+        (weekly_review_classification(row), row)
+        for row in server_rows
+    ]
+    counts = {
+        label: sum(classification == label for classification, _ in classified)
+        for label in (
+            "Formal Review",
+            "Watch",
+            "Insufficient Data",
+            "No Current Concern",
+        )
+    }
+    open_follow_ups = sum(
+        str(row.get("Status") or "").casefold()
+        not in {"complete", "dismissed"}
+        for row in current_actions
+    )
+    cards = [
+        ("Formal Reviews", counts["Formal Review"], "D9E1F2"),
+        ("Watch", counts["Watch"], "FFF2CC"),
+        ("Insufficient Data", counts["Insufficient Data"], "E7E6E6"),
+        ("No Current Concern", counts["No Current Concern"], "E2F0D9"),
+        ("Open Follow-ups", open_follow_ups, "FCE8E6"),
+        ("Coverage Gaps", coverage_gap_count, "F4CCCC"),
+    ]
+    card_ranges = ((1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 13))
+    for (label, value, color), (start_col, end_col) in zip(
+        cards, card_ranges, strict=True
+    ):
+        ws.merge_cells(
+            start_row=7, start_column=start_col, end_row=7, end_column=end_col
+        )
+        ws.merge_cells(
+            start_row=8, start_column=start_col, end_row=8, end_column=end_col
+        )
+        label_cell = ws.cell(row=7, column=start_col, value=label)
+        value_cell = ws.cell(row=8, column=start_col, value=value)
+        for cell in (label_cell, value_cell):
+            cell.fill = PatternFill("solid", fgColor=color)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        label_cell.font = Font(bold=True, color="595959")
+        value_cell.font = Font(bold=True, color="7A1E1E", size=16)
+    ws.row_dimensions[7].height = 24
+    ws.row_dimensions[8].height = 30
+
+    style_section_header(ws, 10, 1, len(headers), "STORE SNAPSHOT")
+    store_headers = [
+        "Location",
+        "Status",
+        "Sales",
+        "Guests",
+        "Checks",
+        "Sales / Guest",
+        "Sales / Check",
+        "Guests / Check",
+    ]
+    for col, header in enumerate(store_headers, start=1):
+        cell = ws.cell(row=11, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="E7E6E6")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    store_by_entity = {str(row.get("entity")): row for row in store_rows}
+    store_data_start = 12
+    latest_locations = sorted(
+        readiness.latest_location_rows,
+        key=lambda row: str(row.get("location") or ""),
+    )
+    for row_index, latest in enumerate(latest_locations, start=store_data_start):
+        store_item = store_by_entity.get(str(latest.get("location"))) or {}
+        check_available = bool(latest.get("check_count_available"))
+        values = [
+            latest.get("location"),
+            store_item.get("status") or "Not Evaluated",
+            latest.get("gross_sales"),
+            latest.get("guest_count"),
+            latest.get("check_count") if check_available else None,
+            latest.get("check_average"),
+            latest.get("sales_per_check") if check_available else None,
+            latest.get("guests_per_check") if check_available else None,
+        ]
+        for col, value in enumerate(values, start=1):
+            ws.cell(row=row_index, column=col, value=excel_safe_text(value))
+        for col in (3, 6, 7):
+            ws.cell(row=row_index, column=col).number_format = "$#,##0.00"
+        for col in (4, 5):
+            ws.cell(row=row_index, column=col).number_format = "#,##0"
+        ws.cell(row=row_index, column=8).number_format = "0.00"
+
+    section_row = store_data_start + max(1, len(latest_locations)) + 1
+    style_section_header(ws, section_row, 1, len(headers), "ALL CURRENT SERVERS")
+    header_row = section_row + 1
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="7A1E1E")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+    ws.row_dimensions[header_row].height = 36
+
+    classification_order = {
+        "Formal Review": 0,
+        "Watch": 1,
+        "Insufficient Data": 2,
+        "No Current Concern": 3,
+    }
+    sorted_rows = sorted(
+        classified,
+        key=lambda item: (
+            classification_order[item[0]],
+            0
+            if str(item[1].get("confidence") or "") == "Eligible"
+            else 1,
+            0
+            if str(item[1].get("descriptive_recent_movement") or "")
+            in {RecentMovement.UPWARD.value, RecentMovement.DOWNWARD.value}
+            else 1,
+            str(item[1].get("location") or ""),
+            str(item[1].get("display_name") or ""),
+        ),
+    )
+    follow_up_targets: dict[tuple[str, str], int] = {}
+    for index, action in enumerate(
+        sorted_follow_up_actions(current_actions),
+        start=10,
+    ):
+        follow_up_targets.setdefault(
+            (
+                str(action.get("Location") or ""),
+                str(action.get("Person / Area") or ""),
+            ),
+            index,
+        )
+    category_fills = {
+        "Formal Review": "D9E1F2",
+        "Watch": "FFF2CC",
+        "Insufficient Data": "E7E6E6",
+        "No Current Concern": "E2F0D9",
+    }
+    for row_index, (classification, row) in enumerate(
+        sorted_rows, start=header_row + 1
+    ):
+        wow_changes = row.get("week_over_week_changes", {})
+        trend_context = (
+            f"WoW {row.get('week_over_week_movement', 'Not Evaluated')} | "
+            f"4-week {row.get('descriptive_recent_movement', row.get('momentum'))} | "
+            f"8-week {row.get('long_term_direction')}"
+        )
+        evidence_history = (
+            f"{row.get('confidence')} | {row.get('history_used')}"
+        )
+        values = [
+            classification,
+            row.get("location"),
+            row.get("display_name"),
+            operational_sample_text(row),
+            prior_operational_sample_text(row),
+            row.get("check_average"),
+            wow_changes.get("check_average"),
+            row.get("wine_pct"),
+            wow_changes.get("wine_pct"),
+            trend_context,
+            row.get("performance_level"),
+            evidence_history,
+            weekly_review_guidance(row, classification),
+        ]
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(
+                row=row_index,
+                column=col,
+                value=management_display_text(value),
+            )
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=col in {1, 4, 5, 10, 11, 12, 13},
+            )
+        ws.cell(row=row_index, column=1).fill = PatternFill(
+            "solid", fgColor=category_fills[classification]
+        )
+        ws.cell(row=row_index, column=1).font = Font(bold=True)
+        ws.cell(row=row_index, column=6).number_format = "$0.00"
+        ws.cell(row=row_index, column=7).number_format = (
+            "+$0.00;-$0.00;$0.00"
+        )
+        ws.cell(row=row_index, column=8).number_format = "0.0%"
+        ws.cell(row=row_index, column=9).number_format = (
+            "+0.0%;-0.0%;0.0%"
+        )
+        if classification == "Formal Review":
+            target_row = follow_up_targets.get(
+                (
+                    str(row.get("location") or ""),
+                    str(row.get("display_name") or ""),
+                )
+                )
+            if target_row:
+                guidance = ws.cell(row=row_index, column=13)
+                guidance.hyperlink = f"#'Follow-up Queue'!A{target_row}"
+                guidance.style = "Hyperlink"
+                guidance.alignment = Alignment(
+                    vertical="top",
+                    wrap_text=True,
+                )
+        ws.row_dimensions[row_index].height = 66
+
+    if sorted_rows:
+        table = Table(
+            displayName="WeeklyReviewTable",
+            ref=f"A{header_row}:M{header_row + len(sorted_rows)}",
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+    widths = {
+        "A": 19,
+        "B": 20,
+        "C": 24,
+        "D": 25,
+        "E": 22,
+        "F": 16,
+        "G": 21,
+        "H": 12,
+        "I": 18,
+        "J": 38,
+        "K": 23,
+        "L": 48,
+        "M": 55,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = f"D{header_row + 1}"
+    ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = f"1:{header_row}"
+    ws.print_area = f"A1:M{header_row + max(1, len(sorted_rows))}"
+
+
+def write_follow_up_queue_sheet(
+    wb: Workbook,
+    current_actions: list[dict[str, Any]],
+) -> None:
+    remove_sheet_if_present(wb, "Follow-up Queue")
+    ws = wb.create_sheet("Follow-up Queue")
+    style_management_title(
+        ws,
+        "Follow-up Queue — Management Redesign Preview",
+        len(FOLLOW_UP_HEADERS),
+    )
+    ws.merge_cells("A3:P3")
+    ws["A3"] = (
+        "A cleared analytical signal does not close an unresolved management review. "
+        "Complete only the blue fields; document a disposition before completion or dismissal."
+    )
+    ws["A3"].fill = PatternFill("solid", fgColor="FFF2CC")
+    ws["A3"].font = Font(bold=True, color="7F6000")
+    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[3].height = 42
+
+    today = date.today()
+    actionable = sorted_follow_up_actions(
+        current_actions,
+        today=today,
+    )
+    summary = [
+        (
+            "Needs Review",
+            sum(
+                str(row.get("Status") or "") == "Review Needed"
+                for row in actionable
+            ),
+        ),
+        ("Unassigned", sum(is_blank(row.get("Owner")) for row in actionable)),
+        (
+            "Overdue",
+            sum(
+                (as_date(row.get("Due Date")) or date.max) < today
+                for row in actionable
+            ),
+        ),
+        (
+            "Cleared but Unresolved",
+            sum(
+                str(row.get("Signal State") or "").startswith("Cleared")
+                for row in actionable
+            ),
+        ),
+        (
+            "Blocked",
+            sum(str(row.get("Status") or "") == "Blocked" for row in actionable),
+        ),
+    ]
+    card_ranges = ((1, 3), (4, 6), (7, 9), (10, 12), (13, 16))
+    for (label, value), (start_col, end_col) in zip(
+        summary, card_ranges, strict=True
+    ):
+        ws.merge_cells(
+            start_row=5, start_column=start_col, end_row=5, end_column=end_col
+        )
+        ws.merge_cells(
+            start_row=6, start_column=start_col, end_row=6, end_column=end_col
+        )
+        label_cell = ws.cell(row=5, column=start_col, value=label)
+        value_cell = ws.cell(row=6, column=start_col, value=value)
+        for cell in (label_cell, value_cell):
+            cell.fill = PatternFill("solid", fgColor="E7E6E6")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        label_cell.font = Font(bold=True, color="595959")
+        value_cell.font = Font(bold=True, color="7A1E1E", size=16)
+
+    header_row = 9
+    for col, (visible_header, _) in enumerate(FOLLOW_UP_HEADERS, start=1):
+        cell = ws.cell(row=header_row, column=col, value=visible_header)
+        cell.fill = PatternFill("solid", fgColor="7A1E1E")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+    ws.row_dimensions[header_row].height = 38
+    for row_index, action in enumerate(actionable, start=header_row + 1):
+        for col, (_, field) in enumerate(FOLLOW_UP_HEADERS, start=1):
+            value = (
+                action.get("Methodology Version")
+                or action.get("Threshold Version")
+                or MANAGEMENT_METHODOLOGY_VERSION
+                if field == "Methodology Version"
+                else action.get(field)
+            )
+            cell = ws.cell(
+                row=row_index,
+                column=col,
+                value=(
+                    management_display_text(value)
+                    if col in {4, 5, 6, 7, 8, 9, 10, 15, 16}
+                    else excel_safe_text(value)
+                ),
+            )
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=col in {6, 7, 8, 9, 10, 11, 12},
+            )
+        for col in (3, 14, 15, 23):
+            ws.cell(row=row_index, column=col).number_format = "m/d/yyyy"
+        ws.row_dimensions[row_index].height = 72
+    if actionable:
+        table = Table(
+            displayName="FollowUpQueueTable",
+            ref=(
+                f"A{header_row}:{get_column_letter(len(FOLLOW_UP_HEADERS))}"
+                f"{header_row + len(actionable)}"
+            ),
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+    for col in range(FOLLOW_UP_VISIBLE_COLUMNS + 1, len(FOLLOW_UP_HEADERS) + 1):
+        ws.column_dimensions[get_column_letter(col)].hidden = True
+    widths = {
+        "A": 18,
+        "B": 18,
+        "C": 13,
+        "D": 20,
+        "E": 24,
+        "F": 22,
+        "G": 28,
+        "H": 25,
+        "I": 52,
+        "J": 48,
+        "K": 36,
+        "L": 23,
+        "M": 18,
+        "N": 13,
+        "O": 13,
+        "P": 12,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = f"D{header_row + 1}"
+    ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = f"1:{header_row}"
+    ws.print_area = f"A1:P{header_row + max(1, len(actionable))}"
+    if actionable:
+        first, last = header_row + 1, header_row + len(actionable)
+        blue_fill = PatternFill("solid", fgColor="D9EAF7")
+        amber_fill = PatternFill("solid", fgColor="FFF2CC")
+        red_fill = PatternFill("solid", fgColor="F4CCCC")
+        green_fill = PatternFill("solid", fgColor="D9EAD3")
+        for row in range(first, last + 1):
+            for col in (1, 2, 3, 11, 12, 13, 14):
+                cell = ws.cell(row=row, column=col)
+                cell.fill = blue_fill
+                cell.protection = Protection(locked=False)
+        status_validation = DataValidation(
+            type="list",
+            formula1=f'"{",".join(ACTION_STATUS_CHOICES)}"',
+            allow_blank=False,
+            showErrorMessage=True,
+            errorStyle="stop",
+            errorTitle="Choose a valid status",
+            error="Select a status from the Follow-up Queue list.",
+        )
+        owner_validation = DataValidation(
+            type="list",
+            formula1=f"={OWNER_ROSTER_DEFINED_NAME}",
+            allow_blank=True,
+            showErrorMessage=True,
+            errorStyle="stop",
+            errorTitle="Choose an active owner",
+            error="Select an active owner from the Owner Roster or leave blank.",
+        )
+        disposition_validation = DataValidation(
+            type="list",
+            formula1=f'"{",".join(REVIEW_DISPOSITION_CHOICES)}"',
+            allow_blank=False,
+            showErrorMessage=True,
+            errorStyle="stop",
+            errorTitle="Choose a review disposition",
+            error="Select a review disposition from the list.",
+        )
+        ws.add_data_validation(status_validation)
+        ws.add_data_validation(owner_validation)
+        ws.add_data_validation(disposition_validation)
+        status_validation.add(f"A{first}:A{last}")
+        owner_validation.add(f"B{first}:B{last}")
+        owner_validation.add(f"M{first}:M{last}")
+        disposition_validation.add(f"L{first}:L{last}")
+        ws.conditional_formatting.add(
+            f"A{first}:A{last}",
+            FormulaRule(formula=[f'$A{first}="Blocked"'], fill=red_fill),
+        )
+        ws.conditional_formatting.add(
+            f"A{first}:A{last}",
+            FormulaRule(formula=[f'$A{first}="Complete"'], fill=green_fill),
+        )
+        ws.conditional_formatting.add(
+            f"G{first}:G{last}",
+            FormulaRule(
+                formula=[f'LEFT($G{first},7)="Cleared"'], fill=amber_fill
+            ),
+        )
+        ws.conditional_formatting.add(
+            f"C{first}:C{last}",
+            FormulaRule(
+                formula=[
+                    f'AND($C{first}<TODAY(),$C{first}<>"",'
+                    f'$A{first}<>"Complete",$A{first}<>"Dismissed")'
+                ],
+                fill=red_fill,
+            ),
+        )
+
+
+def write_roster_coverage_sheet(
+    wb: Workbook,
+    coverage_weeks: list[date],
+    coverage_rows: list[dict[str, Any]],
+    readiness: LatestWeekReadiness,
+    owner_roster: list[Any],
+) -> None:
+    remove_sheet_if_present(wb, "Roster & Coverage")
+    ws = wb.create_sheet("Roster & Coverage")
+    normalized_owner_roster = normalize_owner_roster(owner_roster)
+    preview_owner_capacity = min(
+        OWNER_ROSTER_MAX_ROWS,
+        max(
+            PREVIEW_OWNER_ROSTER_MIN_EDIT_ROWS,
+            len(normalized_owner_roster) + PREVIEW_OWNER_ROSTER_SPARE_ROWS,
+        ),
+    )
+    headers = [
+        "Location",
+        "Source Name",
+        "Preferred Display Name",
+        "Roster Status",
+        "Weeks Present",
+        "Missing Weeks",
+        *[week_end.strftime("%m/%d/%Y") for week_end in coverage_weeks],
+        "Coverage Note",
+    ]
+    display_columns = max(15, len(headers))
+    style_management_title(
+        ws,
+        "Roster & Coverage — Management Redesign Preview",
+        display_columns,
+    )
+    ws.merge_cells(
+        start_row=3, start_column=1, end_row=3, end_column=display_columns
+    )
+    ws["A3"] = (
+        "Preview roster status is transaction-derived and must be confirmed by the "
+        "custodian before production. Present weeks show active days and guests. Blue "
+        "missing-week cells accept a reason; annotations add context and never change "
+        "the performance calculations. Add active managers in the blue Owner Roster "
+        "so follow-ups can be assigned and closed."
+    )
+    ws["A3"].fill = PatternFill("solid", fgColor="FFF2CC")
+    ws["A3"].font = Font(bold=True, color="7F6000")
+    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[3].height = 48
+
+    active_servers = sum(
+        row.get("Roster Status") == "Active Server"
+        for row in coverage_rows
+    )
+    active_with_gaps = sum(
+        row.get("Roster Status") == "Active Server"
+        and int(row.get("Missing Weeks", 0) or 0) > 0
+        for row in coverage_rows
+    )
+    identity_review = sum(
+        row.get("Roster Status") == "Needs Identity Review"
+        for row in coverage_rows
+    )
+    active_owners = len(active_owner_names(normalized_owner_roster))
+    cards = [
+        ("Active Servers", active_servers),
+        ("Active with Missing Weeks", active_with_gaps),
+        (
+            "Unknown Gaps",
+            sum(int(row.get("Missing Weeks", 0) or 0) for row in coverage_rows),
+        ),
+        ("Identity Review", identity_review),
+        ("Active Owners", active_owners),
+    ]
+    card_ranges = ((1, 3), (4, 6), (7, 9), (10, 12), (13, display_columns))
+    for (label, value), (start_col, end_col) in zip(
+        cards, card_ranges, strict=True
+    ):
+        ws.merge_cells(
+            start_row=5, start_column=start_col, end_row=5, end_column=end_col
+        )
+        ws.merge_cells(
+            start_row=6, start_column=start_col, end_row=6, end_column=end_col
+        )
+        label_cell = ws.cell(row=5, column=start_col, value=label)
+        value_cell = ws.cell(row=6, column=start_col, value=value)
+        for cell in (label_cell, value_cell):
+            cell.fill = PatternFill("solid", fgColor="E7E6E6")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        label_cell.font = Font(bold=True, color="595959")
+        value_cell.font = Font(bold=True, color="7A1E1E", size=16)
+
+    style_section_header(ws, 8, 1, 7, "LATEST SOURCE COVERAGE")
+    source_headers = [
+        "Week Ending",
+        "Location",
+        "Expected Days",
+        "Source Days",
+        "Status",
+        "Management Use",
+        "Check Count",
+    ]
+    for col, header in enumerate(source_headers, start=1):
+        cell = ws.cell(row=9, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="E7E6E6")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    for row_index, latest in enumerate(
+        sorted(
+            readiness.latest_location_rows,
+            key=lambda row: str(row.get("location") or ""),
+        ),
+        start=10,
+    ):
+        source_days = int(latest.get("source_days", 0) or 0)
+        source_status = (
+            "Complete" if source_days >= OPERATING_WEEK_DAYS else "Partial"
+        )
+        values = [
+            readiness.latest_week_end,
+            latest.get("location"),
+            OPERATING_WEEK_DAYS,
+            source_days,
+            source_status,
+            "Eligible for review" if readiness.ready else "Preliminary only",
+            (
+                "Complete"
+                if latest.get("check_count_available")
+                else "Unavailable"
+            ),
+        ]
+        for col, value in enumerate(values, start=1):
+            ws.cell(row=row_index, column=col, value=excel_safe_text(value))
+        ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
+    ws.merge_cells(
+        start_row=8, start_column=9, end_row=8, end_column=display_columns
+    )
+    ws.cell(row=8, column=9, value="OWNER ROSTER").fill = PatternFill(
+        "solid", fgColor="E7E6E6"
+    )
+    ws.cell(row=8, column=9).font = Font(bold=True, color="7A1E1E")
+    owner_header_row = 9
+    owner_first_row = owner_header_row + 1
+    owner_last_row = owner_header_row + preview_owner_capacity
+    for offset, header in enumerate(OWNER_ROSTER_HEADERS):
+        cell = ws.cell(
+            row=owner_header_row,
+            column=9 + offset,
+            value=header,
+        )
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    for offset in range(preview_owner_capacity):
+        row_index = owner_first_row + offset
+        entry = (
+            normalized_owner_roster[offset]
+            if offset < len(normalized_owner_roster)
+            else None
+        )
+        name_cell = ws.cell(
+            row=row_index,
+            column=9,
+            value=excel_safe_text(entry["Owner Name"]) if entry else None,
+        )
+        active_cell = ws.cell(
+            row=row_index,
+            column=10,
+            value=entry["Active"] if entry else None,
+        )
+        for cell in (name_cell, active_cell):
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.protection = Protection(locked=False)
+        active_cell.alignment = Alignment(horizontal="center")
+        ws.row_dimensions[row_index].height = 20
+    owner_table = Table(
+        displayName=PREVIEW_OWNER_ROSTER_TABLE_NAME,
+        ref=f"I{owner_header_row}:J{owner_last_row}",
+    )
+    owner_table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(owner_table)
+    owner_active_validation = DataValidation(
+        type="list",
+        formula1='"Yes,No"',
+        allow_blank=True,
+        showErrorMessage=True,
+        errorStyle="stop",
+        errorTitle="Choose Yes or No",
+        error="Select Yes or No from the Owner Roster Active list.",
+    )
+    ws.add_data_validation(owner_active_validation)
+    owner_active_validation.add(f"J{owner_first_row}:J{owner_last_row}")
+    ws.merge_cells(
+        start_row=9, start_column=11, end_row=11, end_column=display_columns
+    )
+    owner_note = ws.cell(
+        row=9,
+        column=11,
+        value=(
+            f"{active_owners} active owner"
+            f"{'s' if active_owners != 1 else ''} configured. "
+            "Blue cells are protected management inputs. Add one person per row "
+            "and choose Yes or No; the assignment lists update when Excel recalculates."
+            if active_owners
+            else "No active owners configured. Add a manager in the blue cells and "
+            "choose Yes before assigning or closing follow-ups."
+        ),
+    )
+    owner_note.alignment = Alignment(wrap_text=True, vertical="top")
+    owner_note.fill = PatternFill(
+        "solid", fgColor="D9EAD3" if active_owners else "F4CCCC"
+    )
+
+    section_row = owner_last_row + 3
+    style_section_header(
+        ws, section_row, 1, len(headers), "SERVER ROSTER AND EIGHT-WEEK COVERAGE"
+    )
+    header_row = section_row + 1
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="7A1E1E")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+    ws.row_dimensions[header_row].height = 38
+    for row_index, row in enumerate(coverage_rows, start=header_row + 1):
+        values = [
+            row.get("Location"),
+            row.get("Source Name"),
+            row.get("Preferred Display Name"),
+            row.get("Roster Status"),
+            row.get("Weeks Present"),
+            row.get("Missing Weeks"),
+            *[
+                row.get("Coverage", {}).get(week_end, "Unknown")
+                for week_end in coverage_weeks
+            ],
+            row.get("Coverage Note"),
+        ]
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_index, column=col, value=excel_safe_text(value))
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=col in {2, 3, 4, len(headers)},
+                horizontal=(
+                    "center"
+                    if 5 <= col < len(headers)
+                    else None
+                ),
+            )
+        ws.row_dimensions[row_index].height = 42
+    if coverage_rows:
+        table = Table(
+            displayName="RosterCoverageTable",
+            ref=(
+                f"A{header_row}:{get_column_letter(len(headers))}"
+                f"{header_row + len(coverage_rows)}"
+            ),
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+    widths = {
+        "A": 20,
+        "B": 26,
+        "C": 26,
+        "D": 25,
+        "E": 14,
+        "F": 14,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    for col in range(7, 7 + len(coverage_weeks)):
+        ws.column_dimensions[get_column_letter(col)].width = 16
+    ws.column_dimensions["I"].width = 24
+    ws.column_dimensions["J"].width = 14
+    ws.column_dimensions[get_column_letter(len(headers))].width = 34
+    ws.freeze_panes = f"E{header_row + 1}"
+    ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = f"1:{header_row}"
+    ws.print_area = (
+        f"A1:{get_column_letter(display_columns)}"
+        f"{header_row + max(1, len(coverage_rows))}"
+    )
+    if coverage_rows:
+        first, last = header_row + 1, header_row + len(coverage_rows)
+        blue_fill = PatternFill("solid", fgColor="D9EAF7")
+        missing_cells: list[str] = []
+        for row in range(first, last + 1):
+            for col in (3, 4, len(headers)):
+                cell = ws.cell(row=row, column=col)
+                cell.fill = blue_fill
+                cell.protection = Protection(locked=False)
+            for col in range(7, 7 + len(coverage_weeks)):
+                cell = ws.cell(row=row, column=col)
+                if str(cell.value or "") in COVERAGE_REASON_CHOICES:
+                    cell.fill = blue_fill
+                    cell.protection = Protection(locked=False)
+                    missing_cells.append(cell.coordinate)
+        status_validation = DataValidation(
+            type="list",
+            formula1=f'"{",".join(ROSTER_STATUS_CHOICES)}"',
+            allow_blank=False,
+            showErrorMessage=True,
+            errorStyle="stop",
+            errorTitle="Choose a roster status",
+            error="Select a roster status from the list.",
+        )
+        ws.add_data_validation(status_validation)
+        status_validation.add(f"D{first}:D{last}")
+        if missing_cells:
+            reason_validation = DataValidation(
+                type="list",
+                formula1=f'"{",".join(COVERAGE_REASON_CHOICES)}"',
+                allow_blank=False,
+                showErrorMessage=True,
+                errorStyle="stop",
+                errorTitle="Choose a coverage reason",
+                error="Select a missing-week reason from the list.",
+            )
+            ws.add_data_validation(reason_validation)
+            for coordinate in missing_cells:
+                reason_validation.add(coordinate)
+
+
+def write_data_quality_audit_sheet(
+    wb: Workbook,
+    readiness: LatestWeekReadiness,
+    weekly_location_rows: list[dict[str, Any]],
+    current_actions: list[dict[str, Any]],
+    action_history: list[dict[str, Any]],
+    owner_roster: list[Any],
+) -> None:
+    remove_sheet_if_present(wb, "Data Quality & Audit")
+    ws = wb.create_sheet("Data Quality & Audit")
+    style_management_title(
+        ws,
+        "Data Quality & Audit — Management Redesign Preview",
+        12,
+    )
+    ws.merge_cells("A3:L3")
+    active_owners = active_owner_names(owner_roster)
+    if not readiness.ready:
+        audit_status = (
+            f"ATTENTION — {readiness.missing_text or 'latest-week source gaps'}"
+        )
+        audit_status_fill = "F4CCCC"
+        audit_status_font = "990000"
+    elif not active_owners:
+        audit_status = "SOURCE DATA READY — OWNER ROSTER NOT CONFIGURED"
+        audit_status_fill = "FFF2CC"
+        audit_status_font = "7F6000"
+    else:
+        audit_status = "READY FOR HUMAN REVIEW"
+        audit_status_fill = "D9EAD3"
+        audit_status_font = "274E13"
+    ws["A3"] = audit_status
+    ws["A3"].fill = PatternFill(
+        "solid", fgColor=audit_status_fill
+    )
+    ws["A3"].font = Font(bold=True, color=audit_status_font)
+    ws["A3"].alignment = Alignment(horizontal="center", vertical="center")
+    _, global_full = full_week_ends_by_location(weekly_location_rows)
+    latest_rows = readiness.latest_location_rows
+    check_covered = sum(
+        bool(row.get("check_count_available")) for row in latest_rows
+    )
+    unresolved = sum(
+        str(row.get("Status") or "").casefold()
+        not in {"complete", "dismissed"}
+        for row in current_actions
+    )
+    legacy = sum(
+        str(row.get("Evidence Status") or "").startswith("Legacy v2")
+        for row in current_actions
+    )
+    cards = [
+        ("Source Days", f"{len(readiness.received_dates)}/{len(readiness.expected_dates)}"),
+        ("Complete Weeks", len(global_full)),
+        ("Check Count Coverage", f"{check_covered}/{len(latest_rows)} stores"),
+        ("Open Follow-ups", unresolved),
+        ("Legacy Revalidation", legacy),
+        ("Active Owners", len(active_owners)),
+    ]
+    card_ranges = ((1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12))
+    for (label, value), (start_col, end_col) in zip(
+        cards, card_ranges, strict=True
+    ):
+        ws.merge_cells(
+            start_row=5, start_column=start_col, end_row=5, end_column=end_col
+        )
+        ws.merge_cells(
+            start_row=6, start_column=start_col, end_row=6, end_column=end_col
+        )
+        label_cell = ws.cell(row=5, column=start_col, value=label)
+        value_cell = ws.cell(row=6, column=start_col, value=value)
+        for cell in (label_cell, value_cell):
+            cell.fill = PatternFill("solid", fgColor="E7E6E6")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        label_cell.font = Font(bold=True, color="595959")
+        value_cell.font = Font(bold=True, color="7A1E1E", size=14)
+
+    style_section_header(ws, 8, 1, 7, "LATEST-WEEK SOURCE STATUS")
+    headers = [
+        "Week Ending",
+        "Location",
+        "Expected Days",
+        "Source Days",
+        "Status",
+        "Management Use",
+        "Check Count",
+    ]
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(row=9, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="7A1E1E")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    for row_index, latest in enumerate(
+        sorted(latest_rows, key=lambda row: str(row.get("location") or "")),
+        start=10,
+    ):
+        source_days = int(latest.get("source_days", 0) or 0)
+        values = [
+            readiness.latest_week_end,
+            latest.get("location"),
+            OPERATING_WEEK_DAYS,
+            source_days,
+            "Complete" if source_days >= OPERATING_WEEK_DAYS else "Partial",
+            "Eligible" if readiness.ready else "Preliminary",
+            (
+                "Complete"
+                if latest.get("check_count_available")
+                else "Unavailable"
+            ),
+        ]
+        for col, value in enumerate(values, start=1):
+            ws.cell(row=row_index, column=col, value=excel_safe_text(value))
+        ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
+
+    notes_start = 13
+    style_section_header(ws, notes_start, 1, 12, "AUDIT AND USE BOUNDARIES")
+    notes = [
+        (
+            "Metric definition",
+            "Sales / Guest is gross sales divided by guests. True Sales / Check "
+            "remains unavailable where Check Count is absent.",
+        ),
+        (
+            "Action lifecycle",
+            "Signal State and Management Status are separate. A cleared signal remains "
+            "in Follow-up Queue until the manager records a disposition.",
+        ),
+        (
+            "Coverage interpretation",
+            "A missing server-week is not automatically a performance issue. Confirm "
+            "no shift, no sales, identity mismatch, or source omission.",
+        ),
+        (
+            "Legacy evidence",
+            "Legacy v2 actions remain visible for reconciliation and must be revalidated "
+            "before any coaching or recognition action.",
+        ),
+        (
+            "Protected evidence",
+            "Evidence Detail, Action History, the original Data Quality sheet, Run Notes, "
+            "and calculation sheets remain protected and hidden from ordinary navigation.",
+        ),
+        (
+            "Historical archive",
+            f"{len(action_history)} resolved historical action record(s) remain retained.",
+        ),
+    ]
+    for row_index, (label, note) in enumerate(notes, start=notes_start + 1):
+        ws.cell(row=row_index, column=1, value=label).font = Font(
+            bold=True, color="7A1E1E"
+        )
+        ws.merge_cells(
+            start_row=row_index, start_column=2, end_row=row_index, end_column=12
+        )
+        ws.cell(row=row_index, column=2, value=note).alignment = Alignment(
+            wrap_text=True, vertical="top"
+        )
+        ws.row_dimensions[row_index].height = 36
+    for column, width in {
+        "A": 22,
+        "B": 24,
+        "C": 16,
+        "D": 15,
+        "E": 16,
+        "F": 20,
+        "G": 18,
+    }.items():
+        ws.column_dimensions[column].width = width
+    for column in range(8, 13):
+        ws.column_dimensions[get_column_letter(column)].width = 14
+    ws.freeze_panes = "A9"
+    ws.sheet_view.zoomScale = 90
+    ws.print_area = f"A1:L{notes_start + len(notes)}"
 
 
 def write_team_trends_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
@@ -11935,13 +14001,18 @@ def write_management_run_notes(
         ("Signal Scoring", "Person-level movement and peer comparison use separately calibrated Sales / Guest and Wine % bands only. Check Count, Rate of Sale, and Ticket Time are context only. Rank is display-only and contributes no points. A prompt requires aligned movement and peer context, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
         ("Review Gate", "Generated rows start at Review Needed. A later workflow state requires Review Disposition, Reviewed By, and Review Date; the signal cannot be the sole basis for an adverse employment decision."),
         (
-            "Team Trends",
+            "Weekly Review",
             "Shows every current non-excluded server with exact consecutive-week "
-            "Sales / Guest and Wine % deltas plus descriptive 4-week and 8-week "
-            "direction. These visible movements do not bypass the action gates.",
+            "Sales / Guest and Wine % deltas, current and prior sample size, descriptive "
+            "Watch cases, and the separate formal action gate.",
         ),
         ("Technical Trend Detail", "Server Week-over-Week Detail remains protected descriptive audit context. Generated coaching prompts use qualified Recent Movement, peer comparison, evidence stability, and two-week persistence."),
-        ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward between weekly runs. Cleared signals move to Action History."),
+        (
+            "Action Tracking",
+            "Owner, due date, status, context notes, and review fields carry forward "
+            "between weekly runs. A cleared signal remains in Follow-up Queue until "
+            "the management review is completed or dismissed with a disposition.",
+        ),
         (
             "Evidence Contract",
             "Action and reason codes, exact evidence weeks, source hashes/parser "
@@ -11985,20 +14056,40 @@ def finalize_management_workbook(wb: Workbook) -> None:
     # most 15 characters. Longer values are written by openpyxl but Excel
     # silently drops their hashes on save, so keep the random recovery token
     # comfortably inside that compatibility limit.
+    redesign_layout = all(
+        name in wb.sheetnames for name in VISIBLE_MANAGEMENT_SHEETS
+    )
+    visible_sheet_names = (
+        VISIBLE_MANAGEMENT_SHEETS
+        if redesign_layout
+        else PRE_REDESIGN_VISIBLE_MANAGEMENT_SHEETS
+    )
     protection_password = secrets.token_hex(6)
     for sheet in wb.worksheets:
-        if sheet.title in VISIBLE_MANAGEMENT_SHEETS:
+        if sheet.title in visible_sheet_names:
             sheet.sheet_state = "visible"
-            add_management_navigation(sheet)
+            (
+                add_preview_navigation(sheet)
+                if redesign_layout
+                else add_management_navigation(sheet)
+            )
             configure_management_print_layout(sheet)
         else:
             sheet.sheet_state = "veryHidden"
         protect_worksheet(sheet, protection_password)
-    ordered = [wb[name] for name in VISIBLE_MANAGEMENT_SHEETS if name in wb.sheetnames]
-    ordered.extend(sheet for sheet in wb.worksheets if sheet.title not in VISIBLE_MANAGEMENT_SHEETS)
+    ordered = [wb[name] for name in visible_sheet_names if name in wb.sheetnames]
+    ordered.extend(
+        sheet
+        for sheet in wb.worksheets
+        if sheet.title not in visible_sheet_names
+    )
     wb._sheets = ordered
     wb.active = 0
     tab_colors = {
+        "Weekly Review": "7A1E1E",
+        "Follow-up Queue": "C00000",
+        "Roster & Coverage": "4472C4",
+        "Data Quality & Audit": "5B9BD5",
         "How to Use": "FFD966",
         "Dashboard": "7A1E1E",
         "Action Board": "C00000", "Team Trends": "5B9BD5",
@@ -12065,6 +14156,13 @@ def write_master_workbook(
             current_actions, state["owner_roster"]
         )
         visible_server_rows = server_rows if readiness.ready else []
+        coverage_weeks, coverage_rows = build_roster_coverage_rows(
+            weekly_server_rows,
+            visible_server_rows,
+            weekly_location_rows,
+            state["roster_coverage"],
+            config,
+        )
 
         if "Data Quality" in wb.sheetnames:
             remove_sheet_if_present(wb, "_Data Quality Detail")
@@ -12074,6 +14172,7 @@ def write_master_workbook(
             "Recent Movement Signals", "Run Notes",
             "Server Scorecard", "Team Trends", "Store & Group Scorecards", "Action History", "Management Setup",
             "Evidence Detail",
+            "Weekly Review", "Follow-up Queue", "Roster & Coverage", "Data Quality & Audit",
         ):
             remove_sheet_if_present(wb, name)
         write_management_setup_sheet(
@@ -12082,6 +14181,13 @@ def write_master_workbook(
             state["owner_roster"],
             config,
             state["owner_roster_capacity"],
+        )
+        write_roster_coverage_sheet(
+            wb,
+            coverage_weeks,
+            coverage_rows,
+            readiness,
+            state["owner_roster"],
         )
         write_owner_validation_sheet(
             wb,
@@ -12107,6 +14213,27 @@ def write_master_workbook(
             readiness,
             owner_warnings,
             records=records,
+        )
+        write_follow_up_queue_sheet(wb, current_actions)
+        write_data_quality_audit_sheet(
+            wb,
+            readiness,
+            weekly_location_rows,
+            current_actions,
+            action_history,
+            state["owner_roster"],
+        )
+        write_weekly_review_sheet(
+            wb,
+            visible_server_rows,
+            store_rows,
+            current_actions,
+            readiness,
+            sum(
+                int(row.get("Missing Weeks", 0) or 0) > 0
+                for row in coverage_rows
+            ),
+            len(global_full),
         )
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
@@ -13432,6 +15559,12 @@ def assert_staging_capacity(
 
 
 def run(args: argparse.Namespace) -> list[Path]:
+    if (
+        hasattr(args, "management_redesign_preview")
+        and not bool(getattr(args, "initialize_integrity_baseline", False))
+        and not bool(getattr(args, "migrate_history_only", False))
+    ):
+        validate_management_redesign_preview_request(args)
     config_path = Path(args.config).resolve()
     # Validate before a folder, run lock, environment, or report artifact is created.
     args._validated_config = load_config(config_path)
@@ -14707,6 +16840,23 @@ def print_health_check(payload: dict[str, Any]) -> None:
     )
 
 
+def validate_management_redesign_preview_request(args: argparse.Namespace) -> None:
+    """Keep the preview branch out of the routine live publication path."""
+    if not bool(getattr(args, "management_redesign_preview", False)):
+        raise ValueError(
+            "This branch contains the management redesign preview and does not run "
+            "the routine production workbook workflow. Re-run with "
+            "--management-redesign-preview and a separate --output-dir."
+        )
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    live_output_dir = Path(DEFAULT_OUTPUT_DIR).expanduser().resolve()
+    if output_dir == live_output_dir:
+        raise ValueError(
+            "The management redesign preview cannot use the live finished-reports "
+            "folder. Choose a separate --output-dir; the live workbook was not changed."
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build Red Onion weekly metric workbooks.")
     parser.add_argument(
@@ -14718,6 +16868,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
         help="Folder for generated workbooks.",
+    )
+    parser.add_argument(
+        "--management-redesign-preview",
+        action="store_true",
+        help=(
+            "Explicitly generate the isolated management-layer preview. This preview-only "
+            "branch refuses the live finished-reports output folder."
+        ),
     )
     parser.add_argument(
         "--archive-dir",
@@ -14900,6 +17058,11 @@ def main() -> None:
         except Exception as exc:
             raise SystemExit(f"ERROR: {exc}") from exc
         return
+    if not args.initialize_integrity_baseline and not args.migrate_history_only:
+        try:
+            validate_management_redesign_preview_request(args)
+        except Exception as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
     try:
         generated = run(args)
     except Exception as exc:

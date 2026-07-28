@@ -12,9 +12,33 @@ from openpyxl.comments import Comment
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Font, PatternFill, Protection
 from openpyxl.utils import range_boundaries
+from openpyxl.worksheet.datavalidation import DataValidation
 import pytest
 
 import red_onion_weekly_metrics as metrics
+
+
+def test_management_redesign_preview_cli_requires_explicit_isolated_output(
+    tmp_path: Path,
+) -> None:
+    routine_args = metrics.build_parser().parse_args([])
+    with pytest.raises(ValueError, match="preview"):
+        metrics.validate_management_redesign_preview_request(routine_args)
+
+    live_args = metrics.build_parser().parse_args(
+        ["--management-redesign-preview"]
+    )
+    with pytest.raises(ValueError, match="live finished-reports"):
+        metrics.validate_management_redesign_preview_request(live_args)
+
+    isolated_args = metrics.build_parser().parse_args(
+        [
+            "--management-redesign-preview",
+            "--output-dir",
+            str(tmp_path / "preview-output"),
+        ]
+    )
+    metrics.validate_management_redesign_preview_request(isolated_args)
 
 
 def action_row() -> dict[str, object]:
@@ -358,6 +382,34 @@ def test_active_owner_defined_name_and_action_validation_are_live() -> None:
     assert status_validation.allowBlank is False
     assert owner_validation.allowBlank is True
     assert disposition_validation.allowBlank is False
+    workbook.close()
+
+
+def test_noncontiguous_validation_contract_is_order_independent() -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    formula = '"No shift,No sales,Name mismatch,Source missing,Unknown"'
+    validation = DataValidation(
+        type="list",
+        formula1=formula,
+        allow_blank=False,
+        showErrorMessage=True,
+        errorStyle="stop",
+        errorTitle="Choose a reason",
+        error="Select a reason from the list.",
+    )
+    worksheet.add_data_validation(validation)
+    coordinates = ["G19", "H19", "G22", "L24", "M35", "G40"]
+    for coordinate in coordinates:
+        validation.add(coordinate)
+
+    metrics.require_stop_style_list_validation(
+        worksheet,
+        formula1=formula,
+        label="Coverage reason",
+        allow_blank=False,
+        sqref=" ".join(reversed(coordinates)),
+    )
     workbook.close()
 
 

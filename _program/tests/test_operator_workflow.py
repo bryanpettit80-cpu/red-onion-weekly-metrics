@@ -5,9 +5,263 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils import range_boundaries
 import pytest
 
 import red_onion_weekly_metrics as metrics
+
+
+@pytest.mark.parametrize(
+    ("legacy_text", "expected"),
+    [
+        ("Check Average fell $5.00.", "Sales / Guest fell $5.00."),
+        ("Review check avg context.", "Review Sales / Guest context."),
+        ("=Check Average", "'=Sales / Guest"),
+    ],
+)
+def test_management_display_text_uses_sales_per_guest_language(
+    legacy_text: str,
+    expected: str,
+) -> None:
+    assert metrics.management_display_text(legacy_text) == expected
+
+
+def test_operational_sample_text_uses_singular_day_labels() -> None:
+    row = {
+        "guest_count": 7,
+        "active_days": 1,
+        "check_count_available": False,
+        "previous_week_end": date(2026, 7, 19),
+        "previous_guest_count": 7,
+        "previous_active_days": 1,
+    }
+    assert metrics.operational_sample_text(row).endswith("1 day")
+    assert metrics.prior_operational_sample_text(row) == "7 guests / 1 day"
+
+
+def test_follow_up_queue_prioritizes_blocked_overdue_and_review_needed() -> None:
+    today = date.today()
+
+    def action(
+        action_id: str,
+        status: str,
+        *,
+        due_date: date | None = None,
+        signal_state: str = "Cleared / Follow-up Required",
+    ) -> dict[str, object]:
+        return {
+            "Action ID": action_id,
+            "Status": status,
+            "Due Date": due_date,
+            "Location": "RC Richmond",
+            "Person / Area": action_id,
+            "Action": "Context Review",
+            "Signal State": signal_state,
+            "Evidence Status": "Eligible",
+            "Review Disposition": "Pending Review",
+        }
+
+    workbook = Workbook()
+    metrics.write_follow_up_queue_sheet(
+        workbook,
+        [
+            action("OPEN", "Open"),
+            action("REVIEW", "Review Needed", signal_state="Current"),
+            action("PROGRESS", "In Progress", due_date=today + timedelta(days=2)),
+            action("OVERDUE", "Open", due_date=today - timedelta(days=1)),
+            action("BLOCKED", "Blocked"),
+        ],
+    )
+
+    worksheet = workbook["Follow-up Queue"]
+    assert [worksheet.cell(row=row, column=17).value for row in range(10, 15)] == [
+        "BLOCKED",
+        "OVERDUE",
+        "REVIEW",
+        "PROGRESS",
+        "OPEN",
+    ]
+    workbook.close()
+
+
+def test_roster_coverage_preserves_governed_identity_and_gap_context() -> None:
+    first_week = date(2026, 6, 7)
+    second_week = date(2026, 6, 14)
+    coverage_weeks, rows = metrics.build_roster_coverage_rows(
+        [
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Alex Source",
+                "week_end": second_week,
+                "active_days": 3,
+                "guest_count": 42,
+            }
+        ],
+        [
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Alex Source",
+                "display_name": "Alex Source",
+            }
+        ],
+        [
+            {
+                "location": "RC Richmond",
+                "week_end": first_week,
+                "source_days": metrics.OPERATING_WEEK_DAYS,
+            },
+            {
+                "location": "RC Richmond",
+                "week_end": second_week,
+                "source_days": metrics.OPERATING_WEEK_DAYS,
+            },
+        ],
+        [
+            {
+                "Location": "RC Richmond",
+                "Source Name": "Alex Source",
+                "Preferred Display Name": "Alex Preferred",
+                "Roster Status": "Active Server",
+                "06/07/2026": "No shift",
+                "Coverage Note": "Confirmed by manager",
+            }
+        ],
+    )
+
+    assert coverage_weeks == [first_week, second_week]
+    assert rows == [
+        {
+            "Location": "RC Richmond",
+            "Source Name": "Alex Source",
+            "Preferred Display Name": "Alex Preferred",
+            "Roster Status": "Active Server",
+            "Weeks Present": 1,
+            "Missing Weeks": 1,
+            "Coverage": {
+                first_week: "No shift",
+                second_week: "3d / 42g",
+            },
+            "Coverage Note": "Confirmed by manager",
+        }
+    ]
+
+
+def test_roster_coverage_includes_first_generation_historic_only_servers() -> None:
+    first_week = date(2026, 6, 7)
+    second_week = date(2026, 6, 14)
+    coverage_weeks, rows = metrics.build_roster_coverage_rows(
+        [
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Historic Server",
+                "display_name": "Historic Server",
+                "week_end": first_week,
+                "active_days": 2,
+                "guest_count": 18,
+            },
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Current Server",
+                "display_name": "Current Server",
+                "week_end": second_week,
+                "active_days": 3,
+                "guest_count": 42,
+            },
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Training",
+                "display_name": "Training",
+                "week_end": first_week,
+                "active_days": 1,
+                "guest_count": 1,
+            },
+        ],
+        [
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Current Server",
+                "display_name": "Current Server",
+            }
+        ],
+        [
+            {
+                "location": "RC Richmond",
+                "week_end": first_week,
+                "source_days": metrics.OPERATING_WEEK_DAYS,
+            },
+            {
+                "location": "RC Richmond",
+                "week_end": second_week,
+                "source_days": metrics.OPERATING_WEEK_DAYS,
+            },
+        ],
+        config={"dashboard_exclude_exact_names": ["Training"]},
+    )
+
+    assert coverage_weeks == [first_week, second_week]
+    assert [row["Source Name"] for row in rows] == [
+        "Current Server",
+        "Historic Server",
+    ]
+    historic = next(row for row in rows if row["Source Name"] == "Historic Server")
+    assert historic["Roster Status"] == "Needs Identity Review"
+    assert historic["Weeks Present"] == 1
+    assert historic["Missing Weeks"] == 1
+    assert historic["Coverage"] == {
+        first_week: "2d / 18g",
+        second_week: "Unknown",
+    }
+
+
+def test_roster_coverage_uses_full_history_when_latest_week_is_incomplete() -> None:
+    first_week = date(2026, 6, 7)
+    second_week = date(2026, 6, 14)
+    incomplete_week = date(2026, 6, 21)
+    coverage_weeks, rows = metrics.build_roster_coverage_rows(
+        [
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Historic Server",
+                "display_name": "Historic Server",
+                "week_end": first_week,
+                "active_days": 2,
+                "guest_count": 18,
+            },
+            {
+                "location": "RC Richmond",
+                "raw_user_name": "Latest Partial Server",
+                "display_name": "Latest Partial Server",
+                "week_end": incomplete_week,
+                "active_days": 1,
+                "guest_count": 7,
+            },
+        ],
+        [],
+        [
+            {
+                "location": "RC Richmond",
+                "week_end": first_week,
+                "source_days": metrics.OPERATING_WEEK_DAYS,
+            },
+            {
+                "location": "RC Richmond",
+                "week_end": second_week,
+                "source_days": metrics.OPERATING_WEEK_DAYS,
+            },
+            {
+                "location": "RC Richmond",
+                "week_end": incomplete_week,
+                "source_days": metrics.OPERATING_WEEK_DAYS - 1,
+            },
+        ],
+    )
+
+    assert coverage_weeks == [first_week, second_week]
+    assert [row["Source Name"] for row in rows] == ["Historic Server"]
+    assert rows[0]["Coverage"] == {
+        first_week: "2d / 18g",
+        second_week: "Unknown",
+    }
 
 
 @pytest.mark.parametrize(
@@ -697,7 +951,7 @@ def test_management_baseline_excludes_short_weeks_and_target_takes_precedence(
     assert result["benchmark_sources"]["gross_sales"] == "2-week baseline"
 
 
-def test_action_tracking_carries_manual_fields_and_moves_cleared_items_to_history() -> None:
+def test_action_tracking_carries_manual_fields_until_review_is_resolved() -> None:
     signal = {
         "Entity Key": "server|richmond|server one|coaching",
         "Priority": "High",
@@ -739,8 +993,97 @@ def test_action_tracking_carries_manual_fields_and_moves_cleared_items_to_histor
     cleared, history = metrics.merge_management_actions(
         [], {"active_actions": carried, "action_history": []}
     )
-    assert cleared == []
+    assert history == []
+    assert len(cleared) == 1
+    assert cleared[0]["Action ID"] == current[0]["Action ID"]
+    assert cleared[0]["Status"] == "In Progress"
+    assert cleared[0]["Signal State"] == "Cleared / Follow-up Required"
+
+    cleared[0]["Status"] = "Complete"
+    archived, history = metrics.merge_management_actions(
+        [], {"active_actions": cleared, "action_history": []}
+    )
+    assert archived == []
+    assert history[0]["Action ID"] == current[0]["Action ID"]
     assert history[0]["Signal State"] == "Cleared"
+
+
+@pytest.mark.parametrize("status", ["Review Needed", "Open"])
+def test_unreviewed_history_whose_signal_cleared_returns_to_follow_up(
+    status: str,
+) -> None:
+    prior = {
+        "Action ID": "LEGACY-ONE",
+        "Entity Key": "server|richmond|server one|coaching",
+        "Priority": "High",
+        "Status": status,
+        "Owner": "",
+        "Due Date": None,
+        "Location": "RC Richmond",
+        "Person / Area": "Server One",
+        "Action": "Coach Now",
+        "Signal": "Falling / Below Benchmark",
+        "Why It Matters": "Legacy review evidence.",
+        "Recommended Next Step": "Review comparable work context.",
+        "Last Seen": date(2026, 6, 21),
+        "Context Notes": "",
+        "Peer Comparison": "Below Benchmark",
+        "Recent Movement": "Falling",
+        "First Seen": date(2026, 6, 21),
+        "Weeks Open": 1,
+        "Evidence Status": "Legacy",
+        "Signal State": "Cleared",
+        "Review Disposition": "Pending Review",
+        "Reviewed By": "",
+        "Review Date": None,
+        "Methodology Version": metrics.PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION,
+    }
+
+    current, history = metrics.merge_management_actions(
+        [],
+        {"active_actions": [], "action_history": [prior]},
+    )
+
+    assert history == []
+    assert len(current) == 1
+    assert current[0]["Action ID"] == "LEGACY-ONE"
+    assert current[0]["Status"] == status
+    assert current[0]["Review Disposition"] == "Pending Review"
+    assert current[0]["Signal State"] == "Cleared / Follow-up Required"
+    assert current[0]["Evidence Status"] == "Legacy v2 — revalidate before action"
+
+
+@pytest.mark.parametrize(
+    ("case", "evidence_status"),
+    [
+        ("active-days-limited", "Limited Volume"),
+        ("current-guests-limited", "Limited Volume"),
+        ("prior-guests-limited", "Limited History"),
+    ],
+)
+def test_descriptive_watch_remains_visible_without_becoming_coaching(
+    case: str,
+    evidence_status: str,
+) -> None:
+    row = {
+        "action": "Monitor",
+        "week_over_week_movement": "Watch",
+        "descriptive_recent_movement": "Not Evaluated",
+        "long_term_direction": "Not Evaluated",
+        "performance_level": "Within Peer Range",
+        "confidence": evidence_status,
+        "previous_week_end": date(2026, 6, 21),
+        "positive_drivers": [],
+        "negative_drivers": ["Sales / Guest -$12.50"],
+        "case": case,
+    }
+
+    assert metrics.weekly_review_classification(row) == "Watch"
+    assert row["action"] == "Monitor"
+    assert "Coaching" not in metrics.weekly_review_guidance(row, "Watch")
+    assert metrics.metric_driver("check_average", -12.5) == (
+        "Sales / Guest -$12.50"
+    )
 
 
 def test_new_evidence_resets_a_recurring_action_to_review_needed() -> None:
@@ -938,82 +1281,28 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["_Dashboard Chart Data"].sheet_state == "veryHidden"
     assert wb["Weekly Server Metrics"].sheet_state == "veryHidden"
     assert wb["Store Week Trends"].sheet_state == "veryHidden"
-    assert wb.active.title == "How to Use"
-    assert wb["How to Use"].sheet_state == "visible"
-    assert wb["Dashboard"].sheet_state == "visible"
-    assert wb["Action Board"].sheet_state == "visible"
-
-    guide = wb["How to Use"]
-    guide_values = {
-        value
-        for row in guide.iter_rows(values_only=True)
-        for value in row
-        if isinstance(value, str)
-    }
-    assert set(metrics.HOW_TO_USE_SECTION_HEADINGS).issubset(guide_values)
+    assert wb.active.title == "Weekly Review"
     assert all(
-        cell.protection.locked is not False for cell in guide._cells.values()
-    )
-    assert not guide._charts
-    assert not guide._images
-    assert guide.freeze_panes == "A3"
-    assert guide.sheet_view.zoomScale == 85
-    assert guide.sheet_properties.tabColor.rgb[-6:] == "FFD966"
-    assert all(
-        guide.column_dimensions[metrics.get_column_letter(column)].width == 13
-        for column in range(1, 13)
-    )
-    assert guide.row_dimensions[1].height == 32
-    assert guide.row_dimensions[2].height == 24
-    assert guide.row_dimensions[3].height == 24
-    assert guide.row_dimensions[4].height == 54
-    assert guide.row_dimensions[30].height == 42
-    assert guide.row_dimensions[58].height == 24
-    assert guide.row_dimensions[59].height == 72
-    assert guide["A44"].value == metrics.HOW_TO_USE_SECTION_HEADINGS[6]
-    assert metrics.MANAGEMENT_METHODOLOGY_VERSION in "\n".join(guide_values)
-    for phrase in (
-        "never be the sole or determinative basis",
-        "Do not infer protected characteristics from names.",
-        "ExternalCheckRequired",
-        "Rate of Sale is opportunities divided by qualifying sales",
-        "Ticket Time is weighted only by complete Check Count coverage",
-    ):
-        assert phrase in "\n".join(guide_values)
-    for field in (
-        "D — Status",
-        "E — Owner",
-        "F — Due Date",
-        "N — Context Notes",
-        "U — Review Disposition",
-        "V — Reviewed By",
-        "W — Review Date",
-    ):
-        assert field in guide_values
-    for choice in (*metrics.ACTION_STATUS_CHOICES, *metrics.REVIEW_DISPOSITION_CHOICES):
-        assert choice in "\n".join(guide_values)
-    assert guide["A45"].value == "Sheet - click to open"
-    workbook_map_rows = range(
-        46, 46 + len(metrics.VISIBLE_MANAGEMENT_SHEETS)
-    )
-    assert [
-        guide.cell(row=row, column=1).value for row in workbook_map_rows
-    ] == list(metrics.VISIBLE_MANAGEMENT_SHEETS)
-    assert [
-        guide.cell(row=row, column=1).hyperlink.target
-        for row in workbook_map_rows
-    ] == [
-        f"#'{sheet_name}'!A1"
+        wb[sheet_name].sheet_state == "visible"
         for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS
-    ]
-    assert all(
-        guide.cell(row=row, column=1).font.underline == "single"
-        and guide.cell(row=row, column=1).protection.locked is True
-        for row in workbook_map_rows
     )
+    for sheet_name in (
+        "How to Use",
+        "Dashboard",
+        "Action Board",
+        "Team Trends",
+        "Store & Group Scorecards",
+        "Evidence Detail",
+        "Action History",
+        "Data Quality",
+        "Management Setup",
+        "Run Notes",
+    ):
+        assert wb[sheet_name].sheet_state == "veryHidden"
 
     for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
         worksheet = wb[sheet_name]
+        assert "Management Redesign Preview" in str(worksheet["A1"].value)
         start_column, end_column = metrics.management_menu_bounds(worksheet)
         expected_merge = (
             f"{metrics.get_column_letter(start_column)}2:"
@@ -1026,8 +1315,8 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             for merged in worksheet.merged_cells.ranges
             if merged.min_row <= 2 <= merged.max_row
         } == {expected_merge}
-        assert menu_cell.value == metrics.MANAGEMENT_MENU_LABEL
-        assert menu_cell.hyperlink.target == metrics.MANAGEMENT_MENU_TARGET
+        assert menu_cell.value == metrics.PREVIEW_MENU_LABEL
+        assert menu_cell.hyperlink.target == metrics.PREVIEW_MENU_TARGET
         assert menu_cell.font.underline == "single"
         assert menu_cell.font.bold is True
         assert menu_cell.font.size == 9
@@ -1061,11 +1350,6 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             worksheet.page_setup.fitToWidth
             == metrics.MANAGEMENT_PRINT_WIDTHS[sheet_name]
         )
-        if sheet_name == "Data Quality":
-            assert (
-                str(worksheet.page_setup.paperSize)
-                == str(worksheet.PAPERSIZE_TABLOID)
-            )
         assert worksheet.page_setup.orientation == "landscape"
         assert worksheet.print_area
         assert worksheet.print_title_rows
@@ -1078,12 +1362,92 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         frozen_at = worksheet.freeze_panes
         assert frozen_at is not None
         assert int("".join(character for character in str(frozen_at) if character.isdigit())) >= 3
-    assert metrics.management_menu_bounds(wb["Action Board"]) == (3, 21)
-    assert metrics.management_menu_bounds(wb["Action History"]) == (3, 14)
-    assert metrics.management_menu_bounds(wb["Evidence Detail"]) == (1, 14)
     assert "Action Focus" not in wb.sheetnames
     assert "Server Scorecard" not in wb.sheetnames
     assert "Recent Movement Signals" not in wb.sheetnames
+
+    weekly_review = wb["Weekly Review"]
+    assert "live workbook is unchanged" in weekly_review["A4"].value
+    assert "WeeklyReviewTable" in weekly_review.tables
+    weekly_review_values = {
+        value
+        for row in weekly_review.iter_rows(values_only=True)
+        for value in row
+        if isinstance(value, str)
+    }
+    assert {
+        "Review Level",
+        "Current Sample",
+        "Prior Sample",
+        "Sales / Guest",
+        "WoW Sales / Guest Δ",
+        "Manager Guidance",
+    }.issubset(weekly_review_values)
+    assert "Check Average" not in weekly_review_values
+    assert any("60 guests / 6 days" in value for value in weekly_review_values)
+
+    follow_up = wb["Follow-up Queue"]
+    assert "FollowUpQueueTable" in follow_up.tables
+    assert len(follow_up.data_validations.dataValidation) == 3
+    for formal_review_row in (
+        row
+        for row in range(1, weekly_review.max_row + 1)
+        if weekly_review.cell(row=row, column=1).value == "Formal Review"
+    ):
+        follow_up_target = weekly_review.cell(
+            row=formal_review_row,
+            column=13,
+        ).hyperlink.target
+        follow_up_row = int(follow_up_target.rsplit("A", 1)[1])
+        assert follow_up.cell(row=follow_up_row, column=4).value == (
+            weekly_review.cell(row=formal_review_row, column=2).value
+        )
+        assert follow_up.cell(row=follow_up_row, column=5).value == (
+            weekly_review.cell(row=formal_review_row, column=3).value
+        )
+    assert all(
+        follow_up.column_dimensions[metrics.get_column_letter(column)].hidden is True
+        for column in range(metrics.FOLLOW_UP_VISIBLE_COLUMNS + 1, len(metrics.FOLLOW_UP_HEADERS) + 1)
+    )
+    assert follow_up["A10"].protection.locked is False
+    assert follow_up["B10"].protection.locked is False
+    assert follow_up["K10"].protection.locked is False
+
+    roster = wb["Roster & Coverage"]
+    assert "RosterCoverageTable" in roster.tables
+    assert metrics.PREVIEW_OWNER_ROSTER_TABLE_NAME in roster.tables
+    roster_values = {
+        value
+        for row in roster.iter_rows(values_only=True)
+        for value in row
+        if isinstance(value, str)
+    }
+    assert "Preferred Display Name" in roster_values
+    assert "Roster Status" in roster_values
+    assert "Coverage Note" in roster_values
+    assert "Alex Rising" in roster_values
+    assert roster["A6"].value == 0
+    assert roster["J6"].value == 2
+    _, roster_header_row, _, roster_last_row = range_boundaries(
+        roster.tables["RosterCoverageTable"].ref
+    )
+    assert {
+        roster.cell(row=row, column=4).value
+        for row in range(roster_header_row + 1, roster_last_row + 1)
+        if roster.cell(row=row, column=2).value
+    } == {"Needs Identity Review"}
+
+    quality_audit = wb["Data Quality & Audit"]
+    quality_audit_values = {
+        value
+        for row in quality_audit.iter_rows(values_only=True)
+        for value in row
+        if isinstance(value, str)
+    }
+    assert "LATEST-WEEK SOURCE STATUS" in quality_audit_values
+    assert "AUDIT AND USE BOUNDARIES" in quality_audit_values
+    assert "SOURCE DATA READY — OWNER ROSTER NOT CONFIGURED" in quality_audit_values
+    assert any("Sales / Guest is gross sales divided by guests" in value for value in quality_audit_values)
 
     dashboard_values = {
         value
@@ -1180,6 +1544,8 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert "Check Count Coverage" in run_note_rows
     assert wb["Management Setup"].row_dimensions[5].height == 30
     assert wb["Management Setup"]["C5"].alignment.wrap_text is True
+    assert wb["Management Setup"]["D5"].value == "Sales / Guest Target"
+    assert wb["Management Setup"]["A13"].value == "Sales / Guest"
     assert all(
         wb["Store & Group Scorecards"].row_dimensions[row].height == 30
         for row in range(18, 30)
@@ -1202,7 +1568,6 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert trends.row_dimensions[3].height == 30
     assert trends.row_dimensions[4].height == 54
     assert trends.freeze_panes == "E4"
-    assert trends.page_setup.fitToWidth == 2
     assert trends.max_row == 5
     assert "TeamTrends" in trends.tables
     assert [trends.cell(row=row, column=1).value for row in (4, 5)] == [
@@ -1258,6 +1623,152 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert "Reference Unavailable" in {
         cell.value for row in trends.iter_rows() for cell in row
     }
+
+
+def test_management_redesign_preserves_hidden_analytics_engine(tmp_path: Path) -> None:
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    records: list[metrics.MetricRecord] = []
+    for week_end, gross, guests, wine in (
+        (date(2026, 6, 7), 1000, 50, 100),
+        (date(2026, 6, 14), 1200, 60, 144),
+        (date(2026, 6, 21), 900, 45, 72),
+    ):
+        for location in ("RC Richmond", "RC Virginia Beach"):
+            records.extend(
+                full_week_records(
+                    week_end,
+                    location=location,
+                    weekly_gross=gross,
+                    weekly_guests=guests,
+                    weekly_wine=wine,
+                    server="Alex Analytics",
+                )
+            )
+
+    engine_path = tmp_path / "analytics-engine.xlsx"
+    redesigned_path = tmp_path / "redesigned-master.xlsx"
+    metrics._write_master_workbook_base(
+        records,
+        engine_path,
+        config,
+        tmp_path / "Daily Reports",
+        date(2026, 6, 16),
+        date(2026, 6, 21),
+    )
+    metrics.write_master_workbook(
+        records,
+        redesigned_path,
+        config,
+        tmp_path / "Daily Reports",
+        date(2026, 6, 16),
+        date(2026, 6, 21),
+    )
+
+    def sheet_signature(worksheet) -> dict:
+        cells = tuple(
+            (
+                cell.coordinate,
+                cell.value,
+                cell.data_type,
+                tuple(cell._style),
+            )
+            for cell in sorted(
+                worksheet._cells.values(),
+                key=lambda item: (item.row, item.column),
+            )
+        )
+        tables = []
+        for table_name in sorted(worksheet.tables):
+            table = worksheet.tables[table_name]
+            style = table.tableStyleInfo
+            tables.append(
+                (
+                    table_name,
+                    table.displayName,
+                    table.ref,
+                    table.headerRowCount,
+                    table.totalsRowCount,
+                    tuple(
+                        (
+                            column.id,
+                            column.name,
+                            column.totalsRowLabel,
+                            column.totalsRowFunction,
+                        )
+                        for column in table.tableColumns
+                    ),
+                    (
+                        style.name,
+                        style.showFirstColumn,
+                        style.showLastColumn,
+                        style.showRowStripes,
+                        style.showColumnStripes,
+                    )
+                    if style
+                    else None,
+                )
+            )
+        return {
+            "dimensions": (worksheet.max_row, worksheet.max_column),
+            "cells": cells,
+            "tables": tuple(tables),
+            "merged_cells": tuple(
+                sorted(str(merged) for merged in worksheet.merged_cells.ranges)
+            ),
+            "freeze_panes": str(worksheet.freeze_panes or ""),
+            "auto_filter": worksheet.auto_filter.ref,
+            "columns": tuple(
+                (
+                    name,
+                    dimension.width,
+                    dimension.hidden,
+                    dimension.outlineLevel,
+                )
+                for name, dimension in sorted(
+                    worksheet.column_dimensions.items()
+                )
+            ),
+            "rows": tuple(
+                (
+                    index,
+                    dimension.height,
+                    dimension.hidden,
+                    dimension.outlineLevel,
+                )
+                for index, dimension in sorted(
+                    worksheet.row_dimensions.items()
+                )
+            ),
+        }
+
+    analytics_sheets = {
+        "Weekly Server Metrics": "Weekly Server Metrics",
+        "Weekly Server Rankings": "Weekly Server Rankings",
+        "Server Week-over-Week Detail": "Server Week-over-Week Detail",
+        "Weekly Location Metrics": "Weekly Location Metrics",
+        "Store Week Trends": "Store Week Trends",
+        "Store Trend Summary": "Store Trend Summary",
+        "Group Week Trends": "Group Week Trends",
+        "Group Trend Summary": "Group Trend Summary",
+        "Daily Server Detail": "Daily Server Detail",
+        "Daily Location Detail": "Daily Location Detail",
+        "Server Trend Summary": "Server Trend Summary",
+        "Data Quality": "_Data Quality Detail",
+    }
+    engine = load_workbook(engine_path, data_only=False)
+    redesigned = load_workbook(redesigned_path, data_only=False)
+    try:
+        assert set(analytics_sheets).issubset(engine.sheetnames)
+        assert set(analytics_sheets.values()).issubset(redesigned.sheetnames)
+        for engine_name, redesigned_name in analytics_sheets.items():
+            assert (
+                sheet_signature(redesigned[redesigned_name])
+                == sheet_signature(engine[engine_name])
+            ), f"Analytics engine sheet changed: {engine_name}"
+            assert redesigned[redesigned_name].sheet_state == "veryHidden"
+    finally:
+        engine.close()
+        redesigned.close()
 
 
 def test_incomplete_latest_week_hides_team_trends_and_server_actions(tmp_path: Path) -> None:
@@ -1340,18 +1851,64 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
     wb = load_workbook(output_path)
     setup = wb["Management Setup"]
     setup["D7"] = 28.0
-    setup["A21"] = "Pat Manager"
-    setup["B21"] = "Yes"
-    actions = wb["Action Board"]
+    roster_sheet = wb["Roster & Coverage"]
+    owner_table = roster_sheet.tables[metrics.PREVIEW_OWNER_ROSTER_TABLE_NAME]
+    owner_min_col, owner_header_row, owner_max_col, _ = range_boundaries(
+        owner_table.ref
+    )
+    roster_sheet.cell(
+        row=owner_header_row + 1,
+        column=owner_min_col,
+        value="Pat Manager",
+    )
+    roster_sheet.cell(
+        row=owner_header_row + 1,
+        column=owner_max_col,
+        value="Yes",
+    )
+    actions = wb["Follow-up Queue"]
     assert actions.max_row >= 5
-    actions["D5"] = "In Progress"
-    actions["E5"] = "Pat Manager"
-    actions["F5"] = date(2026, 6, 30)
-    actions["N5"] = "Follow up Friday"
-    actions["U5"] = "Coaching Accepted"
-    actions["V5"] = "Pat Manager"
-    actions["W5"] = date(2026, 6, 23)
-    action_id = actions["A5"].value
+    actions["A10"] = "In Progress"
+    actions["B10"] = "Pat Manager"
+    actions["C10"] = date(2026, 6, 30)
+    actions["K10"] = "Check Average context review Friday"
+    actions["L10"] = "Coaching Accepted"
+    actions["M10"] = "Pat Manager"
+    actions["N10"] = date(2026, 6, 23)
+    action_id = actions["Q10"].value
+    roster_table = roster_sheet.tables["RosterCoverageTable"]
+    roster_min_col, roster_header_row, _, roster_max_row = range_boundaries(
+        roster_table.ref
+    )
+    roster_row = next(
+        row
+        for row in range(roster_header_row + 1, roster_max_row + 1)
+        if roster_sheet.cell(row=row, column=roster_min_col).value
+        == "RC Richmond"
+        and roster_sheet.cell(row=row, column=roster_min_col + 1).value
+        == "Alex Rising"
+    )
+    coverage_note_column = next(
+        column
+        for column in range(1, roster_sheet.max_column + 1)
+        if roster_sheet.cell(row=roster_header_row, column=column).value
+        == "Coverage Note"
+    )
+    roster_sheet.cell(
+        row=roster_row,
+        column=3,
+        value="Alex Preferred",
+    )
+    roster_sheet.cell(
+        row=roster_row,
+        column=4,
+        value="Active Server",
+    )
+    roster_sheet.cell(
+        row=roster_row,
+        column=coverage_note_column,
+        value="Confirmed by Richmond manager",
+    )
     wb.save(output_path)
     wb.close()
 
@@ -1366,15 +1923,50 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
     assert roster.ref == "A20:B70"
     assert regenerated["Management Setup"]["A21"].value == "Pat Manager"
     assert regenerated["Management Setup"]["B21"].value == "Yes"
-    action_rows = metrics.records_from_sheet(regenerated["Action Board"], "Action ID")
+    preview_owner_sheet = regenerated["Roster & Coverage"]
+    preview_owner_table = preview_owner_sheet.tables[
+        metrics.PREVIEW_OWNER_ROSTER_TABLE_NAME
+    ]
+    preview_owner_min_col, preview_owner_header_row, preview_owner_max_col, _ = (
+        range_boundaries(preview_owner_table.ref)
+    )
+    assert (
+        preview_owner_sheet.cell(
+            row=preview_owner_header_row + 1,
+            column=preview_owner_min_col,
+        ).value
+        == "Pat Manager"
+    )
+    assert (
+        preview_owner_sheet.cell(
+            row=preview_owner_header_row + 1,
+            column=preview_owner_max_col,
+        ).value
+        == "Yes"
+    )
+    action_rows = metrics.records_from_follow_up_sheet(
+        regenerated["Follow-up Queue"]
+    )
     carried = next(row for row in action_rows if row["Action ID"] == action_id)
     assert carried["Status"] == "In Progress"
     assert carried["Owner"] == "Pat Manager"
     assert carried["Due Date"].date() == date(2026, 6, 30)
-    assert carried["Context Notes"] == "Follow up Friday"
+    assert carried["Context Notes"] == "Check Average context review Friday"
     assert carried["Review Disposition"] == "Coaching Accepted"
     assert carried["Reviewed By"] == "Pat Manager"
     assert carried["Review Date"].date() == date(2026, 6, 23)
+    roster_rows = metrics.records_from_roster_coverage_sheet(
+        regenerated["Roster & Coverage"]
+    )
+    carried_roster = next(
+        row
+        for row in roster_rows
+        if row["Location"] == "RC Richmond"
+        and row["Source Name"] == "Alex Rising"
+    )
+    assert carried_roster["Preferred Display Name"] == "Alex Preferred"
+    assert carried_roster["Roster Status"] == "Active Server"
+    assert carried_roster["Coverage Note"] == "Confirmed by Richmond manager"
     regenerated.close()
 
 

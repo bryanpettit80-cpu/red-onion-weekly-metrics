@@ -248,49 +248,55 @@ def test_incomplete_week_carries_manual_active_action_as_paused() -> None:
         [], {"active_actions": [prior, stale_data_quality], "action_history": []}, readiness
     )
 
-    assert len(history) == 1
-    assert history[0]["Action ID"] == stale_data_quality["Action ID"]
-    assert history[0]["Signal State"] == "Cleared"
-    assert len(current) == 1
-    assert current[0]["Action ID"] == prior["Action ID"]
-    assert current[0]["Status"] == "Review Needed"
-    assert current[0]["Owner"] == "Pat Manager"
-    assert current[0]["Due Date"] == date(2026, 7, 15)
-    assert current[0]["Context Notes"] == "Review Friday"
-    assert current[0]["Priority"] == "Paused"
-    assert current[0]["Action"] == "Paused Carryover"
-    assert current[0]["Signal"].startswith("PAUSED / CARRYOVER")
-    assert current[0]["Why It Matters"].startswith("Prior action retained")
-    assert "manual assignment on hold" in current[0]["Recommended Next Step"]
-    assert current[0]["Peer Comparison"] == "Preliminary"
-    assert current[0]["Recent Movement"] == "Not Evaluated"
-    assert current[0]["Evidence Status"] == "Paused"
-    assert current[0]["Review Disposition"] == "Pending Review"
-    assert current[0]["Signal State"] == "Paused / Carryover"
-    assert current[0]["Action Code"] == "PAUSED_CARRYOVER"
+    assert history == []
+    assert len(current) == 2
+    current_by_id = {row["Action ID"]: row for row in current}
+    paused = current_by_id[prior["Action ID"]]
+    cleared_follow_up = current_by_id[stale_data_quality["Action ID"]]
+    assert cleared_follow_up["Status"] == "Review Needed"
+    assert cleared_follow_up["Review Disposition"] == "Pending Review"
+    assert cleared_follow_up["Signal State"] == "Cleared / Follow-up Required"
+    assert "never resolved" in cleared_follow_up["Recommended Next Step"]
+    assert paused["Status"] == "Review Needed"
+    assert paused["Owner"] == "Pat Manager"
+    assert paused["Due Date"] == date(2026, 7, 15)
+    assert paused["Context Notes"] == "Review Friday"
+    assert paused["Priority"] == "Paused"
+    assert paused["Action"] == "Paused Carryover"
+    assert paused["Signal"].startswith("PAUSED / CARRYOVER")
+    assert paused["Why It Matters"].startswith("Prior action retained")
+    assert "manual assignment on hold" in paused["Recommended Next Step"]
+    assert paused["Peer Comparison"] == "Preliminary"
+    assert paused["Recent Movement"] == "Not Evaluated"
+    assert paused["Evidence Status"] == "Paused"
+    assert paused["Review Disposition"] == "Pending Review"
+    assert paused["Signal State"] == "Paused / Carryover"
+    assert paused["Action Code"] == "PAUSED_CARRYOVER"
     assert (
-        current[0]["Reason Code"]
+        paused["Reason Code"]
         == "LATEST_WEEK_INCOMPLETE_PRIOR_ACTION_RETAINED"
     )
-    assert current[0]["Evidence ID"] != "STALE-EVIDENCE"
-    assert "2026-07-12" in current[0]["Evidence Week Ends"]
-    paused_evidence = json.loads(current[0]["Metric Evidence"])[
+    assert paused["Evidence ID"] != "STALE-EVIDENCE"
+    assert "2026-07-12" in paused["Evidence Week Ends"]
+    paused_evidence = json.loads(paused["Metric Evidence"])[
         "paused_carryover"
     ]
     assert paused_evidence["latest_week_end"] == "2026-07-12"
     assert paused_evidence["missing_dates"] == ["2026-07-11"]
     assert "Jul 11" in paused_evidence["missing_text"]
-    assert current[0]["Last Seen"] == date(2026, 7, 12)
-    assert current[0]["First Seen"] == date(2026, 6, 28)
-    assert current[0]["Weeks Open"] == 3
+    assert paused["Last Seen"] == date(2026, 7, 12)
+    assert paused["First Seen"] == date(2026, 6, 28)
+    assert paused["Weeks Open"] == 3
 
     repeated, _ = metrics.merge_management_actions(
         [], {"active_actions": current, "action_history": history}, readiness
     )
-    assert repeated[0]["Last Seen"] == date(2026, 7, 12)
-    assert repeated[0]["First Seen"] == date(2026, 6, 28)
-    assert repeated[0]["Weeks Open"] == 3
-    assert repeated[0]["Evidence ID"] == current[0]["Evidence ID"]
+    repeated_by_id = {row["Action ID"]: row for row in repeated}
+    repeated_paused = repeated_by_id[prior["Action ID"]]
+    assert repeated_paused["Last Seen"] == date(2026, 7, 12)
+    assert repeated_paused["First Seen"] == date(2026, 6, 28)
+    assert repeated_paused["Weeks Open"] == 3
+    assert repeated_paused["Evidence ID"] == paused["Evidence ID"]
 
 
 def test_backdated_incomplete_week_does_not_rewind_paused_action_dates() -> None:

@@ -104,6 +104,13 @@ def downgrade_master_to_pre_consolidation_layout(path: Path) -> str:
 
     workbook = load_workbook(path, data_only=False)
     try:
+        # A historical workbook cannot also carry the redesign management layer.
+        # Removing these sheets keeps the compatibility fixture on the legacy
+        # routing path and prevents redesign-only validations from leaking into
+        # the historical protection contracts.
+        for sheet_name in metrics.VISIBLE_MANAGEMENT_SHEETS:
+            if sheet_name in workbook.sheetnames:
+                workbook.remove(workbook[sheet_name])
         if "Team Trends" in workbook.sheetnames:
             current_actions = metrics.records_from_sheet(
                 workbook["Action Board"],
@@ -1114,7 +1121,7 @@ def test_manifest_pinned_legacy_v3_navigation_is_regenerated_with_menu(
             }
             assert (
                 worksheet.cell(row=2, column=start_column).hyperlink.target
-                == metrics.MANAGEMENT_MENU_TARGET
+                == metrics.PREVIEW_MENU_TARGET
             )
     finally:
         upgraded.close()
@@ -1661,21 +1668,18 @@ def test_v2_evidence_export_rejects_legacy_action_schema(
     [
         ("missing", "missing required sheets"),
         ("hidden", "expected 'visible'"),
-        ("reordered", "must be the first worksheet"),
+        ("reordered", "approved order"),
         ("unlocked", "editable-cell protection"),
-        ("navigation_target", "invalid navigation target"),
-        ("navigation_style", "navigation style"),
-        ("menu_merge", "approved workbook-menu merge"),
-        ("map_target", "invalid workbook-map navigation link"),
-        ("map_style", "invalid workbook-map navigation link"),
-        ("map_heading", "approved workbook-map heading"),
-        ("map_heading_layout", "invalid workbook-map heading layout"),
-        ("map_row_layout", "invalid workbook-map row layout"),
-        ("guide_text", "missing required operating guidance"),
+        ("navigation_target", "invalid preview navigation target"),
+        ("navigation_style", "preview navigation style"),
+        ("menu_merge", "preview workbook-menu merge"),
+        ("review_header", "missing required review columns"),
+        ("visible_label", "label check_average as Sales / Guest"),
+        ("quality_guidance", "missing required guidance"),
         ("title_merge", "title band must extend through column L"),
     ],
 )
-def test_current_workbook_rejects_guide_and_navigation_contract_tampering(
+def test_current_workbook_rejects_redesign_usability_contract_tampering(
     tmp_path: Path,
     valid_master_template: Path,
     tamper_kind: str,
@@ -1685,43 +1689,52 @@ def test_current_workbook_rejects_guide_and_navigation_contract_tampering(
     shutil.copy2(valid_master_template, master)
     workbook = load_workbook(master, data_only=False)
     try:
-        guide = workbook["How to Use"]
+        review = workbook["Weekly Review"]
         if tamper_kind == "missing":
-            workbook.remove(guide)
+            workbook.remove(review)
         elif tamper_kind == "hidden":
-            guide.sheet_state = "hidden"
+            review.sheet_state = "hidden"
         elif tamper_kind == "reordered":
             workbook._sheets = [
-                workbook["Dashboard"],
+                workbook["Follow-up Queue"],
                 *[
                     worksheet
                     for worksheet in workbook.worksheets
-                    if worksheet.title != "Dashboard"
+                    if worksheet.title != "Follow-up Queue"
                 ],
             ]
         elif tamper_kind == "unlocked":
-            guide["A4"].protection = metrics.Protection(locked=False)
+            review["A4"].protection = metrics.Protection(locked=False)
         elif tamper_kind == "navigation_target":
-            guide["A2"].hyperlink = "#'Dashboard'!A1"
+            review["A2"].hyperlink = "#'Follow-up Queue'!A1"
         elif tamper_kind == "navigation_style":
-            guide["A2"].fill = metrics.PatternFill("solid", fgColor="00FF00")
+            review["A2"].fill = metrics.PatternFill("solid", fgColor="00FF00")
         elif tamper_kind == "menu_merge":
-            guide.unmerge_cells("A2:L2")
-        elif tamper_kind == "map_target":
-            guide["A46"].hyperlink = "#'Dashboard'!A1"
-        elif tamper_kind == "map_style":
-            guide["A46"].font = Font(bold=True, color="7A1E1E")
-        elif tamper_kind == "map_heading":
-            guide["A45"] = "Sheet"
-        elif tamper_kind == "map_heading_layout":
-            guide.unmerge_cells("A45:B45")
-        elif tamper_kind == "map_row_layout":
-            guide.unmerge_cells("A46:B46")
-        elif tamper_kind == "guide_text":
-            guide["A59"] = "Unsupported assumptions removed"
+            review.unmerge_cells("A2:L2")
+        elif tamper_kind == "review_header":
+            header_row = next(
+                (
+                    row
+                    for row in range(1, review.max_row + 1)
+                    if review.cell(row=row, column=1).value == "Review Level"
+                ),
+                None,
+            )
+            assert header_row is not None
+            review.cell(row=header_row, column=6, value="Metric")
+        elif tamper_kind == "visible_label":
+            review["A4"] = "Check Average is the primary metric."
+        elif tamper_kind == "quality_guidance":
+            quality = workbook["Data Quality & Audit"]
+            for cell in quality._cells.values():
+                if isinstance(cell.value, str) and (
+                    "Sales / Guest is gross sales divided by guests" in cell.value
+                ):
+                    cell.value = "Metric guidance removed."
+                    break
         else:
-            guide.unmerge_cells("A1:L1")
-            guide.merge_cells("A1:K1")
+            review.unmerge_cells("A1:M1")
+            review.merge_cells("A1:K1")
         workbook.save(master)
     finally:
         workbook.close()
@@ -1734,12 +1747,12 @@ def test_current_workbook_rejects_guide_and_navigation_contract_tampering(
 @pytest.mark.parametrize(
     "tamper_kind",
     [
-        "guide_text",
+        "review_text",
         "navigation_target",
         "navigation_height",
         "menu_merge",
-        "map_target",
-        "guide_width",
+        "quality_text",
+        "review_width",
     ],
 )
 def test_generated_content_digest_covers_workbook_usability_contract(
@@ -1752,18 +1765,18 @@ def test_generated_content_digest_covers_workbook_usability_contract(
     original_digest = metrics.workbook_generated_content_sha256(master)
     workbook = load_workbook(master, data_only=False)
     try:
-        if tamper_kind == "guide_text":
-            workbook["How to Use"]["A4"] = "Changed scope"
+        if tamper_kind == "review_text":
+            workbook["Weekly Review"]["A4"] = "Changed scope"
         elif tamper_kind == "navigation_target":
-            workbook["Dashboard"]["A2"].hyperlink = "#'Action Board'!A1"
+            workbook["Weekly Review"]["A2"].hyperlink = "#'Follow-up Queue'!A1"
         elif tamper_kind == "navigation_height":
-            workbook["Action History"].row_dimensions[2].height = 30
+            workbook["Follow-up Queue"].row_dimensions[2].height = 30
         elif tamper_kind == "menu_merge":
-            workbook["Dashboard"].unmerge_cells("A2:L2")
-        elif tamper_kind == "map_target":
-            workbook["How to Use"]["A46"].hyperlink = "#'Dashboard'!A1"
+            workbook["Weekly Review"].unmerge_cells("A2:L2")
+        elif tamper_kind == "quality_text":
+            workbook["Data Quality & Audit"]["B14"] = "Changed audit guidance"
         else:
-            workbook["How to Use"].column_dimensions["L"].width = 14
+            workbook["Weekly Review"].column_dimensions["M"].width = 54
         workbook.save(master)
     finally:
         workbook.close()

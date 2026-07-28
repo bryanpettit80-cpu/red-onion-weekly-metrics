@@ -9,6 +9,40 @@ screening rules. They are not a statistical, predictive, causal, or
 employment-decision model. Data integrity and reproducibility do not establish
 that a signal fairly attributes performance to one person.
 
+## Side-By-Side Management Preview
+
+The management-layer redesign is a **preview-only, non-live** workbook for
+side-by-side evaluation. It does not replace the authoritative live workbook,
+change the `2026.07-v3` analytics engine, or expand the permitted use of named
+employee data. Its four visible sheets are `Weekly Review`, `Follow-up Queue`,
+`Roster & Coverage`, and `Data Quality & Audit`; the existing analytical and
+evidence worksheets remain protected and hidden.
+
+All identifiable content on those four sheets remains Restricted Employee
+Performance Information. The display label `Sales / Guest` is gross sales
+divided by guests and is only a clearer name for the existing internal
+`check_average` field. It is not a new measure or scoring input.
+
+`Follow-up Queue` separates analytical Signal State from Management Status. If
+a signal clears before the human review is resolved, the item remains visible
+as `Cleared / Follow-up Required` until an authorized manager explicitly
+completes or dismisses it with the required disposition. This preserves
+accountability for an unfinished review; it must not be represented as a
+current signal or as evidence supporting an employment decision.
+
+`Roster & Coverage` presents governed owner names, source coverage, and
+server-week evidence availability. A missing evidence week is a data-coverage
+condition, not negative performance evidence. Coverage reasons and notes must
+be factual, minimum-necessary, and must not include protected attributes or
+unsupported conclusions about an employee. Until an authoritative roster is
+provided, transaction-derived names must remain `Needs Identity Review`; the
+preview must not infer active employment status from sales transactions alone.
+The initial roster must include every non-excluded name found in the selected
+eight complete weeks, including names absent from the latest week. Confirmed
+status, preferred display names, missing-week reasons, coverage notes, and the
+blue manager-editable Owner Roster are protected management inputs and must
+persist across regeneration.
+
 ## Allowed Use
 
 - Weekly context review by authorized Red Onion leaders.
@@ -55,7 +89,10 @@ The reviewer records one of `Coaching Accepted`, `Recognition Accepted`,
 `Context Explains`, `Data Issue`, or `Monitor`, together with Reviewed By and
 Review Date. Context Notes should contain only the minimum information needed
 to explain the disposition. A prompt remains pending if those fields are
-incomplete.
+incomplete. In the non-live preview, a cleared analytical signal likewise
+remains in `Follow-up Queue` while this review is incomplete; the separate
+Signal State must remain visible so the old signal is not mistaken for a
+current one.
 
 ## Minimum Necessary Data
 
@@ -114,6 +151,13 @@ The business owner resolves use and context disputes. The technical maintainer
 resolves source, integrity, and implementation defects. Material methodology
 changes require a new version, updated model card, regression/backtest review,
 and owner approval before deployment.
+
+Because the side-by-side redesign changes the management presentation and
+workflow rather than the methodology, it still requires documented business
+review, protected-workbook validation, and an explicit deployment decision
+before it may replace the live workbook. Preview generation alone is not
+approval or deployment. The preview branch requires explicit preview intent and
+must reject the configured live finished-reports folder.
 
 Remove access promptly when roles change and review membership quarterly.
 

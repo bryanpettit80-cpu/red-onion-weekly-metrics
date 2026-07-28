@@ -184,6 +184,7 @@ def test_verified_evidence_uses_live_editable_action_fields(
     board["D5"] = "Blocked"
     board["E5"] = "Current Manager"
     board["F5"] = date(2026, 8, 6)
+    board["N5"] = "Waiting for comparable shift context."
     board["U5"] = "Coaching Accepted"
     board["V5"] = "Reviewing Manager"
     board["W5"] = date(2026, 8, 1)

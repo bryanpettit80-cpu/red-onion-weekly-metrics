@@ -9,6 +9,8 @@
   replay, and managed local publication are complete; authorized people-review
   use remains blocked until a separate business-owner approval record is
   documented and verified
+- **Management redesign status:** side-by-side working preview only; not
+  deployed to or authoritative for the live workbook
 - **Methodology:** `2026.07-v3`
 - **System type:** deterministic, rule-based observational coaching signal
 - **Owners:** Red Onion business owner and designated technical maintainer
@@ -18,6 +20,46 @@ This model card describes two intentionally separate layers. The operations
 layer presents trends, volume, and descriptive context. The people-review layer
 covers person-level Recent Movement, Peer Comparison, Context Review, Coaching
 Prompt, and Recognition Prompt behavior.
+
+## Side-By-Side Management-Layer Preview
+
+The management redesign is a presentation and workflow preview, not a new model
+or methodology release. It preserves the existing analytics engine, source
+reconciliation, metric calculations, eligibility and sample gates, calibrated
+thresholds, peer comparisons, persistence and stability rules, classifications,
+evidence lineage, and hidden analytical worksheets. It does not replace the
+live workbook or expand the currently blocked authorization for people-review
+use.
+
+The preview has four visible management sheets:
+
+- `Weekly Review` presents current and prior sample context for every current
+  non-excluded server, descriptive Watch cases, and the distinct formal action
+  gate.
+- `Follow-up Queue` separates the analytical Signal State from the manager's
+  workflow Status and disposition.
+- `Roster & Coverage` presents the governed owner roster, source coverage, and
+  an eight-week server evidence-coverage matrix. The initial roster includes
+  every non-excluded name found in those eight complete weeks, even when the
+  name is absent from the latest week. Its blue Owner Roster cells are the
+  manager-accessible setup surface for assignments and dispositions.
+- `Data Quality & Audit` presents readiness, source completeness, exceptions,
+  provenance, and interpretation boundaries.
+
+The visible term `Sales / Guest` means gross sales divided by guests. It is a
+plain-language label for the existing internal `check_average` field; neither
+the stored metric nor its calculation changes. `Roster & Coverage` describes
+whether usable evidence exists. A missing evidence week is not an adverse
+performance fact and cannot create or strengthen a coaching signal. In the
+absence of an authoritative roster, transaction-derived names default to
+`Needs Identity Review`; the preview does not silently assume active employment
+status. Confirmed roster annotations persist across subsequent rebuilds.
+
+An analytical signal can clear while a management review remains unresolved.
+In that case the preview retains the item in `Follow-up Queue` as
+`Cleared / Follow-up Required` until an authorized manager explicitly completes
+or dismisses it with the required disposition. Retention is workflow
+accountability, not evidence that the prior signal remains current.
 
 ## Intended Use
 
@@ -221,6 +263,12 @@ An incomplete or low-volume week, unavailable peer reference, missing calendar
 week, changed direction, or failed stability check breaks escalation. A
 day-sensitive signal cannot exceed `Context Review`.
 
+In the non-live management preview, clearing a current analytical signal does
+not silently close an unfinished human review. Signal State and Management
+Status remain separate, and unresolved follow-up persists until a completed or
+dismissed disposition is recorded. This workflow rule does not alter signal
+generation, persistence, or escalation.
+
 ## Human Review And Evidence
 
 Every generated row begins with Review Disposition `Pending Review`. An
@@ -341,3 +389,10 @@ persistence, terminology, or permitted use require:
 3. regression and historical backtesting;
 4. business-owner approval; and
 5. a protected release and deployment.
+
+The side-by-side management preview is not that deployment. Promoting it to the
+live workbook requires separate review and approval of the management workflow,
+protected edit surface, integrity contract, regression results, and operator
+instructions even though the analytical methodology is unchanged. The preview
+branch requires an explicit preview-generation switch and refuses the
+configured live finished-reports folder.
