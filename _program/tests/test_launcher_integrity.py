@@ -24,11 +24,11 @@ def test_release_preflight_runs_before_any_runtime_mutation() -> None:
     assert '"status", "--porcelain=v1", "--untracked-files=all"' in compact_launcher
     assert '"symbolic-ref", "--quiet", "--short", "HEAD"' in compact_launcher
     assert 'refs/remotes/origin/main^{commit}' in launcher
-    assert "Assert-NoSourceBytecode" in launcher
+    assert "Assert-NoSourceBytecode" not in launcher
     assert 'PYTHONDONTWRITEBYTECODE = "1"' in launcher
     assert "PYTHONPYCACHEPREFIX" in launcher
     preflight_call = launcher.index(
-        "Assert-NoSourceBytecode\n\nif ($IsDeployedCheckout)"
+        "if ($IsDeployedCheckout) {\n    Assert-DeployedRelease"
     )
     assert preflight_call < launcher.index(
         "New-Item -ItemType Directory"
@@ -92,6 +92,17 @@ from pathlib import Path
 capture_path = os.environ.get("RED_ONION_TEST_ARGUMENTS_PATH")
 if capture_path:
     Path(capture_path).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+environment_path = os.environ.get("RED_ONION_TEST_ENVIRONMENT_PATH")
+if environment_path:
+    Path(environment_path).write_text(
+        "\\n".join(
+            [
+                os.environ.get("PYTHONDONTWRITEBYTECODE", ""),
+                os.environ.get("PYTHONPYCACHEPREFIX", ""),
+            ]
+        ),
+        encoding="utf-8",
+    )
 raise SystemExit(0)
 """,
         encoding="utf-8",
@@ -199,7 +210,7 @@ def test_clean_main_deployment_at_local_origin_main_runs(
     not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
     reason="Windows PowerShell and Git required",
 )
-def test_deployed_checkout_rejects_ignored_python_bytecode_before_python(
+def test_deployed_checkout_accepts_ignored_python_bytecode_with_isolated_cache(
     tmp_path: Path, launcher_environment: dict[str, str]
 ) -> None:
     repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
@@ -215,17 +226,23 @@ def test_deployed_checkout_rejects_ignored_python_bytecode_before_python(
     assert _git(repository_root, "status", "--porcelain=v1").stdout == ""
 
     capture_path = tmp_path / "invoked-arguments.txt"
+    environment_path = tmp_path / "invoked-environment.txt"
     environment = launcher_environment.copy()
     environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    environment["RED_ONION_TEST_ENVIRONMENT_PATH"] = str(environment_path)
     result = _run_launcher(launcher, environment)
-    normalized_output = " ".join((result.stdout + result.stderr).split())
 
-    assert result.returncode != 0
-    assert "Release preflight failed" in normalized_output
-    assert "Python bytecode that cannot be verified by Git" in normalized_output
-    assert "red_onion_integrity.cpython-312.pyc" in normalized_output
-    assert not capture_path.exists()
-    assert not (tmp_path / "01 Daily Reports - Drop Here").exists()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Verified deployed release: main at" in result.stdout
+    assert capture_path.exists()
+    assert bytecode.read_bytes() == b"crafted ignored bytecode"
+    assert (tmp_path / "01 Daily Reports - Drop Here").is_dir()
+    bytecode_write_setting, cache_prefix_text = environment_path.read_text(
+        encoding="utf-8"
+    ).splitlines()
+    cache_prefix = Path(cache_prefix_text).resolve()
+    assert bytecode_write_setting == "1"
+    assert not cache_prefix.is_relative_to(repository_root.resolve())
 
 
 @pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")

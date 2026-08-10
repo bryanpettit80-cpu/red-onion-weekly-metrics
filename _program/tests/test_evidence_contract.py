@@ -231,7 +231,7 @@ def test_verified_evidence_uses_live_editable_action_fields(
     monkeypatch.setattr(
         metrics,
         "validate_v2_management_evidence_workbook",
-        lambda workbook, expected_digest: None,
+        lambda workbook, expected_digest, **verification: None,
     )
     args = Namespace(
         output_dir=str(output_dir),

@@ -534,6 +534,41 @@ def downgrade_master_to_previous_action_schema(path: Path) -> str:
     return metrics.stamp_generated_content_digest(path)
 
 
+def stamp_true_scheme_less_v2_digest(path: Path) -> str:
+    """Model a workbook emitted before manifests carried an explicit scheme."""
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        run_notes = workbook["Run Notes"]
+        scheme_rows = [
+            row
+            for row in range(1, run_notes.max_row + 1)
+            if run_notes.cell(row=row, column=1).value == "Digest Scheme"
+        ]
+        assert len(scheme_rows) <= 1
+        if scheme_rows:
+            run_notes.delete_rows(scheme_rows[0], 1)
+        workbook.save(path)
+    finally:
+        workbook.close()
+    digest = metrics.workbook_metadata_sha256(path)
+    workbook = load_workbook(path, data_only=False)
+    try:
+        run_notes = workbook["Run Notes"]
+        digest_row = next(
+            row
+            for row in range(1, run_notes.max_row + 1)
+            if run_notes.cell(row=row, column=1).value
+            == metrics.RUN_NOTES_DIGEST_LABEL
+        )
+        run_notes.cell(row=digest_row, column=2, value=digest)
+        workbook.save(path)
+    finally:
+        workbook.close()
+    assert metrics.workbook_metadata_sha256(path) == digest
+    return digest
+
+
 def test_explicit_baseline_succeeds_without_active_input_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -568,6 +603,199 @@ def test_explicit_baseline_succeeds_without_active_input_and_is_idempotent(
     assert second == [baseline]
     assert manifest_paths(archive_dir) == [baseline]
     assert integrity.read_json_manifest(anchor, root=anchor.parent) == anchor_payload
+
+
+def test_scheme_less_v2_master_baseline_keeps_legacy_digest_contract(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = stamp_true_scheme_less_v2_digest(master)
+
+    [baseline] = metrics.run(args)
+    payload = integrity.read_json_manifest(baseline)
+
+    assert payload["master_generated_content_sha256"] == legacy_digest
+    assert (
+        payload["master_generated_content_digest_scheme"]
+        == metrics.LEGACY_WORKBOOK_DIGEST_SCHEME
+    )
+    workbook = load_workbook(master, data_only=False)
+    try:
+        assert metrics.stamped_workbook_digest_scheme(workbook) is None
+    finally:
+        workbook.close()
+    verified, _ = metrics.verify_integrity_state(
+        Path(args.archive_dir), output_dir, baseline
+    )
+    assert (
+        verified["_master_generated_content_digest_scheme"]
+        == metrics.LEGACY_WORKBOOK_DIGEST_SCHEME
+    )
+
+
+def test_v2_baseline_metadata_drift_uses_inventory_pinned_prior_master(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path, initialize_baseline=True)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = stamp_true_scheme_less_v2_digest(master)
+    reference = (
+        archive_dir
+        / metrics.GENERATED_WORKBOOK_ARCHIVE_FOLDER
+        / "week-ending-2026-08-02"
+        / "prior-weekly-run"
+        / "published"
+        / master.name
+    )
+    reference.parent.mkdir(parents=True)
+    shutil.copy2(master, reference)
+
+    [baseline] = metrics.run(args)
+    baseline_payload = integrity.read_json_manifest(baseline)
+    assert baseline_payload["run_id"] != "prior-weekly-run"
+    assert baseline_payload["master_generated_content_sha256"] == legacy_digest
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook.calculation.calcMode = None
+        workbook.save(master)
+    finally:
+        workbook.close()
+
+    with pytest.warns(UserWarning, match="metadata differs"):
+        verified, _ = metrics.verify_integrity_state(
+            archive_dir,
+            output_dir,
+            baseline,
+        )
+    assert verified["_master_metadata_drift"] is True
+    assert Path(verified["_legacy_master_reference_path"]) == reference
+
+
+def test_explicit_v3_manifest_requires_metadata_digest(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    archive_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    state = metrics.build_integrity_state(archive_dir, output_dir)
+    assert (
+        state["master_generated_content_digest_scheme"]
+        == metrics.WORKBOOK_DIGEST_SCHEME
+    )
+    state.pop("master_metadata_sha256")
+    manifest = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=Path(args.config),
+        config=metrics.load_config(Path(args.config)),
+        kind="weekly-run",
+        run_id="malformed-v3",
+        previous_manifest=None,
+        integrity_state=state,
+    )
+
+    with pytest.raises(
+        metrics.IntegrityError,
+        match="V3 integrity manifest is missing the required master metadata digest",
+    ):
+        metrics.verify_integrity_state(archive_dir, output_dir, manifest)
+
+
+def test_pre_v3_history_only_migration_carries_augmented_legacy_state(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    archive_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = stamp_true_scheme_less_v2_digest(master)
+    reference = (
+        archive_dir
+        / metrics.GENERATED_WORKBOOK_ARCHIVE_FOLDER
+        / "week-ending-2026-08-02"
+        / "archived-v2-run"
+        / "published"
+        / master.name
+    )
+    reference.parent.mkdir(parents=True)
+    shutil.copy2(master, reference)
+
+    pre_v3_state = metrics.build_integrity_state(archive_dir, output_dir)
+    pre_v3_state.pop("master_generated_content_digest_scheme")
+    pre_v3_state.pop("master_metadata_sha256")
+    pre_v3_manifest = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=Path(args.config),
+        config=metrics.load_config(Path(args.config)),
+        kind="weekly-run",
+        run_id="pre-v3-head",
+        previous_manifest=None,
+        integrity_state=pre_v3_state,
+    )
+    metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        Path(args.config),
+        metrics.load_config(Path(args.config)),
+        allow_initialize=True,
+    )
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook.calculation.calcMode = None
+        workbook.save(master)
+    finally:
+        workbook.close()
+    current_metadata_digest = metrics.workbook_metadata_sha256(master)
+    assert current_metadata_digest != legacy_digest
+
+    migration_source = tmp_path / "approved-history"
+    migration_source.mkdir()
+    (migration_source / "Daily Report historical.xlsx").write_bytes(
+        b"approved historical source"
+    )
+    install_synthetic_parser(monkeypatch)
+    args.migrate_history_from = [str(migration_source)]
+    args.migrate_history_only = True
+
+    with pytest.warns(UserWarning, match="metadata differs"):
+        copied = metrics.run(args)
+
+    assert len(copied) == 1
+    latest = metrics.latest_integrity_manifest_path(archive_dir)
+    assert latest is not None and latest != pre_v3_manifest
+    payload = integrity.read_json_manifest(latest)
+    assert payload["kind"] == "history-migration"
+    assert payload["master_generated_content_sha256"] == legacy_digest
+    assert (
+        payload["master_generated_content_digest_scheme"]
+        == metrics.LEGACY_WORKBOOK_DIGEST_SCHEME
+    )
+    assert payload["master_metadata_sha256"] == current_metadata_digest
+    verified, _ = metrics.verify_integrity_state(archive_dir, output_dir, latest)
+    assert verified["_master_metadata_drift"] is True
 
 
 def test_replacement_path_rebind_verifies_backed_up_head(
@@ -1558,6 +1786,37 @@ def test_protected_v031_pre_guide_master_uses_exact_compatibility_contract(
         master,
         expected_digest=pre_guide_digest,
     ) == pre_guide_digest
+
+
+@pytest.mark.parametrize("legacy_layout", ["v1", "pre_guide"])
+def test_scheme_less_v2_legacy_layout_uses_metadata_digest_contract(
+    tmp_path: Path,
+    valid_master_template: Path,
+    legacy_layout: str,
+) -> None:
+    master = tmp_path / f"scheme-less-{legacy_layout}.xlsx"
+    shutil.copy2(valid_master_template, master)
+    if legacy_layout == "v1":
+        downgrade_master_to_v1_action_focus(master)
+    else:
+        downgrade_master_to_pre_guide_v031(master)
+    legacy_digest = stamp_true_scheme_less_v2_digest(master)
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        assert metrics.stamped_workbook_digest_scheme(workbook) is None
+    finally:
+        workbook.close()
+    validator = (
+        metrics.validate_v1_action_focus_workbook
+        if legacy_layout == "v1"
+        else metrics.validate_pre_guide_management_workbook
+    )
+    assert validator(master, legacy_digest) == legacy_digest
+    assert metrics.verify_existing_management_workbook_integrity(
+        master,
+        expected_digest=legacy_digest,
+    ) == legacy_digest
 
 
 def test_evidence_source_accepts_manifest_pinned_pre_guide_v031_master(

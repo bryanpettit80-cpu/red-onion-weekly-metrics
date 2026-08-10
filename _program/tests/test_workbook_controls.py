@@ -3,15 +3,20 @@ from __future__ import annotations
 from base64 import b64decode
 from datetime import date
 from pathlib import Path
+import shutil
 from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.layout import Layout
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.comments import Comment
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Font, PatternFill, Protection
 from openpyxl.utils import range_boundaries
+from openpyxl.worksheet.hyperlink import Hyperlink
 import pytest
 
 import red_onion_weekly_metrics as metrics
@@ -194,6 +199,34 @@ def add_legacy_vml_drawing_part(path: Path) -> None:
         b'<xml xmlns:v="urn:schemas-microsoft-com:vml"><v:shape id="overlay" /></xml>'
     )
     replacement = path.with_name(f".{path.name}.vml.tmp")
+    with ZipFile(replacement, "w", compression=ZIP_DEFLATED) as target:
+        for name, content in source_parts.items():
+            target.writestr(name, content)
+    replacement.replace(path)
+
+
+def add_external_non_xl_relationship(path: Path) -> None:
+    with ZipFile(path) as source:
+        source_parts = {item.filename: source.read(item) for item in source.infolist()}
+    source_parts["customXml/_rels/item1.xml.rels"] = b"""<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="urn:red-onion:test" Target="https://example.com/data" TargetMode="External" />
+</Relationships>
+"""
+    replacement = path.with_name(f".{path.name}.external-rel.tmp")
+    with ZipFile(replacement, "w", compression=ZIP_DEFLATED) as target:
+        for name, content in source_parts.items():
+            target.writestr(name, content)
+    replacement.replace(path)
+
+
+def add_unsupported_active_part(path: Path) -> None:
+    with ZipFile(path) as source:
+        source_parts = {item.filename: source.read(item) for item in source.infolist()}
+    source_parts["xl/connections.xml"] = b"""<?xml version="1.0"?>
+<connections xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" />
+"""
+    replacement = path.with_name(f".{path.name}.active-part.tmp")
     with ZipFile(replacement, "w", compression=ZIP_DEFLATED) as target:
         for name, content in source_parts.items():
             target.writestr(name, content)
@@ -573,12 +606,13 @@ def test_generated_content_digest_ignores_only_approved_management_edits(
 
 
 @pytest.mark.parametrize(
-    "tamper_kind",
-    ["style", "internal_hyperlink"],
+    ("tamper_kind", "changes_substantive_digest"),
+    [("style", True), ("internal_hyperlink", True)],
 )
-def test_editable_cells_exclude_scalar_value_but_cover_metadata(
+def test_editable_cells_exclude_only_scalar_value(
     tmp_path: Path,
     tamper_kind: str,
+    changes_substantive_digest: bool,
 ) -> None:
     path = tmp_path / f"editable-metadata-{tamper_kind}.xlsx"
     build_controlled_workbook(path)
@@ -593,7 +627,9 @@ def test_editable_cells_exclude_scalar_value_but_cover_metadata(
     workbook.save(path)
     workbook.close()
 
-    assert metrics.workbook_generated_content_sha256(path) != original_digest
+    assert (
+        metrics.workbook_generated_content_sha256(path) != original_digest
+    ) is changes_substantive_digest
 
 
 def test_editable_cell_formula_is_rejected(tmp_path: Path) -> None:
@@ -622,22 +658,143 @@ def test_external_hyperlink_is_rejected(tmp_path: Path) -> None:
         metrics.workbook_generated_content_sha256(path)
 
 
+def test_external_relationship_outside_xl_package_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "external-package-relationship.xlsx"
+    build_controlled_workbook(path)
+    add_external_non_xl_relationship(path)
+
+    with pytest.raises(metrics.IntegrityError, match="External relationships"):
+        metrics.workbook_generated_content_sha256(path)
+
+
+def test_unsupported_active_workbook_part_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "active-workbook-part.xlsx"
+    build_controlled_workbook(path)
+    add_unsupported_active_part(path)
+
+    with pytest.raises(metrics.IntegrityError, match="active workbook parts"):
+        metrics.workbook_generated_content_sha256(path)
+
+
+def test_internal_hyperlink_target_and_location_serializations_are_equivalent() -> None:
+    target_form = Hyperlink(ref="A1", target="#'Action Board'!A5")
+    location_form = Hyperlink(ref="A1", location="'Action Board'!A5")
+
+    assert metrics.workbook_internal_hyperlink_destination(
+        target_form,
+        sheet_name="How to Use",
+        coordinate="A1",
+    ) == metrics.workbook_internal_hyperlink_destination(
+        location_form,
+        sheet_name="How to Use",
+        coordinate="A1",
+    )
+
+
+def test_internal_hyperlink_tooltip_and_display_are_substantive(tmp_path: Path) -> None:
+    path = tmp_path / "internal-hyperlink-display.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    cell = workbook["Management Setup"]["A21"]
+    cell.hyperlink = Hyperlink(
+        ref=cell.coordinate,
+        target="#'Action Board'!A5",
+        tooltip="Open action",
+        display="Action link",
+    )
+    workbook.save(path)
+    workbook.close()
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    workbook["Management Setup"]["A21"].hyperlink.tooltip = "Changed tooltip"
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) != original_digest
+
+
+def test_generated_error_and_text_cells_with_same_value_have_distinct_digest(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "generated-data-type.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A2"].value = "#N/A"
+    workbook["_Technical"]["A2"].data_type = "s"
+    workbook.save(path)
+    workbook.close()
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A2"].data_type = "e"
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) != original_digest
+
+
+def test_rich_text_cells_are_rejected_before_inline_format_can_be_hidden(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rich-text.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A1"] = CellRichText(
+        [
+            "Revenue ",
+            TextBlock(InlineFont(color="000000"), "123"),
+        ]
+    )
+    workbook.save(path)
+    workbook.close()
+
+    with pytest.raises(metrics.IntegrityError, match="Rich-text cells are not allowed"):
+        metrics.workbook_generated_content_sha256(path)
+
+
+def test_external_formula_reference_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "external-formula.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A2"] = "='[Other.xlsx]Sheet1'!A1"
+    workbook.save(path)
+    workbook.close()
+
+    with pytest.raises(metrics.IntegrityError, match="External formula references"):
+        metrics.workbook_generated_content_sha256(path)
+
+
 @pytest.mark.parametrize(
-    "tamper_kind",
+    ("tamper_kind", "changes_substantive_digest"),
     [
-        "cell_style",
-        "row_layout",
-        "column_layout",
-        "chart",
-        "conditional_formatting",
-        "merged_cells",
-        "filter",
-        "protection_password",
+        ("cell_style", True),
+        ("blank_cell_style", True),
+        ("row_layout", True),
+        ("column_layout", True),
+        ("cell_number_format", True),
+        ("generated_data_type", True),
+        ("quote_prefix", True),
+        ("pivot_button", True),
+        ("chart", True),
+        ("chart_series_color", True),
+        ("chart_anchor", True),
+        ("conditional_formatting", True),
+        ("conditional_formatting_range", True),
+        ("table_style", True),
+        ("validation_prompt", True),
+        ("validation_disable_prompts", True),
+        ("sheet_zero_height", True),
+        ("sheet_show_formulas", True),
+        ("merged_cells", True),
+        ("filter", True),
+        ("protection_password", True),
     ],
 )
-def test_generated_content_digest_covers_layout_and_object_state(
+def test_substantive_digest_separates_schema_from_presentation_metadata(
     tmp_path: Path,
     tamper_kind: str,
+    changes_substantive_digest: bool,
 ) -> None:
     path = tmp_path / f"object-state-{tamper_kind}.xlsx"
     build_controlled_workbook(path)
@@ -648,21 +805,183 @@ def test_generated_content_digest_covers_layout_and_object_state(
     technical = workbook["_Technical"]
     if tamper_kind == "cell_style":
         actions["G5"].font = Font(name="Arial", bold=True)
+    elif tamper_kind == "blank_cell_style":
+        technical["B10"].fill = PatternFill(fill_type="solid", fgColor="000000")
+    elif tamper_kind == "cell_number_format":
+        actions["G5"].number_format = ";;;"
+    elif tamper_kind == "generated_data_type":
+        technical["A2"].value = "#N/A"
+        technical["A2"].data_type = "e"
+    elif tamper_kind == "quote_prefix":
+        technical["A2"].quotePrefix = True
+    elif tamper_kind == "pivot_button":
+        technical["A2"].pivotButton = True
     elif tamper_kind == "row_layout":
         actions.row_dimensions[5].height = 99
     elif tamper_kind == "column_layout":
         actions.column_dimensions["G"].width = 3
     elif tamper_kind == "chart":
         technical._charts[0].title = "Changed chart"
+    elif tamper_kind == "chart_series_color":
+        technical._charts[0].series[0].graphicalProperties.solidFill = "00FF00"
+    elif tamper_kind == "chart_anchor":
+        technical._charts[0].anchor = "ZZ1000"
     elif tamper_kind == "conditional_formatting":
         conditional_format = list(technical.conditional_formatting)[0]
         conditional_format.rules[0].formula = ["2"]
+    elif tamper_kind == "conditional_formatting_range":
+        conditional_format = list(technical.conditional_formatting)[0]
+        [rule] = conditional_format.rules
+        technical.conditional_formatting._cf_rules.pop(conditional_format)
+        technical.conditional_formatting.add("A3", rule)
+    elif tamper_kind == "table_style":
+        table_style = actions.tables["ActionBoardTable"].tableStyleInfo
+        table_style.showRowStripes = not bool(table_style.showRowStripes)
+    elif tamper_kind == "validation_prompt":
+        validation = actions.data_validations.dataValidation[0]
+        validation.showInputMessage = True
+        validation.promptTitle = "Changed prompt"
+        validation.prompt = "Changed instructions"
+    elif tamper_kind == "validation_disable_prompts":
+        actions.data_validations.disablePrompts = True
+    elif tamper_kind == "sheet_zero_height":
+        technical.sheet_format.zeroHeight = True
+    elif tamper_kind == "sheet_show_formulas":
+        technical.sheet_view.showFormulas = True
     elif tamper_kind == "merged_cells":
         technical.unmerge_cells("D1:E1")
     elif tamper_kind == "filter":
         actions.auto_filter.ref = "A4:N5"
     else:
         actions.protection.set_password("different-password")
+    workbook.save(path)
+    workbook.close()
+
+    assert (
+        metrics.workbook_generated_content_sha256(path) != original_digest
+    ) is changes_substantive_digest
+
+
+def test_substantive_digest_keeps_auto_filter_criteria_with_same_range(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "auto-filter-criteria.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"].auto_filter.ref = "A1:A3"
+    workbook.save(path)
+    workbook.close()
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"].auto_filter.add_filter_column(0, ["Generated detail"])
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) != original_digest
+
+
+@pytest.mark.parametrize(
+    ("plain", "excel_escaped"),
+    [
+        ("$#,##0.00", r"\$#,##0.00"),
+        ("yyyy-mm-dd", r"yyyy\-mm\-dd"),
+        ("$0.00", r"\$0.00"),
+        ("+$#,##0.00;-$#,##0.00", r"\+\$#,##0.00;\-\$#,##0.00"),
+        ("$#,##0", r"\$#,##0"),
+    ],
+)
+def test_substantive_digest_normalizes_only_literal_number_format_escapes(
+    tmp_path: Path,
+    plain: str,
+    excel_escaped: str,
+) -> None:
+    path = tmp_path / "number-format-escape.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A2"].number_format = plain
+    workbook.save(path)
+    workbook.close()
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A2"].number_format = excel_escaped
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) == original_digest
+
+
+def test_substantive_digest_keeps_material_date_number_format_change(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "number-format-material.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A2"].number_format = "m/d/yyyy"
+    workbook.save(path)
+    workbook.close()
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]["A2"].number_format = "mm-dd-yy"
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) != original_digest
+
+
+def test_substantive_digest_normalizes_harmless_dimension_rounding(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "dimension-rounding.xlsx"
+    build_controlled_workbook(path)
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"].column_dimensions["A"].width = 32.0
+    workbook["_Technical"].row_dimensions[2].height = 22.0
+    workbook.save(path)
+    workbook.close()
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"].column_dimensions["A"].width = 32.1
+    workbook["_Technical"].row_dimensions[2].height = 21.95
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) == original_digest
+
+
+def test_substantive_digest_normalizes_empty_chart_layout(tmp_path: Path) -> None:
+    path = tmp_path / "empty-chart-layout.xlsx"
+    build_controlled_workbook(path)
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    workbook["_Technical"]._charts[0].layout = Layout()
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) == original_digest
+
+
+def test_substantive_digest_keeps_theme_color_semantics(tmp_path: Path) -> None:
+    path = tmp_path / "theme-color.xlsx"
+    build_controlled_workbook(path)
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    assert workbook.loaded_theme is not None
+    theme_root = ElementTree.fromstring(workbook.loaded_theme)
+    dark_one = next(
+        node for node in theme_root.iter() if str(node.tag).endswith("}dk1")
+    )
+    [dark_color] = list(dark_one)
+    original_color = dark_color.attrib.get("lastClr")
+    dark_color.attrib["lastClr"] = (
+        "FFFFFF" if original_color != "FFFFFF" else "000000"
+    )
+    workbook.loaded_theme = ElementTree.tostring(theme_root, encoding="utf-8")
     workbook.save(path)
     workbook.close()
 
@@ -724,29 +1043,34 @@ def test_generated_content_digest_detects_generated_and_protection_tampering(
 
 
 @pytest.mark.parametrize(
-    ("attribute", "invalid_value"),
+    ("attribute", "drift_value", "unsafe"),
     [
-        ("calcMode", "manual"),
-        ("fullCalcOnLoad", False),
-        ("forceFullCalc", False),
+        ("calcMode", None, False),
+        ("fullCalcOnLoad", None, False),
+        ("forceFullCalc", None, False),
+        ("calcMode", "manual", True),
+        ("fullCalcOnLoad", False, True),
+        ("forceFullCalc", False, True),
     ],
 )
-def test_calculation_controls_are_digest_covered_and_fail_validation(
+def test_calculation_metadata_defaults_warn_but_explicit_unsafe_values_fail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     attribute: str,
-    invalid_value: object,
+    drift_value: object,
+    unsafe: bool,
 ) -> None:
     path = tmp_path / f"calculation-{attribute}.xlsx"
     build_controlled_workbook(path)
-    original_digest = metrics.workbook_generated_content_sha256(path)
+    original_digest = metrics.stamp_generated_content_digest(path)
 
     workbook = load_workbook(path, data_only=False)
-    setattr(workbook.calculation, attribute, invalid_value)
+    setattr(workbook.calculation, attribute, drift_value)
     workbook.save(path)
     workbook.close()
 
-    assert metrics.workbook_generated_content_sha256(path) != original_digest
+    actual_digest = metrics.workbook_generated_content_sha256(path)
+    assert (actual_digest != original_digest) is unsafe
 
     # This compact fixture deliberately contains only the two visible sheets
     # involved in workbook controls. Narrow the expected visible set so the
@@ -754,10 +1078,112 @@ def test_calculation_controls_are_digest_covered_and_fail_validation(
     monkeypatch.setattr(
         metrics,
         "VISIBLE_MANAGEMENT_SHEETS",
-        ["Management Setup", "Action Board"],
+        ["Management Setup", "Action Board", "Run Notes"],
     )
-    with pytest.raises(
-        metrics.IntegrityError,
-        match="automatic/full recalculation controls are missing",
-    ):
-        metrics.validate_management_workbook(path, original_digest)
+    if unsafe:
+        with pytest.raises(metrics.IntegrityError, match="unsafe calculation settings"):
+            metrics.validate_management_workbook(path, original_digest)
+    else:
+        assert metrics.validate_management_workbook(path, original_digest) == original_digest
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("refMode", "R1C1"),
+        ("iterate", True),
+        ("iterateCount", 12),
+        ("iterateDelta", 0.25),
+        ("fullPrecision", False),
+        ("calcOnSave", False),
+        ("concurrentCalc", False),
+        ("concurrentManualCount", 2),
+    ],
+)
+def test_substantive_digest_keeps_other_calculation_semantics(
+    tmp_path: Path,
+    attribute: str,
+    value: object,
+) -> None:
+    path = tmp_path / f"calculation-semantic-{attribute}.xlsx"
+    build_controlled_workbook(path)
+    original_digest = metrics.workbook_generated_content_sha256(path)
+
+    workbook = load_workbook(path, data_only=False)
+    setattr(workbook.calculation, attribute, value)
+    workbook.save(path)
+    workbook.close()
+
+    assert metrics.workbook_generated_content_sha256(path) != original_digest
+
+
+def test_legacy_v2_metadata_drift_uses_pinned_reference_but_rejects_value_change(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.xlsx"
+    live = tmp_path / "live.xlsx"
+    build_controlled_workbook(reference)
+    legacy_digest = metrics.workbook_metadata_sha256(reference)
+    workbook = load_workbook(reference, data_only=False)
+    workbook["Run Notes"]["B11"] = legacy_digest
+    workbook.save(reference)
+    workbook.close()
+    assert metrics.workbook_metadata_sha256(reference) == legacy_digest
+    shutil.copy2(reference, live)
+
+    workbook = load_workbook(live, data_only=False)
+    workbook.calculation.calcMode = None
+    workbook.save(live)
+    workbook.close()
+
+    assert metrics.workbook_metadata_sha256(live) != legacy_digest
+    with pytest.warns(UserWarning, match="metadata differs"):
+        assert metrics.verify_recorded_workbook_digest(
+            live,
+            stamped_digest=legacy_digest,
+            stamped_scheme=metrics.LEGACY_WORKBOOK_DIGEST_SCHEME,
+            expected_digest=legacy_digest,
+            expected_scheme=metrics.LEGACY_WORKBOOK_DIGEST_SCHEME,
+            legacy_reference_path=reference,
+        ) == legacy_digest
+
+    workbook = load_workbook(live, data_only=False)
+    workbook["Action Board"]["G5"] = "Changed generated location"
+    workbook.save(live)
+    workbook.close()
+    with pytest.raises(metrics.IntegrityError, match="substantive-content verification"):
+        metrics.verify_recorded_workbook_digest(
+            live,
+            stamped_digest=legacy_digest,
+            stamped_scheme=metrics.LEGACY_WORKBOOK_DIGEST_SCHEME,
+            expected_digest=legacy_digest,
+            expected_scheme=metrics.LEGACY_WORKBOOK_DIGEST_SCHEME,
+            legacy_reference_path=reference,
+        )
+
+
+def test_manifest_pinned_legacy_master_requires_one_exact_inventory_entry(
+    tmp_path: Path,
+) -> None:
+    archive_dir = tmp_path / "03 Archive"
+    generated_root = archive_dir / metrics.GENERATED_WORKBOOK_ARCHIVE_FOLDER
+    run_id = "run-123"
+    reference = (
+        generated_root
+        / "week-ending-2026-08-02"
+        / run_id
+        / "published"
+        / "Red_Onion_Server_Master.xlsx"
+    )
+    reference.parent.mkdir(parents=True)
+    build_controlled_workbook(reference)
+    fingerprint = metrics.fingerprint_file(generated_root, reference).to_dict()
+    payload = {
+        "run_id": run_id,
+        "derived_archive_inventory": [fingerprint],
+    }
+
+    assert metrics.manifest_pinned_master_snapshot(archive_dir, payload) == reference
+    payload["derived_archive_inventory"].append(dict(fingerprint))
+    with pytest.raises(metrics.IntegrityError, match="exactly one archived published master"):
+        metrics.manifest_pinned_master_snapshot(archive_dir, payload)
