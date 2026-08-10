@@ -93,12 +93,10 @@ When the repository folder is named exactly `Red Onion Weekly Metrics Automation
 
 - Git is available and the folder is a work tree.
 - `git status --porcelain=v1 --untracked-files=all` is empty.
-- The program source contains no `.pyc` or `.pyo` bytecode artifacts, including
-  ignored `__pycache__` files that do not appear in normal Git status output.
 - The checkout is attached to branch `main`.
 - `HEAD` equals the existing local `refs/remotes/origin/main` commit.
 
-The launcher disables bytecode writes and redirects bytecode lookup to a fresh unused cache path for every run. It does not fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root, but the same source-bytecode safety check applies.
+The launcher permits existing ignored Python bytecode but isolates each run by disabling bytecode writes and redirecting bytecode lookup to a fresh unused cache path. It does not delete those files, fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root.
 
 ## Operational Context And Person-Action Scope
 
@@ -263,10 +261,15 @@ python red_onion_weekly_metrics.py --health-check-json
 The command does not create folders, acquire the workflow lock, install
 packages, generate reports, or access Google Drive. It verifies exact local
 publication through the integrity manifest: exact managed per-location
-workbook bytes plus the protected generated content of the master workbook.
-Approved editable master values, `LAST RUN STATUS.txt`, Dropbox sync, and
-recipient access remain outside that claim. Independent recovery is reported
-as `ExternalCheckRequired` until the current private backup and restore-test
+workbook bytes plus the protected substantive content of the master workbook.
+Generated values, formulas, schema, display-affecting formats, chart content
+and bindings, hidden dimensions, links, drawings, editability, and protection
+remain fail-closed. Proven equivalent Excel serialization defaults are reported
+without blocking only when substantive content matches a manifest-inventoried
+archived master. Approved editable master values, `LAST RUN STATUS.txt`,
+Dropbox sync, and recipient access remain
+outside that claim. Independent recovery is reported as
+`ExternalCheckRequired` until the current private backup and restore-test
 evidence are verified separately.
 
 ## Maintenance Notes

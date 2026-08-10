@@ -28,36 +28,6 @@ function Stop-ReleasePreflight {
     )
 }
 
-function Assert-NoSourceBytecode {
-    # Git intentionally ignores Python bytecode, so a clean status alone cannot
-    # prove that the source directory contains only the reviewed Python files.
-    $BytecodeArtifacts = @(
-        Get-ChildItem -LiteralPath $ProgramDir -Recurse -Force -File |
-            Where-Object { $_.Extension -in @(".pyc", ".pyo") }
-    )
-    if ($BytecodeArtifacts.Count -eq 0) {
-        return
-    }
-
-    $ArtifactPaths = @(
-        $BytecodeArtifacts | ForEach-Object {
-            $_.FullName.Substring($RepositoryRoot.Length).TrimStart("\", "/")
-        }
-    )
-    $Reason = (
-        "The automation source contains Python bytecode that cannot be verified by Git: " +
-        ($ArtifactPaths -join ", ") + "."
-    )
-    if ($IsDeployedCheckout) {
-        Stop-ReleasePreflight $Reason
-    }
-
-    throw (
-        "Launcher safety check failed: $Reason " +
-        "Remove the bytecode artifacts and rerun the launcher."
-    )
-}
-
 function Invoke-LocalGit {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -128,8 +98,6 @@ function Assert-DeployedRelease {
     $env:RED_ONION_VERIFIED_RELEASE_COMMIT = $Head
     Write-Host "Verified deployed release: main at $($Head.Substring(0, 12))."
 }
-
-Assert-NoSourceBytecode
 
 if ($IsDeployedCheckout) {
     Assert-DeployedRelease

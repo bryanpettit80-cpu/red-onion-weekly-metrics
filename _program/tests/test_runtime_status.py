@@ -179,3 +179,58 @@ def test_health_check_does_not_call_empty_integrity_baseline_a_publication(
         check["name"] == "Workbook" and check["status"] == "Attention"
         for check in payload["checks"]
     )
+
+
+def test_health_check_reports_metadata_drift_as_structured_ready_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    archive_dir = tmp_path / "archive"
+    for path in (input_dir, output_dir, archive_dir):
+        path.mkdir()
+    manifest = archive_dir / "weekly.json"
+    manifest_sha256 = "a" * 64
+    monkeypatch.setattr(
+        metrics, "latest_integrity_manifest_path", lambda archive: manifest
+    )
+    monkeypatch.setattr(
+        metrics, "integrity_anchor_exists", lambda archive, anchor: True
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_anchor",
+        lambda archive, anchor: (manifest.resolve(), manifest_sha256),
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_state",
+        lambda archive, output, selected_manifest: (
+            {
+                "kind": "weekly-run",
+                "master_generated_content_sha256": "b" * 64,
+                "published_output_inventory": [{"path": "report.xlsx"}],
+                "_master_metadata_drift": True,
+            },
+            manifest_sha256,
+        ),
+    )
+
+    payload = metrics.build_health_check(
+        Namespace(
+            input_dir=str(input_dir),
+            output_dir=str(output_dir),
+            archive_dir=str(archive_dir),
+            integrity_anchor_dir=str(tmp_path / "anchor"),
+            config=str(tmp_path / "missing-config.json"),
+        )
+    )
+
+    workbook_check = next(
+        check for check in payload["checks"] if check["name"] == "Workbook"
+    )
+    assert workbook_check["status"] == "Ready"
+    assert workbook_check["metadata_drift"] is True
+    assert "metadata differs" in workbook_check["detail"]
+    assert payload["readiness"]["workbook"] == "Ready"

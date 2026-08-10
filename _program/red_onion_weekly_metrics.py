@@ -13,6 +13,7 @@ import stat
 import sys
 import tempfile
 import uuid
+import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,12 +24,13 @@ from typing import Any, Iterable
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell.rich_text import CellRichText
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.data_source import AxDataSource, StrRef
 from openpyxl.chart.series import SeriesLabel
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
-from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.utils import column_index_from_string, get_column_letter, range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.workbook.protection import WorkbookProtection
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -377,7 +379,8 @@ OWNER_ROSTER_HEADERS = ("Owner Name", "Active")
 OWNER_ROSTER_MIN_EDIT_ROWS = 50
 OWNER_ROSTER_SPARE_ROWS = 10
 OWNER_ROSTER_MAX_ROWS = 200
-WORKBOOK_DIGEST_SCHEME = "red-onion-generated-content-v2"
+LEGACY_WORKBOOK_DIGEST_SCHEME = "red-onion-generated-content-v2"
+WORKBOOK_DIGEST_SCHEME = "red-onion-substantive-content-v3"
 RUN_NOTES_DIGEST_LABEL = "Generated Content SHA-256"
 WORKBOOK_PROTECTION_CONTRACT_LABEL = "Protection Contract"
 WORKBOOK_PROTECTION_CONTRACT = "objects-scenarios-stop-validation-v1"
@@ -6574,6 +6577,8 @@ def read_management_state(
     *,
     allow_legacy_protection_upgrade: bool = False,
     expected_digest: str | None = None,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "targets": {},
@@ -6597,6 +6602,8 @@ def read_management_state(
         verify_existing_management_workbook_integrity(
             output_path,
             expected_digest=expected_digest,
+            expected_digest_scheme=expected_digest_scheme,
+            legacy_reference_path=legacy_reference_path,
             allow_legacy_protection_upgrade=allow_legacy_protection_upgrade,
         )
     except Exception:
@@ -6752,6 +6759,26 @@ def workbook_digest_editable_scalar(value: Any, *, sheet_name: str, coordinate: 
     )
 
 
+def reject_external_formula_reference(
+    value: Any,
+    *,
+    data_type: str,
+    sheet_name: str,
+    coordinate: str,
+) -> None:
+    if data_type != "f":
+        return
+    formula = str(value or "")
+    if (
+        re.search(r"\[(?:\d+|[^\]]+\.(?:xlsx?|xlsm|xlsb|csv))\]", formula, re.I)
+        or re.search(r"(?:https?|file)://|\\\\|[A-Za-z]:\\", formula, re.I)
+    ):
+        raise IntegrityError(
+            "External formula references are not allowed in the protected master "
+            f"workbook: {sheet_name}!{coordinate}."
+        )
+
+
 def workbook_digest_dimension_payload(dimension: Any) -> dict[str, Any]:
     payload = {
         "hidden": bool(dimension.hidden),
@@ -6872,6 +6899,58 @@ def reject_unapproved_workbook_drawings(path: Path) -> None:
     try:
         with ZipFile(path) as archive:
             part_names = set(archive.namelist())
+            external_link_parts = sorted(
+                name
+                for name in part_names
+                if name.lower().startswith("xl/externallinks/")
+            )
+            if external_link_parts:
+                raise IntegrityError(
+                    "External workbook links are not allowed in the protected master "
+                    f"workbook ({external_link_parts[0]})."
+                )
+            unsupported_active_parts = sorted(
+                name
+                for name in part_names
+                if name.lower() == "xl/connections.xml"
+                or name.lower().startswith("xl/querytables/")
+                or name.lower() == "xl/vbaproject.bin"
+                or name.lower().startswith("xl/macrosheets/")
+                or name.lower().startswith("xl/dialogsheets/")
+            )
+            if unsupported_active_parts:
+                raise IntegrityError(
+                    "Connections, queries, macros, and other active workbook parts are not "
+                    "allowed in the protected master workbook "
+                    f"({unsupported_active_parts[0]})."
+                )
+            for relationship_part in sorted(
+                name
+                for name in part_names
+                if name.lower().endswith(".rels")
+            ):
+                relationships_root = ElementTree.fromstring(
+                    archive.read(relationship_part)
+                )
+                for relationship in list(relationships_root):
+                    if relationship.attrib.get("TargetMode", "").casefold() != "external":
+                        continue
+                    relationship_type = relationship.attrib.get("Type", "").casefold()
+                    target = relationship.attrib.get("Target", "").strip()
+                    # openpyxl historically serializes an in-workbook fragment as an
+                    # external-mode hyperlink relationship. It is still local when the
+                    # complete target is only a #fragment.
+                    if relationship_type.endswith("/hyperlink") and target.startswith("#"):
+                        continue
+                    if relationship_type.endswith("/hyperlink"):
+                        raise IntegrityError(
+                            "External hyperlinks are not allowed in the protected master "
+                            f"workbook ({relationship_part})."
+                        )
+                    raise IntegrityError(
+                        "External relationships are not allowed in the protected master "
+                        f"workbook ({relationship_part})."
+                    )
             prohibited_binary_parts = sorted(
                 name
                 for name in part_names
@@ -7073,8 +7152,8 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
     return approved
 
 
-def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
-    """Build a stable semantic view that excludes only approved scalar values."""
+def workbook_metadata_payload_v2(path: Path) -> dict[str, Any]:
+    """Reproduce the exact metadata-rich v2 digest contract for old manifests."""
     reject_unapproved_workbook_drawings(path)
     try:
         wb = load_workbook(path, data_only=False, read_only=False)
@@ -7232,6 +7311,742 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
         wb.close()
 
 
+def workbook_metadata_sha256(path: Path) -> str:
+    """Return the legacy v2 metadata-rich digest without reinterpreting it."""
+
+    return canonical_json_sha256(workbook_metadata_payload_v2(path))
+
+
+def workbook_internal_hyperlink_destination(
+    hyperlink: Any,
+    *,
+    sheet_name: str,
+    coordinate: str,
+) -> str | None:
+    """Return one canonical in-workbook destination across Excel serializations."""
+
+    if hyperlink is None:
+        return None
+    target = str(hyperlink.target or "").strip()
+    location = str(hyperlink.location or "").strip()
+    if target and not target.startswith("#"):
+        raise IntegrityError(
+            "External hyperlinks are not allowed in the protected master workbook: "
+            f"{sheet_name}!{coordinate}."
+        )
+    destinations = [value.lstrip("#").strip() for value in (target, location) if value]
+    if any(
+        re.search(r"(?:https?|file)://|\\\\|[A-Za-z]:[\\/]", value, re.I)
+        or value.startswith(("/", "../", "..\\"))
+        for value in destinations
+    ):
+        raise IntegrityError(
+            "External hyperlinks are not allowed in the protected master workbook: "
+            f"{sheet_name}!{coordinate}."
+        )
+    if not destinations:
+        raise IntegrityError(
+            f"Workbook hyperlink has no internal destination: {sheet_name}!{coordinate}."
+        )
+    if len(set(destinations)) != 1:
+        raise IntegrityError(
+            f"Workbook hyperlink has conflicting destinations: {sheet_name}!{coordinate}."
+        )
+    return destinations[0]
+
+
+def workbook_semantic_hyperlink_payload(
+    hyperlink: Any,
+    *,
+    sheet_name: str,
+    coordinate: str,
+) -> dict[str, Any] | None:
+    if hyperlink is None:
+        return None
+    return {
+        "destination": workbook_internal_hyperlink_destination(
+            hyperlink,
+            sheet_name=sheet_name,
+            coordinate=coordinate,
+        ),
+        "tooltip": hyperlink.tooltip,
+        "display": hyperlink.display,
+    }
+
+
+def workbook_hyperlink_matches(
+    hyperlink: Any,
+    expected: str,
+    *,
+    sheet_name: str,
+    coordinate: str,
+) -> bool:
+    if hyperlink is None:
+        return False
+    return workbook_internal_hyperlink_destination(
+        hyperlink,
+        sheet_name=sheet_name,
+        coordinate=coordinate,
+    ) == str(expected).strip().lstrip("#")
+
+
+def workbook_semantic_table_payload(table: Any) -> dict[str, Any]:
+    columns = []
+    for column in table.tableColumns:
+        calculated = getattr(column, "calculatedColumnFormula", None)
+        totals = getattr(column, "totalsRowFormula", None)
+        columns.append(
+            {
+                "id": column.id,
+                "name": column.name,
+                "totals_row_function": getattr(column, "totalsRowFunction", None),
+                "totals_row_label": getattr(column, "totalsRowLabel", None),
+                "unique_name": getattr(column, "uniqueName", None),
+                "query_table_field_id": getattr(column, "queryTableFieldId", None),
+                "header_row_dxf_id": getattr(column, "headerRowDxfId", None),
+                "data_dxf_id": getattr(column, "dataDxfId", None),
+                "totals_row_dxf_id": getattr(column, "totalsRowDxfId", None),
+                "header_row_cell_style": getattr(column, "headerRowCellStyle", None),
+                "data_cell_style": getattr(column, "dataCellStyle", None),
+                "totals_row_cell_style": getattr(column, "totalsRowCellStyle", None),
+                "calculated_formula": getattr(calculated, "text", None),
+                "totals_formula": getattr(totals, "text", None),
+            }
+        )
+    return {
+        "name": table.name,
+        "display_name": table.displayName,
+        "ref": table.ref,
+        "table_type": table.tableType,
+        "header_row_count": table.headerRowCount,
+        "totals_row_count": table.totalsRowCount,
+        "totals_row_shown": table.totalsRowShown,
+        "auto_filter": workbook_digest_serialisable(table.autoFilter),
+        "sort_state": workbook_digest_serialisable(table.sortState),
+        "style": workbook_digest_serialisable(table.tableStyleInfo),
+        "columns": columns,
+    }
+
+
+def workbook_semantic_validation_payload(validation: Any) -> dict[str, Any]:
+    return {
+        "type": validation.type,
+        "operator": validation.operator,
+        "formula1": validation.formula1,
+        "formula2": validation.formula2,
+        "sqref": str(validation.sqref),
+        "allow_blank": bool(validation.allowBlank),
+        "show_drop_down": bool(validation.showDropDown),
+        "show_input": bool(validation.showInputMessage),
+        "show_error": bool(validation.showErrorMessage),
+        "error_style": (
+            validation.errorStyle
+            or ("stop" if validation.showErrorMessage is not False else None)
+        ),
+        "error_title": validation.errorTitle,
+        "error": validation.error,
+        "prompt_title": validation.promptTitle,
+        "prompt": validation.prompt,
+        "ime_mode": validation.imeMode,
+    }
+
+
+def workbook_semantic_workbook_protection_payload(protection: Any) -> dict[str, Any] | None:
+    if protection is None:
+        return None
+    return {
+        "lock_structure": bool(protection.lockStructure),
+        "lock_windows": bool(protection.lockWindows),
+        "lock_revision": bool(protection.lockRevision),
+        "workbook_password": protection.workbookPassword,
+        "revisions_password": protection.revisionsPassword,
+        "workbook_algorithm": protection.workbookAlgorithmName,
+        "workbook_hash": protection.workbookHashValue,
+        "workbook_salt": protection.workbookSaltValue,
+        "workbook_spin_count": protection.workbookSpinCount,
+        "revisions_algorithm": protection.revisionsAlgorithmName,
+        "revisions_hash": protection.revisionsHashValue,
+        "revisions_salt": protection.revisionsSaltValue,
+        "revisions_spin_count": protection.revisionsSpinCount,
+    }
+
+
+def workbook_semantic_number_format(number_format: str) -> str:
+    """Normalize only Excel escape spelling that preserves literal display text."""
+
+    return re.sub(r"\\([$+\-])", r"\1", number_format)
+
+
+def workbook_semantic_style_payload(styleable: Any) -> dict[str, Any]:
+    """Capture visible style semantics without relying on workbook style IDs."""
+
+    return {
+        "font": workbook_digest_serialisable(styleable.font),
+        "fill": workbook_digest_serialisable(styleable.fill),
+        "border": workbook_digest_serialisable(styleable.border),
+        "alignment": workbook_digest_serialisable(styleable.alignment),
+        "number_format": workbook_semantic_number_format(styleable.number_format),
+        "protection": workbook_digest_serialisable(styleable.protection),
+    }
+
+
+def workbook_semantic_calculation_payload(calculation: Any) -> dict[str, Any]:
+    """Keep calculation behavior while normalizing omitted OOXML defaults."""
+
+    return {
+        # calcId identifies the Excel calculation-engine build, not behavior.
+        "calc_mode": calculation.calcMode or "auto",
+        "full_calc_on_load": calculation.fullCalcOnLoad is not False,
+        "force_full_calc": calculation.forceFullCalc is not False,
+        "reference_mode": calculation.refMode or "A1",
+        "iterate": bool(calculation.iterate),
+        "iterate_count": (
+            calculation.iterateCount
+            if calculation.iterateCount is not None
+            else 100
+        ),
+        "iterate_delta": (
+            calculation.iterateDelta
+            if calculation.iterateDelta is not None
+            else 0.001
+        ),
+        "full_precision": (
+            True if calculation.fullPrecision is None else bool(calculation.fullPrecision)
+        ),
+        "calculation_completed": (
+            True if calculation.calcCompleted is None else bool(calculation.calcCompleted)
+        ),
+        "calculate_on_save": (
+            True if calculation.calcOnSave is None else bool(calculation.calcOnSave)
+        ),
+        "concurrent_calculation": (
+            True if calculation.concurrentCalc is None else bool(calculation.concurrentCalc)
+        ),
+        "concurrent_manual_count": calculation.concurrentManualCount,
+    }
+
+
+def workbook_chart_semantic_xml(node: Any) -> dict[str, Any] | None:
+    """Serialize chart semantics fail-closed, excluding only derived data caches."""
+
+    local = str(node.tag).rsplit("}", 1)[-1]
+    if local in {"numCache", "strCache", "multiLvlStrCache"}:
+        # These values are derived from protected worksheet cells and Excel may add or
+        # discard them on open/save. The source formula remains part of the digest.
+        return None
+    raw_attributes = {
+        str(key).rsplit("}", 1)[-1]: str(value)
+        for key, value in sorted(node.attrib.items(), key=lambda item: str(item[0]))
+    }
+    if "formatCode" in raw_attributes:
+        raw_attributes["formatCode"] = workbook_semantic_number_format(
+            raw_attributes["formatCode"]
+        )
+    if local == "smooth" and raw_attributes.get("val", "0").casefold() in {
+        "0", "false",
+    }:
+        return None
+    text = (
+        str(node.text).strip()
+        if node.text is not None and str(node.text).strip()
+        else None
+    )
+    if local == "f" and text is not None:
+        # Excel may add/remove absolute-reference markers without changing the source.
+        text = text.replace("$", "")
+    children = [
+        payload
+        for child in list(node)
+        if (payload := workbook_chart_semantic_xml(child)) is not None
+    ]
+    if local == "dLbls" and not raw_attributes and text is None:
+        false_label_tags = {
+            "showLegendKey", "showVal", "showCatName", "showSerName",
+            "showPercent", "showBubbleSize", "showLeaderLines", "showMarker",
+        }
+        if all(
+            child["tag"] in false_label_tags
+            and child["attributes"].get("val", "0").casefold() in {"0", "false"}
+            and not child["children"]
+            for child in children
+        ):
+            return None
+    if (
+        local == "numFmt"
+        and raw_attributes.get("formatCode") == "General"
+        and raw_attributes.get("sourceLinked", "1").casefold() in {"1", "true"}
+        and set(raw_attributes) <= {"formatCode", "sourceLinked"}
+        and text is None
+        and not children
+    ):
+        return None
+    return {
+        "tag": local,
+        "attributes": raw_attributes,
+        "text": text,
+        "children": children,
+    }
+
+
+def workbook_chart_semantic_part(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        payload = workbook_chart_semantic_xml(value.to_tree())
+        if (
+            payload is not None
+            and not payload["attributes"]
+            and payload["text"] is None
+            and not payload["children"]
+        ):
+            return None
+        return payload
+    except Exception as exc:
+        raise IntegrityError(
+            f"Workbook integrity could not inspect chart semantics: {exc}"
+        ) from exc
+
+
+def workbook_chart_anchor_payload(anchor: Any) -> dict[str, Any]:
+    """Bind chart position and meaningful size while ignoring tiny EMU rounding."""
+
+    if isinstance(anchor, str):
+        return {"type": "cell", "coordinate": anchor}
+
+    def emu(value: Any) -> int | None:
+        if value is None:
+            return None
+        return int(round(int(value) / 10_000.0) * 10_000)
+
+    def marker(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return {
+            "column": value.col,
+            "row": value.row,
+            "column_offset": emu(value.colOff),
+            "row_offset": emu(value.rowOff),
+        }
+
+    extent = getattr(anchor, "ext", None)
+    position = getattr(anchor, "pos", None)
+    return {
+        "type": type(anchor).__name__,
+        "from": marker(getattr(anchor, "_from", None)),
+        "to": marker(getattr(anchor, "to", None)),
+        "position": (
+            {"x": emu(position.x), "y": emu(position.y)}
+            if position is not None
+            else None
+        ),
+        "extent": (
+            {"width": emu(extent.cx), "height": emu(extent.cy)}
+            if extent is not None
+            else None
+        ),
+        "edit_as": getattr(anchor, "editAs", None),
+    }
+
+
+def workbook_chart_semantic_payload(chart: Any) -> dict[str, Any]:
+    """Keep chart sources, ordering, labels, titles, axes, and display semantics."""
+
+    plots = list(getattr(chart, "_charts", None) or [chart])
+    plot_payloads: list[dict[str, Any]] = []
+    all_axes: dict[str, Any] = {}
+    for plot in plots:
+        plot_payloads.append(
+            {
+                "type": type(plot).__name__,
+                "definition": workbook_chart_semantic_part(plot),
+            }
+        )
+        axes = getattr(plot, "_axes", None) or {}
+        axis_items = axes.items() if hasattr(axes, "items") else enumerate(axes)
+        for axis_id, axis in axis_items:
+            all_axes[str(axis_id)] = axis
+    return {
+        "type": type(chart).__name__,
+        "plots": plot_payloads,
+        # openpyxl's chart.to_tree() contains only the plot. These chart-space
+        # components must be serialized separately or visible title/axis tampering
+        # would not affect the digest.
+        "title": workbook_chart_semantic_part(getattr(chart, "title", None)),
+        "legend": workbook_chart_semantic_part(getattr(chart, "legend", None)),
+        "layout": workbook_chart_semantic_part(getattr(chart, "layout", None)),
+        "graphical_properties": workbook_chart_semantic_part(
+            getattr(chart, "graphical_properties", None)
+        ),
+        "axes": [
+            {
+                "id": axis_id,
+                "definition": workbook_chart_semantic_part(axis),
+            }
+            for axis_id, axis in sorted(all_axes.items(), key=lambda item: item[0])
+        ],
+        "style": getattr(chart, "style", None),
+        "rounded_corners": getattr(chart, "roundedCorners", None),
+        "display_blanks": getattr(chart, "display_blanks", None),
+        "visible_cells_only": getattr(chart, "visible_cells_only", None),
+        "index_base": getattr(chart, "idx_base", None),
+        "pivot_source": workbook_chart_semantic_part(
+            getattr(chart, "pivotSource", None)
+        ),
+        "pivot_formats": [
+            workbook_chart_semantic_part(pivot_format)
+            for pivot_format in (getattr(chart, "pivotFormats", None) or [])
+        ],
+        "anchor": workbook_chart_anchor_payload(chart.anchor),
+    }
+
+
+def workbook_semantic_conditional_formatting_payload(ws: Any) -> list[dict[str, Any]]:
+    def normalized_xml(
+        node: Any,
+        *,
+        ignored_attributes: frozenset[str] = frozenset(),
+        normalize_argb: bool = False,
+    ) -> dict[str, Any]:
+        attributes: dict[str, str] = {}
+        for key, value in sorted(node.attrib.items(), key=lambda item: str(item[0])):
+            local_key = str(key).rsplit("}", 1)[-1]
+            if local_key in ignored_attributes:
+                continue
+            text = str(value)
+            if local_key == "formatCode":
+                text = workbook_semantic_number_format(text)
+            if normalize_argb and local_key in {"rgb", "fgColor", "bgColor"}:
+                text = text[-6:].upper()
+            attributes[local_key] = text
+        return {
+            "tag": str(node.tag).rsplit("}", 1)[-1],
+            "attributes": attributes,
+            "text": node.text,
+            "children": [
+                normalized_xml(
+                    child,
+                    ignored_attributes=ignored_attributes,
+                    normalize_argb=normalize_argb,
+                )
+                for child in list(node)
+            ],
+        }
+
+    payload: list[dict[str, Any]] = []
+    for conditional_format in ws.conditional_formatting:
+        payload.append(
+            {
+                "range": str(conditional_format.sqref),
+                "rules": [
+                    {
+                        "definition": normalized_xml(
+                            rule.to_tree(),
+                            ignored_attributes=frozenset({"dxfId"}),
+                        ),
+                        "differential_style": (
+                            normalized_xml(rule.dxf.to_tree(), normalize_argb=True)
+                            if rule.dxf is not None
+                            else None
+                        ),
+                    }
+                    for rule in conditional_format.rules
+                ],
+            }
+        )
+    return payload
+
+
+def workbook_semantic_dimension_payload(dimension: Any) -> dict[str, Any]:
+    payload = {
+        "hidden": bool(dimension.hidden),
+        "outline_level": dimension.outlineLevel,
+        "collapsed": bool(dimension.collapsed),
+        "style": (
+            workbook_semantic_style_payload(dimension)
+            if dimension.has_style
+            else None
+        ),
+    }
+    for attribute in ("width", "bestFit", "height", "thickTop", "thickBot"):
+        if hasattr(dimension, attribute):
+            value = getattr(dimension, attribute)
+            if attribute in {"width", "height"} and value is not None:
+                # Excel may round effective widths/heights by a few hundredths.
+                value = round(float(value) * 4) / 4
+            payload[attribute] = value
+    return payload
+
+
+def workbook_semantic_column_dimensions_payload(ws: Any) -> list[dict[str, Any]]:
+    """Canonicalize grouped/split column records to effective per-column state."""
+
+    effective: dict[int, dict[str, Any]] = {}
+    for index, dimension in ws.column_dimensions.items():
+        default_index = column_index_from_string(str(index))
+        start = dimension.min or default_index
+        end = dimension.max or start
+        payload = workbook_semantic_dimension_payload(dimension)
+        for column in range(start, end + 1):
+            effective[column] = payload
+    return [
+        {"index": get_column_letter(column), **effective[column]}
+        for column in sorted(effective)
+    ]
+
+
+def workbook_semantic_sheet_format_payload(sheet_format: Any) -> dict[str, Any]:
+    def size(value: Any) -> float | None:
+        return None if value is None else round(float(value), 4)
+
+    return {
+        "base_column_width": sheet_format.baseColWidth,
+        "default_column_width": size(sheet_format.defaultColWidth),
+        "default_row_height": size(sheet_format.defaultRowHeight),
+        "custom_height": bool(sheet_format.customHeight),
+        "zero_height": bool(sheet_format.zeroHeight),
+        "thick_top": bool(sheet_format.thickTop),
+        "thick_bottom": bool(sheet_format.thickBottom),
+        "outline_level_row": sheet_format.outlineLevelRow,
+        "outline_level_column": sheet_format.outlineLevelCol,
+    }
+
+
+def workbook_semantic_sheet_view_payload(view: Any) -> dict[str, Any]:
+    return {
+        "show_formulas": bool(view.showFormulas),
+        "show_zeros": True if view.showZeros is None else bool(view.showZeros),
+    }
+
+
+def workbook_semantic_defined_name_payload(
+    name: str, defined_name: Any
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "text": defined_name.attr_text,
+        "type": defined_name.type,
+        "local_sheet_id": defined_name.localSheetId,
+        "hidden": bool(defined_name.hidden),
+        "function": bool(defined_name.function),
+        "vb_procedure": bool(defined_name.vbProcedure),
+        "xlm": bool(defined_name.xlm),
+    }
+
+
+def workbook_semantic_theme_payload(theme: bytes | str | None) -> dict[str, Any] | None:
+    """Canonicalize the full theme because colors, fonts, and charts may reference it."""
+
+    if theme is None:
+        return None
+    from xml.etree import ElementTree
+
+    try:
+        root = ElementTree.fromstring(theme)
+    except (ElementTree.ParseError, TypeError, ValueError) as exc:
+        raise IntegrityError(f"Workbook theme XML is invalid: {exc}") from exc
+
+    def semantic_xml(node: Any) -> dict[str, Any]:
+        text = (
+            str(node.text).strip()
+            if node.text is not None and str(node.text).strip()
+            else None
+        )
+        return {
+            "tag": str(node.tag).rsplit("}", 1)[-1],
+            "attributes": {
+                str(key).rsplit("}", 1)[-1]: str(value)
+                for key, value in sorted(
+                    node.attrib.items(), key=lambda item: str(item[0])
+                )
+            },
+            "text": text,
+            "children": [semantic_xml(child) for child in list(node)],
+        }
+
+    return semantic_xml(root)
+
+
+def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
+    """Build the v3 substantive view with only proven equivalent serialization normalized."""
+
+    reject_unapproved_workbook_drawings(path)
+    try:
+        wb = load_workbook(
+            path,
+            data_only=False,
+            read_only=False,
+            rich_text=True,
+        )
+    except Exception as exc:
+        raise IntegrityError(f"Could not inspect master workbook integrity at {path}: {exc}") from exc
+    try:
+        if getattr(wb, "_external_links", []):
+            raise IntegrityError(
+                "External workbook links are not allowed in the protected master workbook."
+            )
+        approved = approved_management_input_cells(wb)
+        digest_cells = workbook_digest_excluded_cells(wb)
+        sheets: list[dict[str, Any]] = []
+        for ws in wb.worksheets:
+            if ws._images:
+                raise IntegrityError(
+                    "Images and non-chart drawings are not allowed in the protected master "
+                    f"workbook ({ws.title!r})."
+                )
+            cells: list[dict[str, Any]] = []
+            for cell in sorted(ws._cells.values(), key=lambda item: (item.row, item.column)):
+                key = (ws.title, cell.coordinate)
+                if isinstance(cell.value, CellRichText):
+                    raise IntegrityError(
+                        "Rich-text cells are not allowed in the protected master workbook: "
+                        f"{ws.title}!{cell.coordinate}."
+                    )
+                reject_external_formula_reference(
+                    cell.value,
+                    data_type=cell.data_type,
+                    sheet_name=ws.title,
+                    coordinate=cell.coordinate,
+                )
+                is_approved = key in approved
+                is_digest_cell = key in digest_cells
+                hyperlink = workbook_semantic_hyperlink_payload(
+                    cell.hyperlink,
+                    sheet_name=ws.title,
+                    coordinate=cell.coordinate,
+                )
+                if (
+                    cell.value is None
+                    and hyperlink is None
+                    and cell.comment is None
+                    and not cell.has_style
+                    and not is_approved
+                    and not is_digest_cell
+                ):
+                    continue
+                if is_approved or is_digest_cell:
+                    if cell.data_type == "f":
+                        raise IntegrityError(
+                            "Formulas are not allowed in editable or digest-excluded cells: "
+                            f"{ws.title}!{cell.coordinate}."
+                        )
+                    workbook_digest_editable_scalar(
+                        cell.value,
+                        sheet_name=ws.title,
+                        coordinate=cell.coordinate,
+                    )
+                    value_payload: Any = {
+                        "excluded": (
+                            "approved-management-scalar"
+                            if is_approved
+                            else "self-referential-digest"
+                        )
+                    }
+                    value_type = "excluded-scalar"
+                else:
+                    value_payload = workbook_digest_value(cell.value)
+                    value_type = "formula" if cell.data_type == "f" else "scalar"
+                cells.append(
+                    {
+                        "coordinate": cell.coordinate,
+                        "value_type": value_type,
+                        "value": value_payload,
+                        "data_type": (
+                            None if is_approved or is_digest_cell else cell.data_type
+                        ),
+                        "quote_prefix": bool(cell.quotePrefix),
+                        "pivot_button": bool(cell.pivotButton),
+                        # Preserve effective display semantics while excluding only
+                        # workbook-internal style IDs/serialization ordering.
+                        "style": workbook_semantic_style_payload(cell),
+                        "hyperlink": hyperlink,
+                        "comment": (
+                            {
+                                "text": cell.comment.text,
+                                "author": cell.comment.author,
+                            }
+                            if cell.comment is not None
+                            else None
+                        ),
+                        "protection": {
+                            "locked": bool(cell.protection.locked),
+                            "hidden": bool(cell.protection.hidden),
+                        },
+                    }
+                )
+            sheets.append(
+                {
+                    "name": ws.title,
+                    "state": ws.sheet_state,
+                    "cells": cells,
+                    "tables": sorted(
+                        (
+                            workbook_semantic_table_payload(table)
+                            for table in ws.tables.values()
+                        ),
+                        key=lambda item: item["name"].casefold(),
+                    ),
+                    "data_validations": {
+                        "disable_prompts": bool(ws.data_validations.disablePrompts),
+                        "items": [
+                            workbook_semantic_validation_payload(validation)
+                            for validation in ws.data_validations.dataValidation
+                        ],
+                    },
+                    "conditional_formats": (
+                        workbook_semantic_conditional_formatting_payload(ws)
+                    ),
+                    "charts": [
+                        workbook_chart_semantic_payload(chart)
+                        for chart in ws._charts
+                    ],
+                    "merged_cells": sorted(
+                        str(cell_range) for cell_range in ws.merged_cells.ranges
+                    ),
+                    "row_dimensions": [
+                        {
+                            "index": index,
+                            **workbook_semantic_dimension_payload(dimension),
+                        }
+                        for index, dimension in sorted(ws.row_dimensions.items())
+                    ],
+                    "column_dimensions": workbook_semantic_column_dimensions_payload(ws),
+                    "sheet_format": workbook_semantic_sheet_format_payload(
+                        ws.sheet_format
+                    ),
+                    "sheet_view": workbook_semantic_sheet_view_payload(ws.sheet_view),
+                    "auto_filter": workbook_digest_serialisable(ws.auto_filter),
+                    "unlocked_cells": sorted(
+                        cell.coordinate
+                        for cell in ws._cells.values()
+                        if cell.protection.locked is False
+                    ),
+                    "protection": workbook_digest_serialisable(ws.protection),
+                }
+            )
+        return {
+            "digest_scheme": WORKBOOK_DIGEST_SCHEME,
+            "sheet_order": list(wb.sheetnames),
+            "calculation": workbook_semantic_calculation_payload(wb.calculation),
+            "theme": workbook_semantic_theme_payload(wb.loaded_theme),
+            "indexed_colors": list(getattr(wb, "_colors", ()) or ()),
+            "table_styles": workbook_digest_serialisable(
+                getattr(wb, "_table_styles", None)
+            ),
+            "workbook_protection": workbook_semantic_workbook_protection_payload(
+                wb.security
+            ),
+            "defined_names": [
+                workbook_semantic_defined_name_payload(name, defined_name)
+                for name, defined_name in sorted(
+                    wb.defined_names.items(), key=lambda item: item[0].casefold()
+                )
+            ],
+            "sheets": sheets,
+        }
+    finally:
+        wb.close()
+
+
 def workbook_generated_content_sha256(path: Path) -> str:
     return canonical_json_sha256(workbook_generated_content_payload(path))
 
@@ -7253,6 +8068,23 @@ def stamped_workbook_digest(wb: Workbook) -> str | None:
     return str(value).strip().lower() if value else None
 
 
+def stamped_workbook_digest_scheme(wb: Workbook) -> str | None:
+    if "Run Notes" not in wb.sheetnames:
+        return None
+    ws = wb["Run Notes"]
+    rows = [
+        row
+        for row in range(1, ws.max_row + 1)
+        if ws.cell(row=row, column=1).value == "Digest Scheme"
+    ]
+    if len(rows) > 1:
+        raise IntegrityError("Run Notes contains a duplicated digest scheme field.")
+    if not rows:
+        return None
+    value = ws.cell(row=rows[0], column=2).value
+    return str(value).strip() if value is not None else ""
+
+
 def stamped_workbook_protection_contract(wb: Workbook) -> str | None:
     if "Run Notes" not in wb.sheetnames:
         return None
@@ -7271,11 +8103,29 @@ def stamped_workbook_protection_contract(wb: Workbook) -> str | None:
 
 
 def stamp_generated_content_digest(path: Path) -> str:
-    digest = workbook_generated_content_sha256(path)
     wb = load_workbook(path, data_only=False)
     try:
         if "Run Notes" not in wb.sheetnames:
             raise IntegrityError("Generated master workbook is missing Run Notes.")
+        ws = wb["Run Notes"]
+        scheme_rows = [
+            row
+            for row in range(1, ws.max_row + 1)
+            if ws.cell(row=row, column=1).value == "Digest Scheme"
+        ]
+        if len(scheme_rows) > 1:
+            raise IntegrityError("Run Notes contains a duplicated digest scheme field.")
+        if scheme_rows:
+            ws.cell(row=scheme_rows[0], column=2, value=WORKBOOK_DIGEST_SCHEME)
+        else:
+            ws.append(["Digest Scheme", WORKBOOK_DIGEST_SCHEME])
+        wb.save(path)
+    finally:
+        wb.close()
+
+    digest = workbook_generated_content_sha256(path)
+    wb = load_workbook(path, data_only=False)
+    try:
         ws = wb["Run Notes"]
         digest_rows = [
             row
@@ -7313,7 +8163,7 @@ def require_stop_style_list_validation(
     validation = matches[0]
     if (
         validation.showErrorMessage is not True
-        or validation.errorStyle != "stop"
+        or validation.errorStyle not in (None, "stop")
         or bool(validation.allowBlank) is not allow_blank
         or str(validation.sqref) != sqref
         or not validation.errorTitle
@@ -7459,12 +8309,23 @@ def validate_management_workbook_controls(
     if not wb.security.workbookPassword:
         raise IntegrityError("Generated master workbook structure password is missing.")
     if (
-        wb.calculation.calcMode != "auto"
-        or wb.calculation.fullCalcOnLoad is not True
-        or wb.calculation.forceFullCalc is not True
+        wb.calculation.calcMode not in (None, "auto")
+        or wb.calculation.fullCalcOnLoad is False
+        or wb.calculation.forceFullCalc is False
     ):
         raise IntegrityError(
-            "Generated master workbook automatic/full recalculation controls are missing."
+            "Generated master workbook has explicit unsafe calculation settings."
+        )
+    if (
+        wb.calculation.calcMode is None
+        or wb.calculation.fullCalcOnLoad is None
+        or wb.calculation.forceFullCalc is None
+    ):
+        warnings.warn(
+            "Excel omitted default workbook calculation flags; they will be repaired on the "
+            "next successful generated save.",
+            UserWarning,
+            stacklevel=2,
         )
     approved = approved_management_input_cells(wb)
     actual_unlocked = {
@@ -7573,14 +8434,20 @@ def require_current_workbook_usability_contract(
         raise IntegrityError("How to Use must not contain drawings.")
     if any(cell.comment is not None for cell in guide._cells.values()):
         raise IntegrityError("How to Use must not contain comments.")
-    if guide.freeze_panes != "A3":
-        raise IntegrityError("How to Use must freeze the title and navigation rows.")
-    if guide.sheet_view.zoomScale != 85:
-        raise IntegrityError("How to Use must use the approved 85% zoom.")
-    for column in range(1, 13):
-        letter = get_column_letter(column)
-        if guide.column_dimensions[letter].width != 13:
-            raise IntegrityError("How to Use must use uniform A:L column widths.")
+    if (
+        guide.freeze_panes != "A3"
+        or guide.sheet_view.zoomScale != 85
+        or any(
+            guide.column_dimensions[get_column_letter(column)].width != 13
+            for column in range(1, 13)
+        )
+    ):
+        warnings.warn(
+            "Excel rewrote How to Use view or sizing metadata; the generated workbook "
+            "will repair it on the next successful run.",
+            UserWarning,
+            stacklevel=2,
+        )
     guide_text = {
         str(cell.value)
         for cell in guide._cells.values()
@@ -7658,10 +8525,79 @@ def require_current_workbook_usability_contract(
         )
 
 
+def verify_recorded_workbook_digest(
+    path: Path,
+    *,
+    stamped_digest: str | None,
+    stamped_scheme: str | None,
+    expected_digest: str | None,
+    expected_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
+) -> str:
+    """Verify v3 directly or use a manifest-pinned archive for v2 drift."""
+
+    required_digest = str(expected_digest or stamped_digest or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
+        raise IntegrityError("The master workbook requires a valid recorded digest.")
+    if stamped_digest != required_digest:
+        raise IntegrityError(
+            "Master workbook stamped digest does not match the manifest-recorded digest."
+        )
+    scheme = expected_scheme or stamped_scheme or LEGACY_WORKBOOK_DIGEST_SCHEME
+    if expected_scheme and stamped_scheme and expected_scheme != stamped_scheme:
+        raise IntegrityError(
+            "Master workbook digest scheme does not match the manifest-recorded scheme."
+        )
+    if scheme == WORKBOOK_DIGEST_SCHEME:
+        actual_digest = workbook_generated_content_sha256(path)
+        if actual_digest != required_digest:
+            raise IntegrityError(
+                "Master workbook generated-content verification failed: "
+                "substantive-content verification "
+                f"expected {required_digest}; actual {actual_digest}. "
+                "No outputs were replaced and no active source files were moved."
+            )
+        return actual_digest
+    if scheme != LEGACY_WORKBOOK_DIGEST_SCHEME:
+        raise IntegrityError(f"Unsupported master workbook digest scheme: {scheme!r}.")
+
+    actual_legacy_digest = workbook_metadata_sha256(path)
+    if actual_legacy_digest == required_digest:
+        return required_digest
+    if legacy_reference_path is None:
+        raise IntegrityError(
+            "Master workbook generated-content verification failed under the legacy v2 "
+            f"contract: expected {required_digest}; actual {actual_legacy_digest}."
+        )
+    reference_legacy_digest = workbook_metadata_sha256(legacy_reference_path)
+    if reference_legacy_digest != required_digest:
+        raise IntegrityError(
+            "The manifest-pinned archived master does not match its legacy v2 digest."
+        )
+    actual_substantive = workbook_generated_content_sha256(path)
+    reference_substantive = workbook_generated_content_sha256(legacy_reference_path)
+    if actual_substantive != reference_substantive:
+        raise IntegrityError(
+            "Master workbook generated-content verification failed: "
+            "substantive-content verification failed against the "
+            "manifest-pinned archived master. Restore the archived generated workbook "
+            "before rerunning."
+        )
+    warnings.warn(
+        "Master workbook metadata differs under the legacy v2 digest; its substantive "
+        "content matches the manifest-pinned archived master.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return required_digest
+
+
 def validate_management_workbook(
     path: Path,
     expected_digest: str | None = None,
     *,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
     previous_v2_usability: bool = False,
     previous_tab_navigation: bool = False,
     visible_sheets: Iterable[str] | None = None,
@@ -7707,24 +8643,26 @@ def validate_management_workbook(
                 sqref=sqref,
             )
         stamped = stamped_workbook_digest(wb)
+        stamped_scheme = stamped_workbook_digest_scheme(wb)
     finally:
         wb.close()
-    actual_digest = workbook_generated_content_sha256(path)
-    required_digest = expected_digest.lower() if expected_digest else stamped
-    if expected_digest and stamped != required_digest:
-        raise IntegrityError(
-            "Master workbook stamped digest does not match the manifest-recorded digest."
-        )
-    if not required_digest or actual_digest != required_digest.lower():
-        raise IntegrityError(
-            "Master workbook generated-content verification failed: "
-            f"expected {required_digest or 'a stamped digest'}; actual {actual_digest}. "
-            "No outputs were replaced and no active source files were moved."
-        )
-    return actual_digest
+    return verify_recorded_workbook_digest(
+        path,
+        stamped_digest=stamped,
+        stamped_scheme=stamped_scheme,
+        expected_digest=expected_digest,
+        expected_scheme=expected_digest_scheme,
+        legacy_reference_path=legacy_reference_path,
+    )
 
 
-def validate_pre_guide_management_workbook(path: Path, expected_digest: str) -> str:
+def validate_pre_guide_management_workbook(
+    path: Path,
+    expected_digest: str,
+    *,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
+) -> str:
     """Verify the exact protected v0.3.1 workbook before adding the guide."""
 
     required_digest = str(expected_digest).strip().lower()
@@ -7753,18 +8691,26 @@ def validate_pre_guide_management_workbook(path: Path, expected_digest: str) -> 
                 sqref=sqref,
             )
         stamped = stamped_workbook_digest(wb)
+        stamped_scheme = stamped_workbook_digest_scheme(wb)
     finally:
         wb.close()
-    actual_digest = workbook_generated_content_sha256(path)
-    if stamped != required_digest or actual_digest != required_digest:
-        raise IntegrityError(
-            "Pre-guide workbook verification failed: the recorded, stamped, and actual "
-            "generated-content digests must match exactly."
-        )
-    return actual_digest
+    return verify_recorded_workbook_digest(
+        path,
+        stamped_digest=stamped,
+        stamped_scheme=stamped_scheme,
+        expected_digest=required_digest,
+        expected_scheme=expected_digest_scheme,
+        legacy_reference_path=legacy_reference_path,
+    )
 
 
-def validate_v1_action_focus_workbook(path: Path, expected_digest: str) -> str:
+def validate_v1_action_focus_workbook(
+    path: Path,
+    expected_digest: str,
+    *,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
+) -> str:
     """Verify the exact v0.2.x protected workbook before one-way v2 migration."""
 
     required_digest = str(expected_digest).strip().lower()
@@ -7793,19 +8739,25 @@ def validate_v1_action_focus_workbook(path: Path, expected_digest: str) -> str:
                 sqref=sqref,
             )
         stamped = stamped_workbook_digest(wb)
+        stamped_scheme = stamped_workbook_digest_scheme(wb)
     finally:
         wb.close()
-    actual_digest = workbook_generated_content_sha256(path)
-    if stamped != required_digest or actual_digest != required_digest:
-        raise IntegrityError(
-            "V1 workbook verification failed: the recorded, stamped, and actual "
-            "generated-content digests must match exactly."
-        )
-    return actual_digest
+    return verify_recorded_workbook_digest(
+        path,
+        stamped_digest=stamped,
+        stamped_scheme=stamped_scheme,
+        expected_digest=required_digest,
+        expected_scheme=expected_digest_scheme,
+        legacy_reference_path=legacy_reference_path,
+    )
 
 
 def validate_previous_action_schema_workbook(
-    path: Path, expected_digest: str
+    path: Path,
+    expected_digest: str,
+    *,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
 ) -> str:
     """Verify the exact manifest-bound workbook emitted before Action Focus."""
 
@@ -7839,18 +8791,26 @@ def validate_previous_action_schema_workbook(
                 sqref=sqref,
             )
         stamped = stamped_workbook_digest(wb)
+        stamped_scheme = stamped_workbook_digest_scheme(wb)
     finally:
         wb.close()
-    actual_digest = workbook_generated_content_sha256(path)
-    if stamped != required_digest or actual_digest != required_digest:
-        raise IntegrityError(
-            "Previous-schema workbook verification failed: the recorded, stamped, "
-            "and actual generated-content digests must match exactly."
-        )
-    return actual_digest
+    return verify_recorded_workbook_digest(
+        path,
+        stamped_digest=stamped,
+        stamped_scheme=stamped_scheme,
+        expected_digest=required_digest,
+        expected_scheme=expected_digest_scheme,
+        legacy_reference_path=legacy_reference_path,
+    )
 
 
-def validate_pre_contract_management_workbook(path: Path, expected_digest: str) -> str:
+def validate_pre_contract_management_workbook(
+    path: Path,
+    expected_digest: str,
+    *,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
+) -> str:
     """Validate only the exact PR #9 workbook state pinned by an integrity manifest."""
 
     required_digest = str(expected_digest).strip().lower()
@@ -7885,15 +8845,17 @@ def validate_pre_contract_management_workbook(path: Path, expected_digest: str) 
         )
         require_pre_contract_list_validations(wb)
         stamped = stamped_workbook_digest(wb)
+        stamped_scheme = stamped_workbook_digest_scheme(wb)
     finally:
         wb.close()
-    actual_digest = workbook_generated_content_sha256(path)
-    if stamped != required_digest or actual_digest != required_digest:
-        raise IntegrityError(
-            "Pre-contract master workbook verification failed: the manifest digest, "
-            "stamped digest, and actual generated-content digest must match exactly."
-        )
-    return actual_digest
+    return verify_recorded_workbook_digest(
+        path,
+        stamped_digest=stamped,
+        stamped_scheme=stamped_scheme,
+        expected_digest=required_digest,
+        expected_scheme=expected_digest_scheme,
+        legacy_reference_path=legacy_reference_path,
+    )
 
 
 def pre_contract_management_workbook(path: Path) -> bool:
@@ -7998,9 +8960,12 @@ def workbook_uses_pre_consolidation_layout(wb: Workbook) -> bool:
         if (
             ws.sheet_state != "visible"
             or ws.cell(row=2, column=start_column).value != MANAGEMENT_MENU_LABEL
-            or ws.cell(row=2, column=start_column).hyperlink is None
-            or ws.cell(row=2, column=start_column).hyperlink.target
-            != MANAGEMENT_MENU_TARGET
+            or not workbook_hyperlink_matches(
+                ws.cell(row=2, column=start_column).hyperlink,
+                MANAGEMENT_MENU_TARGET,
+                sheet_name=ws.title,
+                coordinate=ws.cell(row=2, column=start_column).coordinate,
+            )
             or str(
                 next(
                     (
@@ -8038,6 +9003,8 @@ def verify_existing_management_workbook_integrity(
     path: Path,
     *,
     expected_digest: str | None = None,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
     allow_legacy_protection_upgrade: bool = False,
 ) -> str | None:
     """Verify new-schema workbooks while allowing one-way migration from legacy files."""
@@ -8096,6 +9063,8 @@ def verify_existing_management_workbook_integrity(
                     return validate_management_workbook(
                         path,
                         expected_digest,
+                        expected_digest_scheme=expected_digest_scheme,
+                        legacy_reference_path=legacy_reference_path,
                         visible_sheets=(
                             PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
                         ),
@@ -8116,6 +9085,8 @@ def verify_existing_management_workbook_integrity(
                     return validate_management_workbook(
                         path,
                         expected_digest,
+                        expected_digest_scheme=expected_digest_scheme,
+                        legacy_reference_path=legacy_reference_path,
                         previous_v2_usability=True,
                         visible_sheets=(
                             PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
@@ -8137,6 +9108,8 @@ def verify_existing_management_workbook_integrity(
                     return validate_management_workbook(
                         path,
                         expected_digest,
+                        expected_digest_scheme=expected_digest_scheme,
+                        legacy_reference_path=legacy_reference_path,
                         previous_tab_navigation=True,
                         visible_sheets=(
                             PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
@@ -8145,16 +9118,30 @@ def verify_existing_management_workbook_integrity(
                             PRE_CONSOLIDATION_NAVIGATION_LINKS
                         ),
                     )
-                return validate_management_workbook(path, expected_digest or stamped)
+                return validate_management_workbook(
+                    path,
+                    expected_digest or stamped,
+                    expected_digest_scheme=expected_digest_scheme,
+                    legacy_reference_path=legacy_reference_path,
+                )
             return validate_pre_guide_management_workbook(
-                path, expected_digest or stamped or ""
+                path,
+                expected_digest or stamped or "",
+                expected_digest_scheme=expected_digest_scheme,
+                legacy_reference_path=legacy_reference_path,
             )
         if has_action_focus_schema:
             return validate_v1_action_focus_workbook(
-                path, expected_digest or stamped or ""
+                path,
+                expected_digest or stamped or "",
+                expected_digest_scheme=expected_digest_scheme,
+                legacy_reference_path=legacy_reference_path,
             )
         return validate_previous_action_schema_workbook(
-            path, expected_digest or stamped or ""
+            path,
+            expected_digest or stamped or "",
+            expected_digest_scheme=expected_digest_scheme,
+            legacy_reference_path=legacy_reference_path,
         )
     if protection_contract is not None:
         raise IntegrityError(
@@ -8175,7 +9162,12 @@ def verify_existing_management_workbook_integrity(
             "It may be adopted only when its exact digest is pinned by the verified "
             "integrity manifest; the next ordinary weekly run will upgrade it."
         )
-    return validate_pre_contract_management_workbook(path, expected_digest)
+    return validate_pre_contract_management_workbook(
+        path,
+        expected_digest,
+        expected_digest_scheme=expected_digest_scheme,
+        legacy_reference_path=legacy_reference_path,
+    )
 
 
 def action_episode_id(entity_key: str, first_seen: date) -> str:
@@ -9052,8 +10044,11 @@ def require_management_title_and_freeze_contract(ws) -> None:
         frozen_at = frozen_at.coordinate
     frozen_row_match = re.search(r"\d+", str(frozen_at or ""))
     if not frozen_row_match or int(frozen_row_match.group()) < 3:
-        raise IntegrityError(
-            f"Worksheet {ws.title!r} must retain the title and navigation rows."
+        warnings.warn(
+            f"Excel rewrote the frozen-pane view on worksheet {ws.title!r}; the next "
+            "successful generated save will repair it.",
+            UserWarning,
+            stacklevel=2,
         )
 
 
@@ -9094,8 +10089,11 @@ def require_legacy_tab_navigation_contract(
                 f"Worksheet {ws.title!r} legacy navigation must remain fully visible."
             )
         if ws.row_dimensions[2].height != 24:
-            raise IntegrityError(
-                f"Worksheet {ws.title!r} does not use the approved navigation height."
+            warnings.warn(
+                f"Excel rewrote the navigation-row height on worksheet {ws.title!r}; "
+                "the next successful generated save will repair it.",
+                UserWarning,
+                stacklevel=2,
             )
         require_management_title_and_freeze_contract(ws)
         for column, (_, target) in zip(
@@ -9103,7 +10101,12 @@ def require_legacy_tab_navigation_contract(
         ):
             cell = ws.cell(row=2, column=column)
             expected_target = f"#'{target}'!A1"
-            if cell.hyperlink is None or cell.hyperlink.target != expected_target:
+            if not workbook_hyperlink_matches(
+                cell.hyperlink,
+                expected_target,
+                sheet_name=ws.title,
+                coordinate=cell.coordinate,
+            ):
                 raise IntegrityError(
                     f"Worksheet {ws.title!r} has an invalid legacy navigation target."
                 )
@@ -9173,8 +10176,12 @@ def require_management_menu_contract(
         cell = guide.cell(row=row, column=1)
         if (
             cell.value != target
-            or cell.hyperlink is None
-            or cell.hyperlink.target != f"#'{target}'!A1"
+            or not workbook_hyperlink_matches(
+                cell.hyperlink,
+                f"#'{target}'!A1",
+                sheet_name=guide.title,
+                coordinate=cell.coordinate,
+            )
             or cell.font.underline != "single"
             or cell.protection.locked is not True
         ):
@@ -9219,15 +10226,22 @@ def require_management_menu_contract(
                 f"Worksheet {ws.title!r} workbook menu must start and end visibly."
             )
         if ws.row_dimensions[2].height != 24:
-            raise IntegrityError(
-                f"Worksheet {ws.title!r} does not use the approved menu height."
+            warnings.warn(
+                f"Excel rewrote the menu-row height on worksheet {ws.title!r}; the next "
+                "successful generated save will repair it.",
+                UserWarning,
+                stacklevel=2,
             )
         require_management_title_and_freeze_contract(ws)
         cell = ws.cell(row=2, column=start_column)
         if (
             cell.value != MANAGEMENT_MENU_LABEL
-            or cell.hyperlink is None
-            or cell.hyperlink.target != MANAGEMENT_MENU_TARGET
+            or not workbook_hyperlink_matches(
+                cell.hyperlink,
+                MANAGEMENT_MENU_TARGET,
+                sheet_name=ws.title,
+                coordinate=cell.coordinate,
+            )
         ):
             raise IntegrityError(
                 f"Worksheet {ws.title!r} has an invalid navigation target."
@@ -9250,6 +10264,10 @@ def require_management_menu_contract(
         ):
             raise IntegrityError(
                 f"Worksheet {ws.title!r} navigation style does not match the contract."
+            )
+        if cell.protection.locked is not True:
+            raise IntegrityError(
+                f"Worksheet {ws.title!r} workbook menu must remain locked."
             )
 
 
@@ -12031,6 +13049,14 @@ def write_master_workbook(
         expected_digest=integrity_context.get(
             "expected_master_generated_content_sha256"
         ),
+        expected_digest_scheme=integrity_context.get(
+            "expected_master_generated_content_digest_scheme"
+        ),
+        legacy_reference_path=(
+            Path(integrity_context["legacy_master_reference_path"])
+            if integrity_context.get("legacy_master_reference_path")
+            else None
+        ),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(f".{output_path.stem}.{os.getpid()}.tmp.xlsx")
@@ -12609,6 +13635,80 @@ def manifest_inventory(payload: dict[str, Any], field: str) -> tuple[FileFingerp
         raise IntegrityError(f"Integrity manifest has an invalid {field!r} inventory: {exc}") from exc
 
 
+def manifest_pinned_master_snapshot(
+    archive_dir: Path,
+    payload: dict[str, Any],
+) -> Path:
+    """Resolve exactly one archived master fingerprint owned by this manifest run."""
+
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise IntegrityError(
+            "The legacy manifest cannot identify its archived master without a run ID."
+        )
+    suffix = (
+        f"/{run_id}/published/Red_Onion_Server_Master.xlsx"
+    ).casefold()
+    inventory = manifest_inventory(payload, "derived_archive_inventory")
+    matches = [
+        item
+        for item in inventory
+        if f"/{item.path.lstrip('/')}".casefold().endswith(suffix)
+    ]
+    if len(matches) > 1:
+        raise IntegrityError(
+            "The legacy manifest must pin exactly one archived published master for its run."
+        )
+    root = generated_workbook_archive_dir(archive_dir)
+
+    def verified_candidate(item: FileFingerprint) -> Path:
+        candidate = managed_recursive_file(
+            [root],
+            root / Path(item.path),
+            purpose="manifest-pinned archived master workbook",
+        )
+        if sha256_file(candidate) != item.sha256:
+            raise IntegrityError(
+                "The manifest-pinned archived master workbook fingerprint does not match."
+            )
+        return candidate
+
+    if matches:
+        return verified_candidate(matches[0])
+
+    expected_v2 = payload.get("master_generated_content_sha256")
+    if not isinstance(expected_v2, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_v2):
+        raise IntegrityError(
+            "The legacy manifest cannot resolve an archived master without its v2 digest."
+        )
+    archived_items = [
+        item
+        for item in inventory
+        if f"/{item.path.lstrip('/')}".casefold().endswith(
+            "/published/red_onion_server_master.xlsx"
+        )
+    ]
+    digest_matches: list[Path] = []
+    for item in archived_items:
+        candidate = verified_candidate(item)
+        if workbook_metadata_sha256(candidate) == expected_v2:
+            digest_matches.append(candidate)
+    if not digest_matches:
+        raise IntegrityError(
+            "The legacy manifest inventory contains no archived published master matching "
+            "its frozen v2 digest."
+        )
+    substantive_digests = {
+        workbook_generated_content_sha256(candidate) for candidate in digest_matches
+    }
+    if len(substantive_digests) != 1:
+        raise IntegrityError(
+            "The legacy manifest inventory contains semantically conflicting archived "
+            "masters for its frozen v2 digest."
+        )
+    return sorted(digest_matches, key=lambda path: str(path).casefold())[0]
+
+
 def latest_integrity_manifest_path(archive_dir: Path) -> Path | None:
     root = integrity_manifest_dir(archive_dir)
     if not root.exists():
@@ -12681,11 +13781,29 @@ def timestamped_manifest_path(root: Path, run_id: str, kind: str) -> Path:
     return root / f"{timestamp}-{safe_kind}-{run_id}.json"
 
 
-def current_master_digest(output_dir: Path) -> str | None:
+def current_master_digest_state(output_dir: Path) -> tuple[str | None, str | None]:
     master_path = managed_master_workbook_path(output_dir)
     if not os.path.lexists(master_path):
-        return None
-    return workbook_generated_content_sha256(master_path)
+        return None, None
+    wb = load_workbook(master_path, data_only=False, read_only=False)
+    try:
+        scheme = stamped_workbook_digest_scheme(wb) or LEGACY_WORKBOOK_DIGEST_SCHEME
+        stamped = stamped_workbook_digest(wb)
+    finally:
+        wb.close()
+    if scheme == LEGACY_WORKBOOK_DIGEST_SCHEME:
+        if not stamped or not re.fullmatch(r"[0-9a-f]{64}", stamped):
+            raise IntegrityError(
+                "Legacy master workbook is missing its frozen stamped v2 digest."
+            )
+        return stamped, scheme
+    if scheme == WORKBOOK_DIGEST_SCHEME:
+        return workbook_generated_content_sha256(master_path), scheme
+    raise IntegrityError(f"Unsupported master workbook digest scheme: {scheme!r}.")
+
+
+def current_master_digest(output_dir: Path) -> str | None:
+    return current_master_digest_state(output_dir)[0]
 
 
 def build_integrity_state(
@@ -12702,12 +13820,19 @@ def build_integrity_state(
     derived_inventory = build_raw_inventory(derived_root)
     public_paths = managed_published_output_paths(output_dir)
     public_inventory = build_raw_inventory(output_dir, public_paths)
-    return {
+    master_digest, master_scheme = current_master_digest_state(output_dir)
+    state = {
         "raw_inventory": inventory_dicts(raw_inventory),
         "derived_archive_inventory": inventory_dicts(derived_inventory),
         "published_output_inventory": inventory_dicts(public_inventory),
-        "master_generated_content_sha256": current_master_digest(output_dir),
+        "master_generated_content_sha256": master_digest,
     }
+    if state["master_generated_content_sha256"] is not None:
+        state["master_generated_content_digest_scheme"] = master_scheme
+        state["master_metadata_sha256"] = workbook_metadata_sha256(
+            managed_master_workbook_path(output_dir)
+        )
+    return state
 
 
 def merge_inventory(
@@ -12747,6 +13872,8 @@ def expected_integrity_state(
     derived_updates: Iterable[FileFingerprint] = (),
     published_updates: Iterable[FileFingerprint] = (),
     master_generated_content_sha256: str | None | object = Ellipsis,
+    master_generated_content_digest_scheme: str | None | object = Ellipsis,
+    master_metadata_sha256: str | None | object = Ellipsis,
 ) -> dict[str, Any]:
     """Build prior-state-plus-explicit-delta without inventorying unrelated changes."""
 
@@ -12755,7 +13882,7 @@ def expected_integrity_state(
         if master_generated_content_sha256 is Ellipsis
         else master_generated_content_sha256
     )
-    return {
+    state = {
         "raw_inventory": inventory_dicts(
             merge_inventory(manifest_inventory(previous_payload, "raw_inventory"), raw_updates)
         ),
@@ -12773,6 +13900,27 @@ def expected_integrity_state(
         ),
         "master_generated_content_sha256": master_digest,
     }
+    scheme = (
+        previous_payload.get(
+            "master_generated_content_digest_scheme",
+            previous_payload.get("_master_generated_content_digest_scheme"),
+        )
+        if master_generated_content_digest_scheme is Ellipsis
+        else master_generated_content_digest_scheme
+    )
+    metadata_digest = (
+        previous_payload.get(
+            "master_metadata_sha256",
+            previous_payload.get("_master_metadata_sha256"),
+        )
+        if master_metadata_sha256 is Ellipsis
+        else master_metadata_sha256
+    )
+    if master_digest is not None and scheme is not None:
+        state["master_generated_content_digest_scheme"] = scheme
+    if master_digest is not None and metadata_digest is not None:
+        state["master_metadata_sha256"] = metadata_digest
+    return state
 
 
 def verify_expected_integrity_state(
@@ -12907,20 +14055,63 @@ def verify_integrity_state(
             raise IntegrityError(
                 "Master workbook verification failed: the recorded master workbook is missing."
             )
-        actual_master = workbook_generated_content_sha256(master_path)
-        if actual_master != expected_master:
+        recorded_scheme = payload.get("master_generated_content_digest_scheme")
+        if recorded_scheme is None:
+            # Schema-v1 manifests emitted before v3 always recorded the exact v2
+            # metadata-rich digest. Absence is legacy meaning, never v3 inference.
+            recorded_scheme = LEGACY_WORKBOOK_DIGEST_SCHEME
+        if recorded_scheme not in {
+            LEGACY_WORKBOOK_DIGEST_SCHEME,
+            WORKBOOK_DIGEST_SCHEME,
+        }:
             raise IntegrityError(
-                "Master workbook generated-content verification failed: "
-                f"expected {expected_master}; actual {actual_master}. Restore the recorded "
-                "Dropbox or generated-workbook archive version before rerunning."
+                f"Integrity manifest contains an unsupported workbook digest scheme: "
+                f"{recorded_scheme!r}."
             )
+        legacy_reference: Path | None = None
+        if (
+            recorded_scheme == LEGACY_WORKBOOK_DIGEST_SCHEME
+            and workbook_metadata_sha256(master_path) != expected_master
+        ):
+            legacy_reference = manifest_pinned_master_snapshot(archive_dir, payload)
+        expected_metadata = payload.get("master_metadata_sha256")
+        metadata_drift = legacy_reference is not None
+        if (
+            recorded_scheme == WORKBOOK_DIGEST_SCHEME
+            and expected_metadata is None
+        ):
+            raise IntegrityError(
+                "V3 integrity manifest is missing the required master metadata digest."
+            )
+        if expected_metadata is not None:
+            if not isinstance(expected_metadata, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_metadata
+            ):
+                raise IntegrityError(
+                    "Integrity manifest contains an invalid master metadata digest."
+                )
+            if workbook_metadata_sha256(master_path) != expected_metadata:
+                metadata_drift = True
+                warnings.warn(
+                    "Master workbook metadata differs from the recorded generated version; "
+                    "substantive verification continues.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         # Compatibility is permitted only when the manifest-recorded digest is
         # independently trusted by explicit adoption or an existing local anchor.
         verify_existing_management_workbook_integrity(
             master_path,
             expected_digest=expected_master,
+            expected_digest_scheme=recorded_scheme,
+            legacy_reference_path=legacy_reference,
             allow_legacy_protection_upgrade=allow_legacy_master_upgrade,
         )
+        payload["_master_generated_content_digest_scheme"] = recorded_scheme
+        payload["_master_metadata_drift"] = metadata_drift
+        payload["_master_metadata_sha256"] = workbook_metadata_sha256(master_path)
+        if legacy_reference is not None:
+            payload["_legacy_master_reference_path"] = str(legacy_reference)
         payload["_legacy_master_upgrade_pending"] = (
             allow_legacy_master_upgrade
             and management_workbook_upgrade_pending(master_path)
@@ -13854,6 +15045,13 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
         "expected_master_generated_content_sha256": previous_payload.get(
             "master_generated_content_sha256"
         ),
+        "expected_master_generated_content_digest_scheme": previous_payload.get(
+            "_master_generated_content_digest_scheme",
+            previous_payload.get("master_generated_content_digest_scheme"),
+        ),
+        "legacy_master_reference_path": previous_payload.get(
+            "_legacy_master_reference_path"
+        ),
     }
 
     migration_copied: list[Path] = []
@@ -13924,6 +15122,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             )
             staged_paths = validate_staged_outputs(stage_dir, staged_paths)
             staged_master_digest = workbook_generated_content_sha256(staged_master)
+            staged_master_metadata_digest = workbook_metadata_sha256(staged_master)
 
             record_run_stage(
                 args,
@@ -14003,6 +15202,8 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
                 derived_updates=derived_updates,
                 published_updates=published_updates,
                 master_generated_content_sha256=staged_master_digest,
+                master_generated_content_digest_scheme=WORKBOOK_DIGEST_SCHEME,
+                master_metadata_sha256=staged_master_metadata_digest,
             )
             verify_expected_integrity_state(archive_dir, output_dir, expected_state)
             assert_manifest_head(
@@ -14140,6 +15341,9 @@ def parse_json_cell(value: Any, *, label: str, expected_type: type) -> Any:
 def validate_v2_management_evidence_workbook(
     workbook_path: Path,
     expected_digest: str,
+    *,
+    expected_digest_scheme: str | None = None,
+    legacy_reference_path: Path | None = None,
 ) -> str:
     """Accept only current or protected pre-guide workbooks with the V2 action schema."""
 
@@ -14173,8 +15377,18 @@ def validate_v2_management_evidence_workbook(
             "legacy workbook evidence cannot be relabeled or promoted as V2."
         )
     if has_guide:
-        return validate_management_workbook(workbook_path, expected_digest)
-    return validate_pre_guide_management_workbook(workbook_path, expected_digest)
+        return validate_management_workbook(
+            workbook_path,
+            expected_digest,
+            expected_digest_scheme=expected_digest_scheme,
+            legacy_reference_path=legacy_reference_path,
+        )
+    return validate_pre_guide_management_workbook(
+        workbook_path,
+        expected_digest,
+        expected_digest_scheme=expected_digest_scheme,
+        legacy_reference_path=legacy_reference_path,
+    )
 
 
 def verified_evidence_source(
@@ -14213,7 +15427,18 @@ def verified_evidence_source(
         raise IntegrityError(
             "The current manifest does not record a management workbook digest."
         )
-    validate_v2_management_evidence_workbook(workbook_path, expected_digest)
+    validate_v2_management_evidence_workbook(
+        workbook_path,
+        expected_digest,
+        expected_digest_scheme=manifest_payload.get(
+            "_master_generated_content_digest_scheme"
+        ),
+        legacy_reference_path=(
+            Path(manifest_payload["_legacy_master_reference_path"])
+            if manifest_payload.get("_legacy_master_reference_path")
+            else None
+        ),
+    )
     wb = load_workbook(workbook_path, data_only=False)
     try:
         allowed_reviewers = (
@@ -14258,6 +15483,9 @@ def verified_evidence_source(
         "manifest_created_at_utc": manifest_payload.get("created_at_utc"),
         "workbook_file": workbook_path.name,
         "workbook_generated_content_sha256": expected_digest,
+        "workbook_generated_content_digest_scheme": manifest_payload.get(
+            "_master_generated_content_digest_scheme"
+        ),
         "generator_commit": (
             manifest_payload.get("provenance", {}).get("git", {}).get("commit")
         ),
@@ -14525,9 +15753,19 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
     )
     checks: list[dict[str, Any]] = []
 
-    def add(name: str, status: str, detail: str) -> None:
+    def add(
+        name: str,
+        status: str,
+        detail: str,
+        **structured_detail: Any,
+    ) -> None:
         checks.append(
-            {"name": name, "status": status, "detail": safe_message(detail)}
+            {
+                "name": name,
+                "status": status,
+                "detail": safe_message(detail),
+                **structured_detail,
+            }
         )
 
     try:
@@ -14617,7 +15855,13 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
         else "Attention"
     )
     workbook_detail = (
-        "Protected generated master content matches the manifest-recorded digest."
+        (
+            "Protected substantive master content matches the manifest; workbook metadata "
+            "differs from the recorded generated version and will be refreshed on the next "
+            "successful run."
+            if verified_manifest_payload.get("_master_metadata_drift")
+            else "Protected substantive master content matches the manifest-recorded digest."
+        )
         if workbook_status == "Ready"
         else (
             "The verified manifest does not record a protected management workbook."
@@ -14625,7 +15869,12 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
             else integrity_detail
         )
     )
-    add("Workbook", workbook_status, workbook_detail)
+    add(
+        "Workbook",
+        workbook_status,
+        workbook_detail,
+        metadata_drift=bool(verified_manifest_payload.get("_master_metadata_drift")),
+    )
 
     published_inventory = verified_manifest_payload.get(
         "published_output_inventory"

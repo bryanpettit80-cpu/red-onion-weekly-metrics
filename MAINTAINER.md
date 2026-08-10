@@ -33,8 +33,9 @@ recovery bundles are operating data and are not committed.
 4. Run `git diff --check`.
 5. Use a pull request and require all Python 3.10-3.12 and Windows launcher
    checks to pass.
-6. Merge, update the deployed Dropbox checkout by fast-forward only, remove
-   source bytecode from that checkout, and prove `HEAD == origin/main`.
+6. Merge, update the deployed Dropbox checkout by fast-forward only, and prove
+   `HEAD == origin/main`. The launcher isolates Python bytecode lookup and does
+   not require maintainer cleanup of ignored `__pycache__` files.
 7. Create an annotated `vX.Y.Z` tag and GitHub Release.
 8. Build and independently retain a recovery bundle:
 
@@ -96,11 +97,17 @@ python _program\red_onion_weekly_metrics.py --health-check-json
 ```
 
 It verifies exact managed per-location workbook bytes plus the protected
-generated content of the master workbook through the integrity manifest.
-Approved editable master values, `LAST RUN STATUS.txt`, Dropbox sync, and
-recipient access are outside that claim. It never claims that independent
-recovery is healthy; recovery remains `ExternalCheckRequired` until the current
-private backup and restore-test evidence are verified separately.
+substantive content of the master workbook through the integrity manifest.
+Generated values and formulas, workbook schema, editable-cell boundaries,
+display-affecting formats, chart content and bindings, hidden dimensions,
+internal-link destinations, drawings, external links, and protection controls
+remain fail-closed. Proven equivalent Excel serialization defaults are reported
+without blocking when substantive content still matches the manifest-pinned
+archived master. Approved editable master values, `LAST RUN STATUS.txt`,
+Dropbox sync, and recipient access are outside
+that claim. It never claims that independent recovery is healthy; recovery
+remains `ExternalCheckRequired` until the current private backup and
+restore-test evidence are verified separately.
 
 Replacement-machine recovery uses
 `-RebindRestoredIntegrityAnchor <SOURCE_ANCHOR_JSON>`. The recovery-only command
