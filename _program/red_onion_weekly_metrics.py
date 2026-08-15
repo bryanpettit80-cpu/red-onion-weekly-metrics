@@ -6253,6 +6253,7 @@ def evaluate_server_week_signal(
         if row["location"] == location
         and row["raw_user_name"] == current["raw_user_name"]
         and row["week_end"] in self_week_ends
+        and shared_pos_number(row) is None
     ]
     baseline = aggregate_weekly_rows(prior_rows)
     prior_guest_count = sum(
@@ -6305,7 +6306,9 @@ def evaluate_server_week_signal(
                 excluded=dashboard_excluded(row, config),
             )
             for row in weekly_server_rows
-            if row["location"] == location and row["week_end"] in peer_week_ends
+            if row["location"] == location
+            and row["week_end"] in peer_week_ends
+            and shared_pos_number(row) is None
         ]
         reference = leave_one_out_same_store_peer_reference(
             observations,
@@ -6374,6 +6377,7 @@ def evaluate_server_week_signal(
         and row["week_end"] == current_week_end
         and str(row.get("raw_user_name") or "").casefold()
         != str(current.get("raw_user_name") or "").casefold()
+        and shared_pos_number(row) is None
         and dashboard_trend_eligible(row, config)
         and not dashboard_excluded(row, config)
     ]
@@ -6613,7 +6617,16 @@ def management_server_rows(
 ) -> list[dict[str, Any]]:
     if not weekly_server_rows:
         return []
+    # Preserve the true reporting horizon even when its only rows are shared
+    # identities; an earlier person week must never become the current queue.
     latest_week_end = max(row["week_end"] for row in weekly_server_rows)
+    # Shared POS identities remain available to Shared & Area Trends, but the
+    # people-review pipeline must never treat them as individuals or peers.
+    management_weekly_server_rows = [
+        row for row in weekly_server_rows if shared_pos_number(row) is None
+    ]
+    if not management_weekly_server_rows:
+        return []
     long_term_limit = int(config.get("dashboard_long_term_full_weeks", 8))
     long_term_block = int(config.get("dashboard_long_term_block_weeks", 4))
     full_min_recent_guests = float(
@@ -6644,12 +6657,12 @@ def management_server_rows(
         key = (row["week_end"], row["location"], row["raw_user_name"])
         if key not in evaluations:
             evaluations[key] = evaluate_server_week_signal(
-                row, weekly_server_rows, full_by_location, config
+                row, management_weekly_server_rows, full_by_location, config
             )
         return evaluations[key]
 
     output: list[dict[str, Any]] = []
-    for current in weekly_server_rows:
+    for current in management_weekly_server_rows:
         if current["week_end"] != latest_week_end or dashboard_excluded(current, config):
             continue
         location = current["location"]
@@ -6679,7 +6692,7 @@ def management_server_rows(
         )
         server_history_rows = [
             row
-            for row in weekly_server_rows
+            for row in management_weekly_server_rows
             if row["location"] == location
             and row["raw_user_name"] == current["raw_user_name"]
             and row["week_end"] in set(history_week_ends)
@@ -6787,7 +6800,7 @@ def management_server_rows(
         previous_row = next(
             (
                 row
-                for row in weekly_server_rows
+                for row in management_weekly_server_rows
                 if row["location"] == location
                 and row["raw_user_name"] == current["raw_user_name"]
                 and row["week_end"] == latest_week_end - timedelta(days=7)
@@ -19685,6 +19698,26 @@ def parse_json_cell(value: Any, *, label: str, expected_type: type) -> Any:
     return parsed
 
 
+def management_center_current_action_header_row(worksheet) -> int | None:
+    """Locate the generated Current Actions header even when its queue is empty."""
+
+    for row in range(1, worksheet.max_row + 1):
+        section_title = worksheet.cell(row=row, column=3).value
+        if not (
+            isinstance(section_title, str)
+            and section_title.startswith("CURRENT ACTIONS |")
+        ):
+            continue
+        header_row = row + 2
+        headers = [
+            worksheet.cell(row=header_row, column=column).value
+            for column in range(1, len(ACTION_HEADERS) + 1)
+        ]
+        if headers == ACTION_HEADERS:
+            return header_row
+    return None
+
+
 def validate_v2_management_evidence_workbook(
     workbook_path: Path,
     expected_digest: str,
@@ -19699,11 +19732,17 @@ def validate_v2_management_evidence_workbook(
         protection_contract = stamped_workbook_protection_contract(wb)
         if MANAGEMENT_CENTER_SHEET in wb.sheetnames:
             management_center = wb[MANAGEMENT_CENTER_SHEET]
-            has_current_evidence_surfaces = (
-                "ActionBoardTable" in management_center.tables
-                and OWNER_ROSTER_TABLE_NAME in management_center.tables
+            action_header_row = management_center_current_action_header_row(
+                management_center
             )
-            if has_current_evidence_surfaces:
+            has_current_evidence_surfaces = (
+                OWNER_ROSTER_TABLE_NAME in management_center.tables
+                and action_header_row is not None
+            )
+            if (
+                has_current_evidence_surfaces
+                and "ActionBoardTable" in management_center.tables
+            ):
                 action_min_col, action_min_row, action_max_col, _ = range_boundaries(
                     management_center.tables["ActionBoardTable"].ref
                 )
@@ -19712,6 +19751,8 @@ def validate_v2_management_evidence_workbook(
                     for column in range(action_min_col, action_max_col + 1)
                     if management_center.cell(action_min_row, column).value is not None
                 }
+            elif has_current_evidence_surfaces:
+                action_headers = set(ACTION_HEADERS)
             else:
                 action_headers = set()
         else:
@@ -19813,8 +19854,10 @@ def verified_evidence_source(
             allowed_reviewers = active_owner_names(
                 owner_roster_from_sheet(management_center)
             )
-            action_records = records_from_table(
-                management_center, "ActionBoardTable"
+            action_records = (
+                records_from_table(management_center, "ActionBoardTable")
+                if "ActionBoardTable" in management_center.tables
+                else []
             )
         else:
             # Exact fallback for protected V2 workbooks created before the
