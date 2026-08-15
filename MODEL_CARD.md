@@ -3,21 +3,24 @@
 ## Identity And Status
 
 - **System:** Red Onion Weekly Metrics
-- **Release contract:** `v0.4.1` (recovery hardening; people-review
-  methodology remains `2026.07-v3`)
+- **Release contract:** `v0.5.0` (descriptive performance/consistency views;
+  people-review methodology remains `2026.07-v3`)
 - **Operational status:** protected backfill migration, exact post-migration
   replay, and managed local publication are complete; authorized people-review
   use remains blocked until a separate business-owner approval record is
   documented and verified
-- **Methodology:** `2026.07-v3`
+- **People-review methodology:** `2026.07-v3`
+- **Descriptive performance/consistency methodology:** `2026.08-v1`
 - **System type:** deterministic, rule-based observational coaching signal
 - **Owners:** Red Onion business owner and designated technical maintainer
 - **Decision authority:** accountable human manager; never the automation
 
-This model card describes two intentionally separate layers. The operations
-layer presents trends, volume, and descriptive context. The people-review layer
-covers person-level Recent Movement, Peer Comparison, Context Review, Coaching
-Prompt, and Recognition Prompt behavior.
+This model card describes three intentionally separate layers. The operations
+layer presents trends, volume, and general context. The descriptive
+performance/consistency layer summarizes observed Sales/Guest and Wine outcomes
+and data sufficiency. The people-review layer covers person-level Recent
+Movement, Peer Comparison, Context Review, Coaching Prompt, and Recognition
+Prompt behavior.
 
 ## Intended Use
 
@@ -34,7 +37,9 @@ Appropriate uses are:
 - asking context-aware coaching or recognition questions;
 - checking source accuracy and comparable-work conditions;
 - recording a manager's independent disposition and follow-up; and
-- monitoring aggregate signal quality during the validation pilot.
+- monitoring aggregate signal quality during the validation pilot; and
+- reviewing a descriptive eight-week selling-outcome pattern while separately
+  checking data sufficiency, consistency, and operating context.
 
 ## Prohibited Use
 
@@ -50,6 +55,10 @@ described as:
 - validated for demographic fairness.
 
 Independent corroboration and an accountable human review are mandatory.
+`Overall Read`, Performance, Consistency, Confidence, weekly bands, ranks, and
+dashboard categories are not formal performance ratings or standalone
+employment evidence. They measure neither total job performance nor equal
+sales opportunity.
 
 ## Inputs, Population, And Missing Context
 
@@ -97,6 +106,67 @@ coaching or recognition prompt is suppressed. Management targets may be shown
 as business context, but they do not drive person-level prompts. Any retained
 eligible-cohort percentile or rank is descriptive only and cannot change a
 classification.
+
+## Descriptive Performance And Consistency Layer
+
+Methodology `2026.08-v1` is a separate deterministic review aid. It uses the
+latest eight globally complete Tuesday-Sunday weeks and the current
+non-excluded roster as of the latest complete shared week. It never supplies an
+input, score, driver, persistence result, or action to the `2026.07-v3`
+people-review path.
+
+A current-roster person-week qualifies only with at least 25 guests, at least
+three active days, and at least five other qualified current-roster servers in
+the same store and week. The peer reference is the leave-one-person-out median.
+Sales/Guest and Wine gaps are the person's result minus that weekly peer
+median. Summary peer gaps use `min(guests, 50)` as the weekly weight; eight-week
+Sales/Guest and Wine % use aggregated qualified sales, guests, and wine sales.
+
+Weekly bands use these rules:
+
+- `Strong`: Sales/Guest gap is at least +$11.50 with nonnegative Wine gap, or
+  Wine gap is at least +4.1 percentage points with nonnegative Sales/Guest gap.
+- `Below`: the symmetric negative boundary with the other gap nonpositive.
+- `Near Peer`: neither boundary is met and the gaps share a sign.
+- `Mixed`: neither boundary is met and the gaps have opposite signs.
+- `Not Qualified`: the sample or peer gate fails. A missing row remains visibly
+  unavailable; neither case is converted to zero.
+
+Performance applies the same boundary logic to capped guest-weighted average
+peer gaps. Data-sufficiency `Confidence` is `High` at six qualified weeks and
+200 qualified guests, `Provisional` at four weeks and 150 guests, and
+`Insufficient` otherwise. This is not statistical confidence, significance,
+predictive validity, or causal certainty.
+
+Consistency uses sample standard deviation of the qualified weekly peer gaps.
+It is `High` only when Sales/Guest SD is no greater than $11.50 and Wine-gap SD
+is no greater than 4.1 percentage points; `Moderate` requires no greater than
+$17.50 and 5.7 points; otherwise it is `Low`. Insufficient-confidence rows are
+always `Insufficient` consistency. `Overall Read` combines the performance and
+consistency axes only after the data-sufficiency gate; an insufficient row is
+always `Insufficient Data`.
+
+Recent movement is the capped-weighted recent-four peer gap minus the
+prior-four peer gap. The workbook highlights magnitudes of at least $5 or 1.5
+percentage points, but this remains descriptive and cannot create an action.
+The runner regenerates static protected values from verified inputs; these are
+not live Excel formulas.
+
+The `Performance Dashboard` also presents an all-stores operating card. Its
+sales, guests, Sales/Guest, and wine measures come only from reconciled location
+totals; changes compare the latest complete week with the combined prior four
+complete weeks. No person-level score or shared POS identity contributes to
+that card.
+
+The separate `Shared & Area Trends` view treats any leading four-digit POS
+identity as a shared operating identity, never as a person or people-review
+input. Bar, Patio, Dining Room, Banquets, and Wine Dinners are aggregated by
+complete week, with Sales/Guest calculated as total Gross Sales divided by
+total Guests. Dining Room is the fallback for eligible named rows not mapped
+to another area. Wine Dinners remains unavailable until the source supplies a
+configured name or `weekly_shared_number_areas` explicitly maps a shared POS
+number to it. These aggregates are operational context only and cannot create,
+change, or escalate a person-level action.
 
 ## Metrics, Scoring, And Calibration
 
@@ -189,7 +259,7 @@ These measures help a manager evaluate workload and mix. They remain
 descriptive operational context because the available reports do not establish
 comparable assignments, causal responsibility, or equal sales opportunity.
 
-## Signal And Persistence Rules
+## `2026.07-v3` People-Review Signal And Persistence Rules
 
 Visible values are:
 
@@ -223,9 +293,10 @@ day-sensitive signal cannot exceed `Context Review`.
 
 ## Human Review And Evidence
 
-Every generated row begins with Review Disposition `Pending Review`. An
-authorized manager checks the source, identity, peer cohort, comparable-work
-context, recurring drivers, and stability evidence, then records one of:
+Every generated row in the `Management Center` Current Actions section begins
+with Review Disposition `Pending Review`. An authorized manager checks the
+source, identity, peer cohort, comparable-work context, recurring drivers, and
+stability evidence, then records one of:
 
 - `Coaching Accepted`
 - `Recognition Accepted`
@@ -257,6 +328,24 @@ treated as containing V2 review evidence.
 Evidence export remains a manual, exact-fingerprint approval workflow. No
 package is uploaded, emailed, or transmitted automatically.
 
+## Workbook Presentation And Controls
+
+The operator-facing workbook has seven visible tabs: `How to Use`,
+`Performance Dashboard`, `Server Scorecards`, `Weekly Performance`, `Shared &
+Area Trends`, `Methodology`, and `Management Center`. `Management Center`
+consolidates the data-readiness summary, targets and owner roster, Current
+Actions, and locked Action History that were previously presented on separate
+tabs.
+
+The supported inputs are limited to target values in `D:I` (Entity in `C`
+remains locked), Owner Roster values in `K:L`, and Current Actions Status (`D`),
+Owner (`E`), Due Date (`F`), Context Notes (`N`), Review Disposition (`U`),
+Reviewed By (`V`), and Review Date (`W`). Detailed `Data Quality`, `Evidence
+Detail`, and `Run Notes`, legacy presentation sheets, and technical
+calculation/raw layers remain protected `veryHidden` audit/support sheets.
+Their hidden status does not remove them from validation, lineage, retention,
+or substantive-digest controls.
+
 ## Validation And Acceptance
 
 Release validation includes unit, workbook-contract, integrity, migration, and
@@ -271,6 +360,35 @@ historical backtests. The candidate historical replay must demonstrate:
   target breach explains the exception;
 - less than 25% category reversal between consecutive qualified weeks; and
 - exact guest reconciliation and sales/wine reconciliation within $0.01.
+
+The `2026.08-v1` regression contract additionally verifies current-roster peer
+exclusion, even-count medians, the 50-guest cap, sample rather than population
+SD, exact boundary behavior, missing versus unqualified weeks, confidence and
+overall-read mappings, rolling-window behavior, and 100% invariance of
+`2026.07-v3` action outputs. Workbook tests require locked visible sheets, a
+protected `veryHidden` calculation layer, no comments or unapproved drawings,
+valid chart bindings, and substantive-digest coverage. These tests establish
+determinism and controls, not fairness or causal validity.
+
+The lowercase workbook password `redonion` is documented for authorized
+operators as an accidental-edit convenience. It is not encryption or an access
+control. The v4 substantive digest remains fail-closed for generated values and
+formulas, sheet and table schema, validation and editability boundaries,
+material cell styles, chart definitions and source bindings, meaningful
+worksheet-view settings, hidden dimensions, internal links, drawings, external
+links, and protection. To stay stable across a no-edit Excel save, it normalizes
+only enumerated serializer defaults such as an explicit-versus-implicit `A1`
+scroll origin and chart caches derived from protected formulas and cells. The
+generator writes Excel's known persisted row heights up front; row heights and
+column widths otherwise remain exact because a small or cumulative change can
+alter rendered layout. The companion metadata-rich digest
+still reports those serializer-sensitive differences as `metadata_drift=true`
+with a Ready warning. That warning requires review or regeneration and does not
+prove that every metadata change was harmless; corrections to substantive
+content must be made in source/configuration and regenerated.
+The immediately preceding v3 digest is accepted only through a one-way bridge
+to the exact manifest-inventoried archived master; the next successful run
+records the v4 contract.
 
 The read-only `2026.07-v3` candidate replay covered 16 complete weeks, 96
 business-date reports, 202 qualified person-weeks, and 25 store-week groups.
@@ -326,18 +444,23 @@ transaction. Failure leaves the prior managed state unchanged.
 ## Monitoring, Disputes, And Change Control
 
 Managers and employees may dispute source data, identity, peer comparability,
-missing operating context, thresholds, or the signal itself. Preserve the
+data-sufficiency labels, consistency calculations, missing operating context,
+thresholds, or the signal itself. Preserve the
 original signal and final disposition. Correct source defects through the
 protected transaction; document context or methodology disagreements rather
 than rewriting prior evidence.
 
 The business owner governs permitted use and resolves context disputes. The
 technical maintainer owns source, integrity, implementation, and release
-controls. Material changes to inputs, cohorts, scoring, thresholds,
-persistence, terminology, or permitted use require:
+controls. Material changes to either methodology's inputs, cohorts, scoring,
+thresholds, persistence, terminology, or permitted use require:
 
 1. a new methodology version;
 2. updated model card and governance documentation;
 3. regression and historical backtesting;
 4. business-owner approval; and
 5. a protected release and deployment.
+
+A `2026.08-v1` change must also prove that the people-review action path is
+unchanged unless a separately versioned and approved `2026.07` successor is
+explicitly in scope.

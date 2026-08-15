@@ -20,6 +20,13 @@ ACTIVE_WEEK_END = date(2026, 7, 26)  # Sunday
 ACTIVE_NAME = "Daily Report - TM - 07-21-2026.xlsx"
 
 
+def action_header_column(header: str) -> int:
+    return metrics.ACTION_HEADERS.index(header) + 1
+
+
+CONTEXT_NOTES_COLUMN = action_header_column("Context Notes")
+
+
 def workflow_args(tmp_path: Path, *, initialize_baseline: bool = False) -> Namespace:
     return Namespace(
         input_dir=str(tmp_path / "01 Daily Reports - Drop Here"),
@@ -76,30 +83,29 @@ def valid_master_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         ACTIVE_DAY,
     )
 
-    # Give the fixture one real, unlocked manager-notes cell so the publication
+    # Give the fixture one real, unlocked context-notes cell so the publication
     # race test exercises the same carry-forward surface an operator edits.
-    action = {header: None for header in metrics.ACTION_HEADERS}
-    action.update(
-        {
-            "Action ID": "RACE-ACTION",
-            "Priority": "Medium",
-            "Status": "Open",
-            "Person / Area": "Alex Server",
-            "Manager Notes": "",
-        }
-    )
     workbook = load_workbook(path, data_only=False)
-    metrics.write_action_tracking_sheet(
-        workbook, "Action Board", [action], editable=True
+    center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    _, action_header_row, _, action_last_row = metrics.range_boundaries(
+        center.tables["ActionBoardTable"].ref
     )
-    metrics.finalize_management_workbook(workbook)
+    assert action_last_row > action_header_row
+    center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).value = ""
     workbook.save(path)
     workbook.close()
     metrics.stamp_generated_content_digest(path)
     metrics.validate_management_workbook(path)
 
     workbook = load_workbook(path, data_only=False)
-    assert workbook["Action Board"]["N5"].protection.locked is False
+    center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    _, action_header_row, _, _ = metrics.range_boundaries(
+        center.tables["ActionBoardTable"].ref
+    )
+    assert (
+        center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).protection.locked
+        is False
+    )
     workbook.close()
     return path
 
@@ -475,7 +481,11 @@ def test_manager_edit_after_staging_is_preserved_when_publication_aborts(
         nonlocal edit_injected
         assert output_path.is_file(), "run() should copy the live master into staging first"
         workbook = load_workbook(live_master, data_only=False)
-        workbook["Action Board"]["N5"] = late_note
+        center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+        _, action_header_row, _, _ = metrics.range_boundaries(
+            center.tables["ActionBoardTable"].ref
+        )
+        center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).value = late_note
         workbook.save(live_master)
         workbook.close()
         edit_injected = True
@@ -492,7 +502,13 @@ def test_manager_edit_after_staging_is_preserved_when_publication_aborts(
 
     assert edit_injected is True
     workbook = load_workbook(live_master, data_only=False)
-    assert workbook["Action Board"]["N5"].value == late_note
+    center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    _, action_header_row, _, _ = metrics.range_boundaries(
+        center.tables["ActionBoardTable"].ref
+    )
+    assert (
+        center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).value == late_note
+    )
     workbook.close()
 
 

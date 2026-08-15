@@ -141,20 +141,22 @@ $InstallRequirementsPath = if (Test-Path -LiteralPath $LockedRequirementsPath) {
 
 function Get-PythonLauncher {
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" *> $null
-        if ($LASTEXITCODE -eq 0) {
-            return @("py", "-3", "-B")
+        foreach ($PythonSelector in @("-3.12", "-3.11", "-3.10")) {
+            & py $PythonSelector -B -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return @("py", $PythonSelector, "-B")
+            }
         }
     }
 
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        & python -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" *> $null
+        & python -B -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" *> $null
         if ($LASTEXITCODE -eq 0) {
             return @("python", "-B")
         }
     }
 
-    throw "Python 3.10 or newer was not found. Install Python from https://www.python.org/downloads/ and check 'Add python.exe to PATH', then rerun this script."
+    throw "Python 3.10-3.12 was not found. Install a supported Python release from https://www.python.org/downloads/ and check 'Add python.exe to PATH', then rerun this script."
 }
 
 function Invoke-PythonLauncher {
@@ -213,14 +215,15 @@ function Test-PythonEnvironment {
     }
     $VerifyScript = (
         "import importlib.metadata as m,pathlib,re,sys;" +
+        "canon=lambda x:re.sub(r'[-_.]+','-',x).lower();" +
         "lines=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines();" +
-        "req=[x.strip() for x in lines if x.strip() and not x.lstrip().startswith('#')];" +
-        "bad=[];" +
-        "[(bad.append(x+': installed='+m.version(x.split('==',1)[0])) " +
-        "if '==' in x and m.version(x.split('==',1)[0])!=x.split('==',1)[1] else None) for x in req];" +
+        "req=[x.strip() for x in lines if x.strip() and not x.lstrip().startswith('#') and '==' in x];" +
+        "pins=[(x.split('==',1)[0].strip(),x.split('==',1)[1].strip().split()[0]) for x in req];" +
+        "installed={canon(d.metadata['Name']):d.version for d in m.distributions() if d.metadata['Name']};" +
+        "bad=[n+'=='+v+': installed='+installed.get(canon(n),'missing') for n,v in pins if installed.get(canon(n))!=v];" +
         "print('\\n'.join(bad));raise SystemExit(1 if bad else 0)"
     )
-    & $VenvPython -B -c $VerifyScript $DirectRequirementsPath
+    & $VenvPython -B -c $VerifyScript $InstallRequirementsPath
     return $LASTEXITCODE -eq 0
 }
 

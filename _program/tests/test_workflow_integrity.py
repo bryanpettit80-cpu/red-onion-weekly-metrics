@@ -92,6 +92,84 @@ def manifest_by_kind(archive_dir: Path, kind: str) -> Path:
     return matches[0]
 
 
+def table_bounds_and_headers(
+    ws,
+    table_name: str,
+) -> tuple[tuple[int, int, int, int], dict[str, int]]:
+    """Return one table's exact bounds and header-to-column mapping."""
+
+    bounds = metrics.range_boundaries(ws.tables[table_name].ref)
+    min_col, header_row, max_col, _ = bounds
+    headers = {
+        str(ws.cell(row=header_row, column=column).value): column
+        for column in range(min_col, max_col + 1)
+    }
+    return bounds, headers
+
+
+def set_current_owner(
+    workbook,
+    name: str,
+    active: str = "Yes",
+    *,
+    offset: int = 0,
+) -> None:
+    """Seed one owner through the current consolidated input table."""
+
+    center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    (_, header_row, _, max_row), headers = table_bounds_and_headers(
+        center,
+        metrics.OWNER_ROSTER_TABLE_NAME,
+    )
+    row = header_row + 1 + offset
+    assert row <= max_row
+    center.cell(row=row, column=headers["Owner Name"], value=name)
+    center.cell(row=row, column=headers["Active"], value=active)
+
+
+def current_target_cell(workbook, entity: str, field: str):
+    """Locate a current management target by table keys rather than fixed cells."""
+
+    center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    (_, header_row, _, max_row), headers = table_bounds_and_headers(
+        center,
+        "ManagementTargets",
+    )
+    target_row = next(
+        row
+        for row in range(header_row + 1, max_row + 1)
+        if center.cell(row=row, column=headers["Entity"]).value == entity
+    )
+    return center.cell(row=target_row, column=headers[field])
+
+
+def current_action_records(workbook) -> list[dict]:
+    """Read current and historical actions from the consolidated management tab."""
+
+    center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    return [
+        *metrics.records_from_table(center, "ActionBoardTable"),
+        *metrics.records_from_table(center, "ActionHistoryTable"),
+    ]
+
+
+def set_current_action(workbook, record: dict) -> None:
+    """Replace the first current-action table row through its declared columns."""
+
+    center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    (_, header_row, _, max_row), headers = table_bounds_and_headers(
+        center,
+        "ActionBoardTable",
+    )
+    assert max_row > header_row
+    for header, value in record.items():
+        center.cell(
+            row=header_row + 1,
+            column=headers[header],
+            value=value,
+        )
+
+
 def install_synthetic_parser(monkeypatch: pytest.MonkeyPatch) -> None:
     def parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
         return minimal_records(ACTIVE_DAY, path.name)
@@ -102,6 +180,7 @@ def install_synthetic_parser(monkeypatch: pytest.MonkeyPatch) -> None:
 def downgrade_master_to_pre_consolidation_layout(path: Path) -> str:
     """Model the manifest-bound workbook before action/trend consolidation."""
 
+    downgrade_master_to_pre_performance_layout(path)
     workbook = load_workbook(path, data_only=False)
     try:
         if "Team Trends" in workbook.sheetnames:
@@ -246,6 +325,383 @@ def downgrade_master_to_pre_consolidation_layout(path: Path) -> str:
             *[
                 workbook[name]
                 for name in metrics.PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
+            ],
+            *[
+                worksheet
+                for worksheet in workbook.worksheets
+                if worksheet.title not in visible_sheets
+            ],
+        ]
+        workbook.active = 0
+        workbook.save(path)
+    finally:
+        workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
+def downgrade_master_to_pre_performance_layout(path: Path) -> str:
+    """Model the manifest-bound v0.4 workbook before descriptive analytics."""
+
+    downgrade_master_to_pre_simplification_layout(path)
+    workbook = load_workbook(path, data_only=False)
+    try:
+        for sheet_name in (
+            "Performance Dashboard",
+            "Server Scorecards",
+            "Weekly Performance",
+            "Shared & Area Trends",
+            "Methodology",
+            "_Consistency Calc",
+        ):
+            if sheet_name in workbook.sheetnames:
+                workbook.remove(workbook[sheet_name])
+
+        guide = workbook["How to Use"]
+        for merged in list(guide.merged_cells.ranges):
+            if merged.min_row <= 60 and merged.max_row >= 46:
+                guide.unmerge_cells(str(merged))
+        for row in range(46, 61):
+            for column in range(1, 13):
+                cell = guide.cell(row=row, column=column)
+                cell.value = None
+                cell.hyperlink = None
+
+        workbook_map = {
+            "How to Use": (
+                "start-here workflow, interpretation, controls, and limitations",
+                "No - locked",
+            ),
+            "Dashboard": ("aggregate weekly brief", "No - locked"),
+            "Action Board": (
+                "single current review and task-tracking queue",
+                "Yes - seven blue fields only",
+            ),
+            "Team Trends": (
+                "current-server movement, evidence, and action-gate context",
+                "No - locked",
+            ),
+            "Store & Group Scorecards": (
+                "operational context only",
+                "No - locked",
+            ),
+            "Evidence Detail": (
+                "evidence weeks, cohort, threshold, stability, and methodology",
+                "No - locked",
+            ),
+            "Action History": (
+                "preserved closed and dismissed items",
+                "No - locked",
+            ),
+            "Data Quality": (
+                "completeness, reconciliation, source provenance, and owner warnings",
+                "No - locked",
+            ),
+            "Management Setup": (
+                "custodian-maintained store targets and owner roster",
+                "Yes - blue cells only",
+            ),
+            "Run Notes": (
+                "release, integrity, methodology, and source-assumption audit trail",
+                "No - locked",
+            ),
+        }
+        for row, (_, target) in enumerate(
+            metrics.PRE_PERFORMANCE_NAVIGATION_LINKS,
+            start=46,
+        ):
+            guide.merge_cells(
+                start_row=row,
+                start_column=1,
+                end_row=row,
+                end_column=2,
+            )
+            guide.merge_cells(
+                start_row=row,
+                start_column=3,
+                end_row=row,
+                end_column=10,
+            )
+            guide.merge_cells(
+                start_row=row,
+                start_column=11,
+                end_row=row,
+                end_column=12,
+            )
+            sheet_cell = guide.cell(row=row, column=1, value=target)
+            sheet_cell.hyperlink = f"#'{target}'!A1"
+            sheet_cell.font = Font(
+                bold=True,
+                color="7A1E1E",
+                underline="single",
+            )
+            purpose, editable = workbook_map[target]
+            guide.cell(row=row, column=3, value=purpose)
+            guide.cell(row=row, column=11, value=editable)
+            for column in (1, 3, 11):
+                guide.cell(row=row, column=column).alignment = Alignment(
+                    wrap_text=True,
+                    vertical="center",
+                )
+            guide.row_dimensions[row].height = 42 if target in {
+                "How to Use",
+                "Team Trends",
+                "Evidence Detail",
+                "Data Quality",
+                "Management Setup",
+                "Run Notes",
+            } else 36
+
+        visible_sheets = set(metrics.PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS)
+        for worksheet in workbook.worksheets:
+            if worksheet.title in visible_sheets:
+                worksheet.sheet_state = "visible"
+            else:
+                worksheet.sheet_state = "veryHidden"
+            metrics.protect_worksheet(worksheet, "test-pass")
+        workbook._sheets = [
+            *[
+                workbook[name]
+                for name in metrics.PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS
+            ],
+            *[
+                worksheet
+                for worksheet in workbook.worksheets
+                if worksheet.title not in visible_sheets
+            ],
+        ]
+        workbook.active = 0
+        workbook.save(path)
+    finally:
+        workbook.close()
+    return metrics.stamp_generated_content_digest(path)
+
+
+def downgrade_master_to_pre_simplification_layout(path: Path) -> str:
+    """Model the manifest-bound analytics workbook before legacy-tab culling."""
+
+    state = metrics.read_management_state(path)
+    legacy_config = metrics.load_config(path.parent / "missing-pre-simplification.json")
+    workbook = load_workbook(path, data_only=False)
+    try:
+        if metrics.MANAGEMENT_CENTER_SHEET in workbook.sheetnames:
+            workbook.remove(workbook[metrics.MANAGEMENT_CENTER_SHEET])
+        metrics.write_management_setup_sheet(
+            workbook,
+            state["targets"],
+            state["owner_roster"],
+            legacy_config,
+            state["owner_roster_capacity"],
+        )
+        metrics.write_owner_validation_sheet(
+            workbook,
+            state["owner_roster"],
+            state["owner_roster_capacity"],
+        )
+        metrics.write_action_tracking_sheet(
+            workbook,
+            "Action Board",
+            state["active_actions"],
+            editable=True,
+        )
+        metrics.write_action_tracking_sheet(
+            workbook,
+            "Action History",
+            state["action_history"],
+            editable=False,
+        )
+        guide = workbook["How to Use"]
+        current_limits_header_row = 46 + len(metrics.MANAGEMENT_NAVIGATION_LINKS)
+        limit_rows = [
+            guide.cell(row=row, column=1).value
+            for row in range(
+                current_limits_header_row + 1,
+                current_limits_header_row + 6,
+            )
+        ]
+        for merged in list(guide.merged_cells.ranges):
+            if merged.min_row <= 66 and merged.max_row >= 46:
+                guide.unmerge_cells(str(merged))
+        for row in range(46, 67):
+            for column in range(1, 13):
+                cell = guide.cell(row=row, column=column)
+                cell.value = None
+                cell.hyperlink = None
+
+        guide["A8"] = (
+            "2. Open Data Quality and confirm the latest Tuesday–Sunday week is complete, "
+            "reconciled, and free of unresolved source or identity problems."
+        )
+        guide.row_dimensions[8].height = 36
+        guide["A10"] = (
+            "4. Use Shared & Area Trends, Dashboard, and Store & Group Scorecards for "
+            "the operations layer: shared POS results, area Check Average, sales, "
+            "guests, checks, Sales / Guest, Sales / Check, Guests / Check, Rate of Sale, "
+            "and Ticket Time. Do not make a person-level decision from a card."
+        )
+        guide.row_dimensions[10].height = 36
+        guide["A11"] = (
+            "5. Use Action Board as the single current queue. Its readiness, peer-reference, "
+            "persistence, stability, evidence, and human-review gates remain separate from "
+            "the new descriptive performance/consistency labels. Review Evidence Detail "
+            "and Team Trends, then complete only the blue management fields."
+        )
+        guide.row_dimensions[11].height = 42
+        guide["A12"] = (
+            "6. Complete the blue Action Board fields. Track follow-up; completed or "
+            "dismissed items move to Action History on the next successful run."
+        )
+        guide.row_dimensions[12].height = 36
+        guide["A27"] = metrics.PRE_SIMPLIFICATION_HOW_TO_USE_SECTION_HEADINGS[4]
+        guide["A28"] = (
+            "Blue cells are the only fields carried forward by the weekly workflow. For "
+            "authorized inspection, Review > Unprotect Sheet uses the lowercase password "
+            f"'{metrics.WORKBOOK_OPERATOR_PASSWORD}'. Work on a copy: saved changes to "
+            "generated fields, formulas, technical sheets, or workbook structure are "
+            "detected and can stop the next protected run."
+        )
+        guide.row_dimensions[28].height = 54
+
+        workbook_map = {
+            "How to Use": (
+                "start-here workflow, interpretation, controls, and limitations",
+                "No - locked",
+            ),
+            "Performance Dashboard": (
+                "eight-week confidence, peer-adjusted performance, and consistency overview",
+                "No - locked",
+            ),
+            "Server Scorecards": (
+                "separate performance, consistency, confidence, sample, and recent movement fields",
+                "No - locked",
+            ),
+            "Weekly Performance": (
+                "dated Strong, Near Peer, Mixed, Below, Not Qualified, and missing-row pattern",
+                "No - locked",
+            ),
+            "Shared & Area Trends": (
+                "eight-week shared POS results and guest-weighted Check Average by operating area",
+                "No - locked by default",
+            ),
+            "Methodology": (
+                "definitions, calculation flow, gates, thresholds, and limitations",
+                "No - locked",
+            ),
+            "Dashboard": ("aggregate weekly brief", "No - locked"),
+            "Action Board": (
+                "single current review and task-tracking queue",
+                "Yes - seven blue fields only",
+            ),
+            "Team Trends": (
+                "all current servers with exact WoW deltas, descriptive movement, evidence, and action gate",
+                "No - locked",
+            ),
+            "Store & Group Scorecards": (
+                "operational context only",
+                "No - locked",
+            ),
+            "Evidence Detail": (
+                "evidence weeks, cohort, threshold, stability, and methodology",
+                "No - locked",
+            ),
+            "Action History": (
+                "preserved closed and dismissed items",
+                "No - locked",
+            ),
+            "Data Quality": (
+                "completeness, reconciliation, source provenance, and owner warnings",
+                "No - locked",
+            ),
+            "Management Setup": (
+                "custodian-maintained store targets and owner roster",
+                "Yes - blue cells only",
+            ),
+            "Run Notes": (
+                "release, integrity, methodology, and source-assumption audit trail",
+                "No - locked",
+            ),
+        }
+        for row, (_, target) in enumerate(
+            metrics.PRE_SIMPLIFICATION_NAVIGATION_LINKS,
+            start=46,
+        ):
+            guide.merge_cells(
+                start_row=row,
+                start_column=1,
+                end_row=row,
+                end_column=2,
+            )
+            guide.merge_cells(
+                start_row=row,
+                start_column=3,
+                end_row=row,
+                end_column=10,
+            )
+            guide.merge_cells(
+                start_row=row,
+                start_column=11,
+                end_row=row,
+                end_column=12,
+            )
+            sheet_cell = guide.cell(row=row, column=1, value=target)
+            sheet_cell.hyperlink = f"#'{target}'!A1"
+            sheet_cell.font = Font(
+                bold=True,
+                color="7A1E1E",
+                underline="single",
+            )
+            purpose, editable = workbook_map[target]
+            guide.cell(row=row, column=3, value=purpose)
+            guide.cell(row=row, column=11, value=editable)
+            for column in (1, 3, 11):
+                guide.cell(row=row, column=column).alignment = Alignment(
+                    wrap_text=True,
+                    vertical="center",
+                )
+            guide.row_dimensions[row].height = 42 if target in {
+                "How to Use",
+                "Performance Dashboard",
+                "Server Scorecards",
+                "Weekly Performance",
+                "Shared & Area Trends",
+                "Methodology",
+                "Team Trends",
+                "Evidence Detail",
+                "Data Quality",
+                "Management Setup",
+                "Run Notes",
+            } else 36
+
+        metrics.write_guide_section_header(
+            guide,
+            61,
+            metrics.PRE_SIMPLIFICATION_HOW_TO_USE_SECTION_HEADINGS[7],
+        )
+        for row, text in enumerate(limit_rows, start=62):
+            metrics.write_guide_text_row(
+                guide,
+                row,
+                text,
+                height=72 if row == 62 else 42 if row == 63 else 36,
+                fill_color="FFF2CC" if row == 62 else "FFFFFF",
+            )
+        guide.print_area = "A1:L66"
+
+        visible_sheets = set(metrics.PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS)
+        for worksheet in workbook.worksheets:
+            if worksheet.title in visible_sheets:
+                worksheet.sheet_state = "visible"
+                for merged in list(worksheet.merged_cells.ranges):
+                    if merged.min_row <= 2 <= merged.max_row:
+                        worksheet.unmerge_cells(str(merged))
+                metrics.add_management_navigation(worksheet)
+                metrics.configure_management_print_layout(worksheet)
+            else:
+                worksheet.sheet_state = "veryHidden"
+            metrics.protect_worksheet(worksheet, "test-pass")
+        workbook._sheets = [
+            *[
+                workbook[name]
+                for name in metrics.PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS
             ],
             *[
                 worksheet
@@ -569,6 +1025,31 @@ def stamp_true_scheme_less_v2_digest(path: Path) -> str:
     return digest
 
 
+def stamp_prior_v3_digest_contract(path: Path, digest: str) -> None:
+    """Model the immediately preceding v3 contract without reinterpreting it."""
+
+    workbook = load_workbook(path, data_only=False)
+    try:
+        run_notes = workbook["Run Notes"]
+        rows = {
+            run_notes.cell(row=row, column=1).value: row
+            for row in range(1, run_notes.max_row + 1)
+        }
+        run_notes.cell(
+            row=rows[metrics.RUN_NOTES_DIGEST_LABEL],
+            column=2,
+            value=digest,
+        )
+        run_notes.cell(
+            row=rows["Digest Scheme"],
+            column=2,
+            value=metrics.PREVIOUS_WORKBOOK_DIGEST_SCHEME,
+        )
+        workbook.save(path)
+    finally:
+        workbook.close()
+
+
 def test_explicit_baseline_succeeds_without_active_input_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -638,6 +1119,72 @@ def test_scheme_less_v2_master_baseline_keeps_legacy_digest_contract(
     )
 
 
+def test_manifest_pinned_v3_master_bridges_once_to_v4(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    archive_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    prior_digest = "3" * 64
+    stamp_prior_v3_digest_contract(master, prior_digest)
+
+    run_id = "prior-v3-weekly-run"
+    reference = (
+        archive_dir
+        / metrics.GENERATED_WORKBOOK_ARCHIVE_FOLDER
+        / "week-ending-2026-08-09"
+        / run_id
+        / "published"
+        / master.name
+    )
+    reference.parent.mkdir(parents=True)
+    shutil.copy2(master, reference)
+    state = metrics.build_integrity_state(archive_dir, output_dir)
+    assert state["master_generated_content_sha256"] == prior_digest
+    assert (
+        state["master_generated_content_digest_scheme"]
+        == metrics.PREVIOUS_WORKBOOK_DIGEST_SCHEME
+    )
+    manifest = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=Path(args.config),
+        config=metrics.load_config(Path(args.config)),
+        kind="weekly-run",
+        run_id=run_id,
+        previous_manifest=None,
+        integrity_state=state,
+    )
+
+    with pytest.warns(UserWarning, match="prior v3 master matches"):
+        verified, _ = metrics.verify_integrity_state(
+            archive_dir,
+            output_dir,
+            manifest,
+        )
+
+    assert (
+        verified["_master_generated_content_digest_scheme"]
+        == metrics.PREVIOUS_WORKBOOK_DIGEST_SCHEME
+    )
+    assert Path(verified["_legacy_master_reference_path"]) == reference
+    assert verified["_master_metadata_drift"] is False
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        workbook["Performance Dashboard"]["A8"] = "generated tamper"
+        workbook.save(master)
+    finally:
+        workbook.close()
+    with pytest.raises(metrics.IntegrityError, match="differs from the manifest-pinned"):
+        metrics.verify_integrity_state(archive_dir, output_dir, manifest)
+
+
 def test_v2_baseline_metadata_drift_uses_inventory_pinned_prior_master(
     tmp_path: Path,
     valid_master_template: Path,
@@ -682,7 +1229,7 @@ def test_v2_baseline_metadata_drift_uses_inventory_pinned_prior_master(
     assert Path(verified["_legacy_master_reference_path"]) == reference
 
 
-def test_explicit_v3_manifest_requires_metadata_digest(
+def test_explicit_current_manifest_requires_metadata_digest(
     tmp_path: Path,
     valid_master_template: Path,
 ) -> None:
@@ -712,7 +1259,7 @@ def test_explicit_v3_manifest_requires_metadata_digest(
 
     with pytest.raises(
         metrics.IntegrityError,
-        match="V3 integrity manifest is missing the required master metadata digest",
+        match="Substantive-content integrity manifest is missing the required",
     ):
         metrics.verify_integrity_state(archive_dir, output_dir, manifest)
 
@@ -1083,7 +1630,9 @@ def test_adopted_pre_contract_master_is_regenerated_with_strict_protection(
             == "Protection Contract"
             for row in range(1, upgraded["Run Notes"].max_row + 1)
         )
-        assert metrics.owner_roster_from_sheet(upgraded["Management Setup"])[0] == {
+        assert metrics.owner_roster_from_sheet(
+            upgraded[metrics.MANAGEMENT_CENTER_SHEET]
+        )[0] == {
             "Owner Name": "Avery Manager",
             "Active": "Yes",
         }
@@ -1106,8 +1655,7 @@ def test_manifest_pinned_v2_usability_master_is_regenerated_as_v3(
     shutil.copy2(valid_master_template, master)
     workbook = load_workbook(master, data_only=False)
     try:
-        workbook["Management Setup"]["A21"] = "Avery Manager"
-        workbook["Management Setup"]["B21"] = "Yes"
+        set_current_owner(workbook, "Avery Manager")
         workbook.save(master)
     finally:
         workbook.close()
@@ -1177,7 +1725,9 @@ def test_manifest_pinned_v2_usability_master_is_regenerated_as_v3(
         )
         assert metrics.MANAGEMENT_METHODOLOGY_VERSION in guide_text
         assert metrics.PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION not in guide_text
-        assert metrics.owner_roster_from_sheet(upgraded["Management Setup"])[0] == {
+        assert metrics.owner_roster_from_sheet(
+            upgraded[metrics.MANAGEMENT_CENTER_SHEET]
+        )[0] == {
             "Owner Name": "Avery Manager",
             "Active": "Yes",
         }
@@ -1200,8 +1750,7 @@ def test_manifest_pinned_legacy_v3_navigation_is_regenerated_with_menu(
     shutil.copy2(valid_master_template, master)
     workbook = load_workbook(master, data_only=False)
     try:
-        workbook["Management Setup"]["A21"] = "Avery Manager"
-        workbook["Management Setup"]["B21"] = "Yes"
+        set_current_owner(workbook, "Avery Manager")
         seeded_action = {
             "Action ID": "NAV-UPGRADE-STATE",
             "Entity Key": "server|rc richmond|alex server",
@@ -1227,31 +1776,11 @@ def test_manifest_pinned_legacy_v3_navigation_is_regenerated_with_menu(
             "Reviewed By": "",
             "Review Date": None,
         }
-        metrics.write_action_tracking_sheet(
-            workbook,
-            "Action Board",
-            [seeded_action],
-            editable=True,
-        )
-        action_board = workbook["Action Board"]
-        metrics.add_management_navigation(action_board)
-        metrics.configure_management_print_layout(action_board)
-        metrics.protect_worksheet(action_board, "test-pass")
-        workbook._sheets = [
-            *[
-                workbook[name]
-                for name in metrics.VISIBLE_MANAGEMENT_SHEETS
-                if name in workbook.sheetnames
-            ],
-            *[
-                worksheet
-                for worksheet in workbook.worksheets
-                if worksheet.title not in metrics.VISIBLE_MANAGEMENT_SHEETS
-            ],
-        ]
+        set_current_action(workbook, seeded_action)
         workbook.save(master)
     finally:
         workbook.close()
+    metrics.stamp_generated_content_digest(master)
     legacy_digest = downgrade_master_to_legacy_v3_navigation(master)
     existing = metrics.write_integrity_manifest(
         archive_dir=archive_dir,
@@ -1302,21 +1831,12 @@ def test_manifest_pinned_legacy_v3_navigation_is_regenerated_with_menu(
     upgraded = load_workbook(master, data_only=False)
     try:
         assert metrics.owner_roster_from_sheet(
-            upgraded["Management Setup"]
+            upgraded[metrics.MANAGEMENT_CENTER_SHEET]
         )[0] == {
             "Owner Name": "Avery Manager",
             "Active": "Yes",
         }
-        carried_actions = [
-            *metrics.records_from_sheet(
-                upgraded["Action Board"],
-                "Action ID",
-            ),
-            *metrics.records_from_sheet(
-                upgraded["Action History"],
-                "Action ID",
-            ),
-        ]
+        carried_actions = current_action_records(upgraded)
         carried = next(
             row
             for row in carried_actions
@@ -1472,6 +1992,345 @@ def test_manifest_pinned_pre_consolidation_layout_requires_upgrade_and_regenerat
         upgraded.close()
 
 
+def test_manifest_pinned_pre_performance_layout_requires_upgrade_and_regenerates(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    legacy_digest = downgrade_master_to_pre_performance_layout(master)
+
+    legacy = load_workbook(master, data_only=False)
+    try:
+        assert [
+            worksheet.title
+            for worksheet in legacy.worksheets
+            if worksheet.sheet_state == "visible"
+        ] == metrics.PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS
+        assert all(
+            name not in legacy.sheetnames
+            for name in (
+                "Performance Dashboard",
+                "Server Scorecards",
+                "Weekly Performance",
+                "Shared & Area Trends",
+                "Methodology",
+                "_Consistency Calc",
+            )
+        )
+        metrics.require_management_menu_contract(
+            legacy,
+            visible_sheets=metrics.PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS,
+            navigation_links=metrics.PRE_PERFORMANCE_NAVIGATION_LINKS,
+        )
+    finally:
+        legacy.close()
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="predates the current performance, shared-number, and area-trend layout",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            allow_legacy_protection_upgrade=True,
+        )
+    assert (
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=legacy_digest,
+            allow_legacy_protection_upgrade=True,
+        )
+        == legacy_digest
+    )
+
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="pre-performance-layout",
+        previous_manifest=None,
+    )
+    assert integrity.read_json_manifest(existing)[
+        "master_generated_content_sha256"
+    ] == legacy_digest
+    adopted, adopted_payload, adopted_sha256 = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+    assert adopted == existing
+    assert adopted_payload["_legacy_master_upgrade_pending"] is True
+    assert metrics.verify_integrity_anchor(archive_dir) == (
+        existing.resolve(),
+        adopted_sha256,
+    )
+
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    (input_dir / "Daily Report - TM - 07-21-2026.xlsx").write_bytes(
+        b"captured active report"
+    )
+    install_synthetic_parser(monkeypatch)
+
+    generated = metrics.run(args)
+
+    assert master in generated
+    assert metrics.validate_management_workbook(master)
+    upgraded = load_workbook(master, data_only=False)
+    try:
+        assert [
+            worksheet.title
+            for worksheet in upgraded.worksheets
+            if worksheet.sheet_state == "visible"
+        ] == metrics.VISIBLE_MANAGEMENT_SHEETS
+        assert all(
+            name in upgraded.sheetnames
+            for name in (
+                "Performance Dashboard",
+                "Server Scorecards",
+                "Weekly Performance",
+                "Shared & Area Trends",
+                "Methodology",
+                "_Consistency Calc",
+            )
+        )
+        assert upgraded["_Consistency Calc"].sheet_state == "veryHidden"
+    finally:
+        upgraded.close()
+
+
+def test_manifest_pinned_pre_simplification_layout_upgrades_and_preserves_state(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = workflow_args(tmp_path)
+    archive_dir = Path(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    config = metrics.load_config(config_path)
+    output_dir.mkdir(parents=True)
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+
+    seeded_action = {
+        "Action ID": "SIMPLIFICATION-UPGRADE-STATE",
+        "Entity Key": "server|rc richmond|alex server",
+        "Priority": "Medium",
+        "Status": "Open",
+        "Owner": "Avery Manager",
+        "Due Date": None,
+        "Location": "RC Richmond",
+        "Person / Area": "Alex Server",
+        "Action": "Review operating context",
+        "Signal": "Context Review",
+        "Why It Matters": "Test protected editable-state carry-forward.",
+        "Recommended Next Step": "Review with the manager",
+        "Last Seen": ACTIVE_DAY,
+        "Context Notes": "Preserve this manager note across tab simplification.",
+        "Peer Comparison": "Reference Unavailable",
+        "Recent Movement": "Not Evaluated",
+        "First Seen": ACTIVE_DAY,
+        "Weeks Open": 1,
+        "Evidence Status": "Developing",
+        "Signal State": "Current",
+        "Review Disposition": "Pending Review",
+        "Reviewed By": "",
+        "Review Date": None,
+    }
+    workbook = load_workbook(master, data_only=False)
+    try:
+        center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+        target_min_col, target_header_row, target_max_col, target_max_row = (
+            metrics.range_boundaries(center.tables["ManagementTargets"].ref)
+        )
+        target_headers = {
+            center.cell(row=target_header_row, column=column).value: column
+            for column in range(target_min_col, target_max_col + 1)
+        }
+        all_stores_row = next(
+            row
+            for row in range(target_header_row + 1, target_max_row + 1)
+            if center.cell(row=row, column=target_headers["Entity"]).value
+            == "All Stores"
+        )
+        center.cell(
+            row=all_stores_row,
+            column=target_headers[dict(metrics.TARGET_FIELDS)["gross_sales"]],
+            value=1234.0,
+        )
+
+        roster_min_col, roster_header_row, roster_max_col, _ = (
+            metrics.range_boundaries(center.tables[metrics.OWNER_ROSTER_TABLE_NAME].ref)
+        )
+        roster_headers = {
+            center.cell(row=roster_header_row, column=column).value: column
+            for column in range(roster_min_col, roster_max_col + 1)
+        }
+        center.cell(
+            row=roster_header_row + 1,
+            column=roster_headers["Owner Name"],
+            value="Avery Manager",
+        )
+        center.cell(
+            row=roster_header_row + 1,
+            column=roster_headers["Active"],
+            value="Yes",
+        )
+
+        action_min_col, action_header_row, action_max_col, action_max_row = (
+            metrics.range_boundaries(center.tables["ActionBoardTable"].ref)
+        )
+        assert action_max_row > action_header_row
+        action_headers = {
+            center.cell(row=action_header_row, column=column).value: column
+            for column in range(action_min_col, action_max_col + 1)
+        }
+        for header, value in seeded_action.items():
+            center.cell(
+                row=action_header_row + 1,
+                column=action_headers[header],
+                value=value,
+            )
+        workbook.save(master)
+    finally:
+        workbook.close()
+    metrics.stamp_generated_content_digest(master)
+    legacy_digest = downgrade_master_to_pre_simplification_layout(master)
+
+    legacy = load_workbook(master, data_only=False)
+    try:
+        assert [
+            worksheet.title
+            for worksheet in legacy.worksheets
+            if worksheet.sheet_state == "visible"
+        ] == metrics.PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS
+        assert metrics.MANAGEMENT_CENTER_SHEET not in legacy.sheetnames
+        assert [
+            legacy["How to Use"].cell(row=row, column=1).value
+            for row in range(46, 61)
+        ] == [
+            target for _, target in metrics.PRE_SIMPLIFICATION_NAVIGATION_LINKS
+        ]
+        assert (
+            legacy["How to Use"]["A27"].value
+            == metrics.PRE_SIMPLIFICATION_HOW_TO_USE_SECTION_HEADINGS[4]
+        )
+        assert (
+            legacy["How to Use"]["A61"].value
+            == metrics.PRE_SIMPLIFICATION_HOW_TO_USE_SECTION_HEADINGS[7]
+        )
+        assert "Dashboard" in str(legacy["How to Use"]["A10"].value)
+        assert "normal tab strip" not in str(legacy["How to Use"]["A28"].value)
+        metrics.require_management_menu_contract(
+            legacy,
+            visible_sheets=metrics.PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS,
+            navigation_links=metrics.PRE_SIMPLIFICATION_NAVIGATION_LINKS,
+        )
+    finally:
+        legacy.close()
+
+    with pytest.raises(
+        integrity.IntegrityError,
+        match="predates the current simplified operator tab layout",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            allow_legacy_protection_upgrade=True,
+        )
+    assert (
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=legacy_digest,
+            allow_legacy_protection_upgrade=True,
+        )
+        == legacy_digest
+    )
+
+    existing = metrics.write_integrity_manifest(
+        archive_dir=archive_dir,
+        output_dir=output_dir,
+        config_path=config_path,
+        config=config,
+        kind="weekly-run",
+        run_id="pre-simplification-layout",
+        previous_manifest=None,
+    )
+    assert integrity.read_json_manifest(existing)[
+        "master_generated_content_sha256"
+    ] == legacy_digest
+    adopted, adopted_payload, adopted_sha256 = metrics.ensure_integrity_preflight(
+        archive_dir,
+        output_dir,
+        config_path,
+        config,
+        allow_initialize=True,
+    )
+    assert adopted == existing
+    assert adopted_payload["_legacy_master_upgrade_pending"] is True
+    assert metrics.verify_integrity_anchor(archive_dir) == (
+        existing.resolve(),
+        adopted_sha256,
+    )
+
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    (input_dir / "Daily Report - TM - 07-21-2026.xlsx").write_bytes(
+        b"captured active report"
+    )
+    install_synthetic_parser(monkeypatch)
+
+    generated = metrics.run(args)
+
+    assert master in generated
+    assert metrics.validate_management_workbook(master)
+    upgraded = load_workbook(master, data_only=False)
+    try:
+        assert [
+            worksheet.title
+            for worksheet in upgraded.worksheets
+            if worksheet.sheet_state == "visible"
+        ] == metrics.VISIBLE_MANAGEMENT_SHEETS
+        assert all(
+            upgraded[name].sheet_state == "veryHidden"
+            for name in (
+                "Dashboard",
+                "Team Trends",
+                "Store & Group Scorecards",
+                "Evidence Detail",
+                "Run Notes",
+            )
+        )
+    finally:
+        upgraded.close()
+
+    state = metrics.read_management_state(master)
+    assert state["targets"]["All Stores"]["gross_sales"] == 1234.0
+    assert state["owner_roster"][0] == {
+        "Owner Name": "Avery Manager",
+        "Active": "Yes",
+    }
+    carried = next(
+        row
+        for row in state["active_actions"]
+        if row["Action ID"] == seeded_action["Action ID"]
+    )
+    assert carried["Status"] == "Open"
+    assert carried["Owner"] == "Avery Manager"
+    assert carried["Context Notes"] == seeded_action["Context Notes"]
+
+
 def test_manifest_pinned_legacy_v3_navigation_rejects_style_tampering(
     tmp_path: Path,
     valid_master_template: Path,
@@ -1620,8 +2479,7 @@ def test_v2_usability_upgrade_combines_history_migration_and_rebuild_atomically(
     shutil.copy2(valid_master_template, master)
     workbook = load_workbook(master, data_only=False)
     try:
-        workbook["Management Setup"]["A21"] = "Avery Manager"
-        workbook["Management Setup"]["B21"] = "Yes"
+        set_current_owner(workbook, "Avery Manager")
         workbook.save(master)
     finally:
         workbook.close()
@@ -1733,7 +2591,9 @@ def test_v2_usability_upgrade_combines_history_migration_and_rebuild_atomically(
     assert metrics.validate_management_workbook(master)
     upgraded = load_workbook(master, data_only=False)
     try:
-        assert metrics.owner_roster_from_sheet(upgraded["Management Setup"])[0] == {
+        assert metrics.owner_roster_from_sheet(
+            upgraded[metrics.MANAGEMENT_CENTER_SHEET]
+        )[0] == {
             "Owner Name": "Avery Manager",
             "Active": "Yes",
         }
@@ -1769,6 +2629,35 @@ def test_protected_v1_action_focus_master_accepts_only_legacy_status_contract(
         assert f'"{",".join(metrics.ACTION_STATUS_CHOICES)}"' not in formulas
     finally:
         workbook.close()
+
+
+def test_protected_v1_action_focus_master_rejects_review_needed_status(
+    tmp_path: Path,
+    valid_master_template: Path,
+) -> None:
+    master = tmp_path / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+    downgrade_master_to_v1_action_focus(master)
+    workbook = load_workbook(master, data_only=False)
+    try:
+        action_board = workbook["Action Board"]
+        _, header_row, _, _ = metrics.range_boundaries(
+            action_board.tables["ActionBoardTable"].ref
+        )
+        action_board.cell(row=header_row + 1, column=4, value="Review Needed")
+        workbook.save(master)
+    finally:
+        workbook.close()
+    recorded_digest = metrics.stamp_generated_content_digest(master)
+
+    with pytest.raises(
+        ValueError,
+        match="Status values must be one of Open, In Progress, Blocked, Complete, Dismissed",
+    ):
+        metrics.verify_existing_management_workbook_integrity(
+            master,
+            expected_digest=recorded_digest,
+        )
 
 
 def test_protected_v031_pre_guide_master_uses_exact_compatibility_contract(
@@ -1900,6 +2789,104 @@ def test_evidence_source_accepts_manifest_pinned_pre_guide_v031_master(
     }
 
 
+def test_evidence_export_stages_current_consolidated_workbook(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "02 Finished Reports"
+    archive_dir = tmp_path / "03 Archive"
+    output_dir.mkdir()
+    archive_dir.mkdir()
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        assert "Action Board" not in workbook.sheetnames
+        assert "Management Setup" not in workbook.sheetnames
+        center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+        assert {
+            "ActionBoardTable",
+            metrics.OWNER_ROSTER_TABLE_NAME,
+        }.issubset(center.tables)
+        set_current_owner(workbook, "Current Manager")
+        (bounds, headers) = table_bounds_and_headers(center, "ActionBoardTable")
+        action_row = bounds[1] + 1
+        center.cell(action_row, headers["Status"], "Blocked")
+        center.cell(action_row, headers["Owner"], "Current Manager")
+        center.cell(action_row, headers["Due Date"], date(2026, 8, 6))
+        center.cell(
+            action_row,
+            headers["Review Disposition"],
+            "Coaching Accepted",
+        )
+        center.cell(action_row, headers["Reviewed By"], "Current Manager")
+        center.cell(action_row, headers["Review Date"], date(2026, 8, 1))
+        expected_action_id = str(center.cell(action_row, headers["Action ID"]).value)
+        workbook.save(master)
+    finally:
+        workbook.close()
+
+    expected_digest = metrics.verify_existing_management_workbook_integrity(master)
+    manifest = archive_dir / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    manifest_sha256 = "a" * 64
+    manifest_payload = {
+        "run_id": "current-consolidated-run",
+        "created_at_utc": "2026-08-10T12:00:00+00:00",
+        "master_generated_content_sha256": expected_digest,
+        "provenance": {
+            "git": {"commit": "b" * 40},
+            "effective_config_sha256": "c" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        metrics,
+        "latest_integrity_manifest_path",
+        lambda archive: manifest,
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_anchor",
+        lambda archive, anchor: (manifest.resolve(), manifest_sha256),
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_state",
+        lambda archive, output, selected_manifest: (
+            manifest_payload,
+            manifest_sha256,
+        ),
+    )
+
+    candidate = tmp_path / "management-evidence.json"
+    paths = metrics.stage_management_evidence(
+        Namespace(
+            output_dir=str(output_dir),
+            archive_dir=str(archive_dir),
+            integrity_anchor_dir=str(tmp_path / "anchors"),
+        ),
+        candidate,
+    )
+
+    assert paths == [
+        candidate,
+        metrics.evidence_fingerprint_path(candidate),
+        metrics.evidence_approval_template_path(candidate),
+    ]
+    package = integrity.read_json_manifest(candidate)
+    exported = {
+        row["action_id"]: row
+        for row in package["records"]
+    }
+    assert expected_action_id in exported
+    assert exported[expected_action_id]["status"] == "Blocked"
+    assert exported[expected_action_id]["owner"] == "Current Manager"
+    assert exported[expected_action_id]["reviewed_by"] == "Current Manager"
+    assert package["source"]["workbook_generated_content_sha256"] == expected_digest
+
+
 def test_v2_evidence_export_rejects_legacy_action_schema(
     tmp_path: Path,
     valid_master_template: Path,
@@ -1977,7 +2964,11 @@ def test_current_workbook_rejects_guide_and_navigation_contract_tampering(
         elif tamper_kind == "map_row_layout":
             guide.unmerge_cells("A46:B46")
         elif tamper_kind == "guide_text":
-            guide["A59"] = "Unsupported assumptions removed"
+            guide.cell(
+                row=47 + len(metrics.MANAGEMENT_NAVIGATION_LINKS),
+                column=1,
+                value="Unsupported assumptions removed",
+            )
         else:
             guide.unmerge_cells("A1:L1")
             guide.merge_cells("A1:K1")
@@ -2014,11 +3005,18 @@ def test_generated_content_digest_covers_workbook_usability_contract(
         if tamper_kind == "guide_text":
             workbook["How to Use"]["A4"] = "Changed scope"
         elif tamper_kind == "navigation_target":
-            workbook["Dashboard"]["A2"].hyperlink = "#'Action Board'!A1"
+            center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+            start_column, _ = metrics.management_menu_bounds(center)
+            center.cell(row=2, column=start_column).hyperlink = "#'Dashboard'!A1"
         elif tamper_kind == "navigation_height":
-            workbook["Action History"].row_dimensions[2].height = 30
+            workbook[metrics.MANAGEMENT_CENTER_SHEET].row_dimensions[2].height = 30
         elif tamper_kind == "menu_merge":
-            workbook["Dashboard"].unmerge_cells("A2:L2")
+            center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+            start_column, end_column = metrics.management_menu_bounds(center)
+            center.unmerge_cells(
+                f"{metrics.get_column_letter(start_column)}2:"
+                f"{metrics.get_column_letter(end_column)}2"
+            )
         elif tamper_kind == "map_target":
             workbook["How to Use"]["A46"].hyperlink = "#'Dashboard'!A1"
         else:
@@ -2055,7 +3053,7 @@ def test_current_action_board_rejects_legacy_status_validation(
         status_validation = next(
             item
             for item in workbook[
-                "Action Board"
+                metrics.MANAGEMENT_CENTER_SHEET
             ].data_validations.dataValidation
             if item.formula1 == f'"{",".join(metrics.ACTION_STATUS_CHOICES)}"'
         )
@@ -2471,10 +3469,13 @@ def test_master_preflight_allows_management_inputs_but_rejects_generated_tamperi
     [baseline] = metrics.run(baseline_args)
 
     workbook = load_workbook(master, data_only=False)
-    workbook["Management Setup"]["B6"] = 1234.0
-    workbook["Management Setup"]["A21"] = "Pat Manager"
-    workbook["Management Setup"]["B21"] = "Yes"
-    workbook.active = workbook.sheetnames.index("Action Board")
+    current_target_cell(
+        workbook,
+        "All Stores",
+        dict(metrics.TARGET_FIELDS)["gross_sales"],
+    ).value = 1234.0
+    set_current_owner(workbook, "Pat Manager")
+    workbook.active = workbook.sheetnames.index(metrics.MANAGEMENT_CENTER_SHEET)
     workbook.save(master)
     workbook.close()
 
@@ -2519,8 +3520,14 @@ def test_master_preflight_allows_management_inputs_but_rejects_generated_tamperi
     assert manifest_paths(archive_dir) == [baseline]
     assert not metrics.generated_workbook_archive_dir(archive_dir).exists()
     workbook = load_workbook(master, data_only=False)
-    assert workbook["Management Setup"]["B6"].value == 1234.0
-    assert workbook["Management Setup"]["A21"].value == "Pat Manager"
+    assert current_target_cell(
+        workbook,
+        "All Stores",
+        dict(metrics.TARGET_FIELDS)["gross_sales"],
+    ).value == 1234.0
+    assert metrics.owner_roster_from_sheet(
+        workbook[metrics.MANAGEMENT_CENTER_SHEET]
+    )[0]["Owner Name"] == "Pat Manager"
     workbook.close()
 
 

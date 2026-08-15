@@ -228,7 +228,23 @@ class RunAttemptRecorder:
             self.readiness["workbook"] = RunReadiness.READY.value
         if details:
             self.details.update(dict(details))
-        self.write()
+        # The attempt log is the authoritative post-commit result. A human-readable
+        # status-file refresh is useful but must not turn an already committed
+        # publication and manifest into a reported operational failure.
+        write_json_atomic(self.attempt_path, self.payload())
+        if self.status_path is not None:
+            try:
+                write_text_atomic(self.status_path, self._status_text())
+            except OSError as exc:
+                self.details["last_run_status_write_warning"] = safe_message(
+                    f"{type(exc).__name__}: {exc}"
+                )
+                try:
+                    write_json_atomic(self.attempt_path, self.payload())
+                except OSError:
+                    # The successful attempt was already persisted before the
+                    # optional status-file write was attempted.
+                    pass
 
     def fail(self, exc: BaseException) -> None:
         self.outcome = "Failed"

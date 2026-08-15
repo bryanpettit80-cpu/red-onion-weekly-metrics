@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -229,6 +230,98 @@ def test_context_only_metrics_cannot_change_a_person_action() -> None:
     assert tuple(metrics.SERVER_TREND_FIELDS) == (
         "check_average",
         "wine_pct",
+    )
+
+
+def test_unavailable_rate_and_ticket_do_not_feed_long_term_scoring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, locations, config = synthetic_history()
+    monkeypatch.setattr(
+        metrics,
+        "SERVER_TREND_FIELDS",
+        (*metrics.SERVER_PERSON_ACTION_FIELDS, *metrics.SERVER_CONTEXT_FIELDS),
+    )
+    for row in rows:
+        if row["raw_user_name"] == "entity-focus":
+            row["rate_of_sale_by_guest_count"] = 99_999.0
+            row["average_ticket_time_seconds"] = 999_999.0
+            row["rate_available"] = False
+            row["ticket_time_available"] = False
+
+    result = focal_result(rows, locations, config)
+
+    for field in metrics.SERVER_CONTEXT_FIELDS:
+        assert result["long_term_changes"][field] is None
+        assert result["long_term_metric_scores"][field] is None
+    assert result["long_term_direction"] == "Not Evaluated"
+
+
+def test_unavailable_baseline_metric_is_a_data_issue_not_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, locations, config = synthetic_history()
+    latest_week_end = max(row["week_end"] for row in locations)
+    current = next(
+        row
+        for row in rows
+        if row["raw_user_name"] == "entity-focus"
+        and row["week_end"] == latest_week_end
+    )
+    full_by_location = {
+        "RC Richmond": {row["week_end"] for row in locations}
+    }
+    original_aggregate = metrics.aggregate_weekly_rows
+
+    def aggregate_with_unavailable_baseline(selected):
+        result = original_aggregate(selected)
+        if result is not None:
+            result = dict(result)
+            result["wine_pct"] = float("nan")
+        return result
+
+    monkeypatch.setattr(
+        metrics,
+        "aggregate_weekly_rows",
+        aggregate_with_unavailable_baseline,
+    )
+
+    evaluated = metrics.evaluate_server_week_signal(
+        current,
+        rows,
+        full_by_location,
+        config,
+    )
+
+    assert evaluated["metric_scores"]["wine_pct"] is None
+    assert evaluated["candidate_qualified"] is False
+    assert evaluated["evidence_status"] == "Data Issue"
+
+
+def test_store_shock_only_failure_is_not_labeled_day_sensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, locations, config = synthetic_history()
+    monkeypatch.setattr(
+        metrics,
+        "assess_common_store_shock",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            guard_passed=False,
+            common_store_shock=True,
+            comparable_metrics=("check_average", "wine_pct"),
+            differentiating_metrics=(),
+            relative_scores=(),
+            reason="common_store_shock",
+        ),
+    )
+
+    result = focal_result(rows, locations, config)
+
+    assert result["action"] == "Context Review"
+    assert result["confidence"] == "Store Shock"
+    assert result["persistence_reason"] == "store_shock_guard_not_passed"
+    assert result["stability_result"] == (
+        "Store-shock guard not passed; day-removal stability not applicable"
     )
 
 

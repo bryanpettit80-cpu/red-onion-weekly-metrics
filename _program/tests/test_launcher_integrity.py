@@ -50,6 +50,26 @@ def test_release_preflight_runs_before_any_runtime_mutation() -> None:
         "-and -not $EnvironmentMatches))" in compact_launcher
     )
     assert "--require-hashes" in launcher
+    assert '@("-3.12", "-3.11", "-3.10")' in launcher
+    assert launcher.count("(3, 10) <= sys.version_info[:2] < (3, 13)") == 2
+    assert "Python 3.10-3.12 was not found" in launcher
+
+
+def test_environment_reuse_verifies_every_locked_dependency_pin() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    compact_launcher = " ".join(launcher.split())
+
+    assert "$InstallRequirementsPath" in launcher
+    assert (
+        "$VenvPython -B -c $VerifyScript $InstallRequirementsPath"
+        in compact_launcher
+    )
+    assert "x.split('==',1)[1].strip().split()[0]" in launcher
+    assert "m.distributions()" in launcher
+    assert (
+        "$VenvPython -B -c $VerifyScript $DirectRequirementsPath"
+        not in compact_launcher
+    )
 
 
 def test_production_dependency_pins_are_exact_and_consistent() -> None:
@@ -69,7 +89,7 @@ def test_production_dependency_pins_are_exact_and_consistent() -> None:
         "red_onion_weekly_metrics",
     ):
         assert f'"{module}"' in pyproject
-    assert 'requires-python = ">=3.10"' in pyproject
+    assert 'requires-python = ">=3.10,<3.13"' in pyproject
     lock = (PROGRAM_DIR / "requirements.lock").read_text(encoding="utf-8")
     assert "--hash=sha256:" in lock
     assert "numpy==2.2.6" in lock

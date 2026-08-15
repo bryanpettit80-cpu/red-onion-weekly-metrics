@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import red_onion_weekly_metrics as metrics
+import red_onion_runtime as runtime
 from red_onion_runtime import RunAttemptRecorder, RunReadiness, RunStage
 
 
@@ -79,6 +80,37 @@ def test_success_marks_workbook_ready_only_for_workbook_generating_operations(
     assert payload["readiness"]["workbook"] == expected
 
 
+def test_success_remains_success_when_final_human_status_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt_path = tmp_path / "archive" / "attempt.json"
+    status_path = tmp_path / "output" / metrics.LAST_RUN_STATUS_FILE
+    recorder = RunAttemptRecorder(
+        run_id="run-status-warning",
+        operation="weekly-run",
+        attempt_path=attempt_path,
+        status_path=status_path,
+    )
+
+    def reject_status_write(path: Path, text: str) -> Path:
+        raise PermissionError("status file is open in another application")
+
+    monkeypatch.setattr(runtime, "write_text_atomic", reject_status_write)
+
+    recorder.succeed("Publication and manifest committed.")
+
+    payload = json.loads(attempt_path.read_text(encoding="utf-8"))
+    assert payload["outcome"] == "Success"
+    assert payload["stage"] == "Complete"
+    assert payload["readiness"]["integrity"] == "Ready"
+    assert payload["readiness"]["workbook"] == "Ready"
+    assert "PermissionError" in payload["details"][
+        "last_run_status_write_warning"
+    ]
+    assert not status_path.exists()
+
+
 def test_failed_attempt_preserves_safe_error_without_recovery_claim(tmp_path: Path) -> None:
     recorder = RunAttemptRecorder(
         run_id="run-failed",
@@ -148,17 +180,21 @@ def test_health_check_does_not_call_empty_integrity_baseline_a_publication(
         "verify_integrity_anchor",
         lambda archive, anchor: (manifest.resolve(), manifest_sha256),
     )
-    monkeypatch.setattr(
-        metrics,
-        "verify_integrity_state",
-        lambda archive, output, selected_manifest: (
+    def verify_pinned_health_state(archive, output, selected_manifest, **kwargs):
+        assert kwargs == {"allow_legacy_master_upgrade": True}
+        return (
             {
                 "kind": "integrity-baseline",
                 "master_generated_content_sha256": None,
                 "published_output_inventory": [],
             },
             manifest_sha256,
-        ),
+        )
+
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_state",
+        verify_pinned_health_state,
     )
 
     payload = metrics.build_health_check(
@@ -206,7 +242,7 @@ def test_health_check_reports_metadata_drift_as_structured_ready_warning(
     monkeypatch.setattr(
         metrics,
         "verify_integrity_state",
-        lambda archive, output, selected_manifest: (
+        lambda archive, output, selected_manifest, **kwargs: (
             {
                 "kind": "weekly-run",
                 "master_generated_content_sha256": "b" * 64,

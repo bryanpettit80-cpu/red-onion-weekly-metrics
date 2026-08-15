@@ -67,12 +67,12 @@ Excel temporary files whose names start with `~$` are ignored.
 
 - The master workbook opens to a protected `How to Use` guide with the weekly workflow, signal meanings, required evidence review, editable-field rules, prohibited uses, and links to every visible sheet.
 - Every visible sheet has one consistent menu link back to the protected `How to Use` workbook map.
-- `Action Board` is the single current execution queue. Its blue Status, Owner, Due Date, Context Notes, Review Disposition, Reviewed By, and Review Date fields remain editable.
-- `Team Trends` shows every current non-excluded server with exact consecutive-week Sales/Guest and Wine % changes, descriptive four-week movement, eight-week direction, evidence status, and the separate gated action outcome. Descriptive movement does not bypass the coaching-signal gates.
-- `Evidence Detail` records stable action/reason codes, exact evidence weeks, source hashes, parser/date provenance, peer-reference details, metric inputs, stability results, review disposition, and methodology version.
-- `Data Quality` includes a latest-first 16-week location completeness matrix with explicit Complete, Partial, and Missing labels before the detailed exception and provenance sections.
+- `Performance Dashboard` opens with an all-stores card sourced from location totals for the latest complete week, including Gross Sales, Guests, Check Average, Wine Mix, and comparisons with the preceding four complete weeks. It then summarizes the latest eight globally complete weeks for the current non-excluded roster. `Server Scorecards` separates peer-adjusted selling outcomes, consistency, and data sufficiency; `Weekly Performance` shows the dated pattern; and `Methodology` defines every calculation and limitation. These read-only views cannot create, strengthen, persist, or escalate a people-review prompt.
+- `Shared & Area Trends` reports leading four-digit shared POS identities such as 5050 and 7070 separately from people. It also shows guest-weighted weekly Check Average (`Gross Sales / Guests`) for Bar, Patio, Dining Room, Banquets, and Wine Dinners at each store and for All Stores.
+- `Management Center` consolidates the operator workflow that previously used separate `Action Board`, `Action History`, `Data Quality`, and `Management Setup` tabs. It shows a data-readiness summary, editable targets and owner roster, the current execution queue, and locked action history on one visible sheet.
+- Detailed `Data Quality`, `Evidence Detail`, and `Run Notes` records remain in protected `veryHidden` audit/support sheets. Legacy presentation sheets such as `Team Trends`, `Store & Group Scorecards`, and `Dashboard` are also `veryHidden`; the focused analytics tabs replace them in the operator-facing layout.
 - Person-level signals require at least 25 guests, 3 active days, 2 prior full self-weeks, and 50 prior-period guests.
-- Partial weeks stay visible in Data Quality but are excluded from management baselines and prominent server actions.
+- Partial weeks are surfaced in the `Management Center` readiness summary and retained in detailed `Data Quality`; they are excluded from management baselines and prominent server actions.
 - Management can record Status, Owner, Due Date, Context Notes, Review Disposition, Reviewed By, and Review Date in the master workbook. Those fields carry forward on the next successful run.
 - Moves successfully processed source files to:
 
@@ -101,17 +101,21 @@ Before the first protected weekly run, a maintainer must explicitly confirm the 
 & '.\Run Weekly Snapshot.cmd' -InitializeIntegrityBaseline
 ```
 
-An ordinary run fails closed if that baseline, its manifest history, or the machine-local trusted head is missing; it never silently establishes a replacement baseline. On the first run after upgrading an older deployment that already has manifests but no local anchor, the same explicit initialization command verifies the complete current state and adopts that existing head once. A manifest-pinned owner-roster workbook from the immediately preceding protection contract is accepted only through that explicit adoption; it is not rewritten during adoption, history-only migration remains blocked, and the next ordinary weekly run regenerates it with the current strict controls. Each later run verifies the trusted head, full manifest chain, canonical raw archive, generated-workbook archive, published public workbooks, and the master workbook's substantive-content digest before reading prior management state. Approved scalar values in blue cells and the Action Board remain editable. Generated values and formulas, sheet and table schema, validation and editability boundaries, display-affecting formats, chart content and bindings, hidden dimensions, internal-link destinations, drawings, external links, and protection controls remain fail-closed. Only proven equivalent Excel serialization defaults are reported without blocking when substantive content still matches the exact manifest-pinned archived master. Legacy metadata-rich digests are never reinterpreted from the live workbook alone; their compatibility bridge requires a manifest-inventoried archived reference before the next successful run records the narrower digest contract.
+An ordinary run fails closed if that baseline, its manifest history, or the machine-local trusted head is missing; it never silently establishes a replacement baseline. On the first run after upgrading an older deployment that already has manifests but no local anchor, the same explicit initialization command verifies the complete current state and adopts that existing head once. A manifest-pinned owner-roster workbook from the immediately preceding supported layout, protection contract, or digest contract is accepted only through the explicit compatibility path; it is not silently reinterpreted, history-only migration remains blocked, and the next successful run regenerates it with the current layout and strict controls. Each later run verifies the trusted head, full manifest chain, canonical raw archive, generated-workbook archive, published public workbooks, and the master workbook's substantive-content digest before reading prior management state. Approved scalar values in the blue `Management Center` input cells remain editable. The v4 substantive digest fails closed for generated values and formulas, sheet and table schema, validation and editability boundaries, material cell styles, chart definitions and source bindings, meaningful worksheet-view settings, row and column sizes, internal-link destinations, drawings, external links, and protection controls. To remain stable across a no-edit Excel save, the generator materializes Excel's known persisted row heights and the digest intentionally normalizes only enumerated serializer defaults such as an explicit-versus-implicit `A1` scroll origin and chart caches derived from protected source formulas and cells. Row heights and column widths otherwise remain exact because even a small or cumulative change can alter rendered layout. Those serializer-sensitive details remain covered by the companion metadata-rich digest recorded in the manifest; a difference is surfaced as `metadata_drift=true` with a Ready warning rather than a substantive-integrity failure. Treat that warning as a request to review or regenerate the workbook, not as proof that every metadata change was harmless. Legacy v2 metadata-rich digests and the immediately preceding v3 substantive digest are never reinterpreted from the live workbook alone; their one-way compatibility bridge requires the exact manifest-inventoried archived master before the next successful run records the v4 contract.
 
 ## Workbook Layers And Metric Use
 
-Methodology `2026.07-v3` separates useful operating context from the narrower
-person-review signal:
+The workbook keeps three purposes separate:
 
 - **Operations layer:** shows volume, trends, store and person comparisons, and
   descriptive context. Check Count supports total checks, Sales/Check, and
   Guests/Check. Rate of Sale and Ticket Time remain visible here.
-- **People-review layer:** may create a Context Review, Coaching Prompt, or
+- **Descriptive performance/consistency layer (`2026.08-v1`):** summarizes
+  Sales/Guest and Wine Percentage across the latest eight globally complete
+  weeks using current-roster, same-store, same-week peer medians. Its
+  `Confidence` label means data sufficiency only; its labels are not statistical
+  confidence, total-performance ratings, or employment decisions.
+- **People-review layer (`2026.07-v3`):** may create a Context Review, Coaching Prompt, or
   Recognition Prompt using only Sales/Guest (the existing internal
   `check_average` field) and Wine Percentage. Rate of Sale, Ticket Time, Check
   Count, and the derived per-check measures cannot create, strengthen, persist,
@@ -142,7 +146,34 @@ The operational layer is intended to help a manager ask:
 - Is the source complete and the work reasonably comparable?
 - What should be verified before a coaching or recognition conversation?
 
-## Coaching-Signal Interpretation
+### Descriptive Performance And Consistency
+
+A server-week qualifies for `2026.08-v1` with at least 25 guests, at least
+three active days, and at least five other qualified current-roster peers in
+the same store and week. Weekly peer references are medians. Eight-week peer
+gaps are weighted by `min(guests, 50)` so one large week cannot dominate.
+
+`High` data sufficiency requires at least six qualified weeks and 200 qualified
+guests; `Provisional` requires at least four weeks and 150 guests; otherwise it
+is `Insufficient`. Consistency is the sample standard deviation of qualified
+weekly peer gaps. High consistency requires Sales/Guest SD no greater than
+$11.50 and Wine-gap SD no greater than 4.1 percentage points; Moderate requires
+no greater than $17.50 and 5.7 points. Recent movement is the capped-weighted
+recent four-week peer gap minus the preceding four-week gap and remains
+descriptive. Missing and unqualified weeks are never treated as zero.
+
+The runner recomputes this protected snapshot from verified source data during
+each successful generation. It is not a live Excel recalculation model, and it
+does not feed the people-review action path.
+
+Shared POS and area trends use the same latest eight globally complete weeks.
+Shared-number rows never enter person peer comparisons or people-review actions.
+Bar, Patio, Banquets, and Wine Dinners use configured source-name patterns;
+Dining Room is the residual set of otherwise eligible named servers. Wine
+Dinners remains visibly unavailable until an actual POS label or shared number
+is configured in `weekly_area_name_patterns` or `weekly_shared_number_areas`.
+
+## `2026.07-v3` Coaching-Signal Interpretation
 
 Methodology `2026.07-v3` is a deterministic, rule-based screening aid. It does
 not estimate statistical confidence, predict future performance, establish
@@ -273,7 +304,7 @@ If the master workbook cannot be read or replaced, the run stops before moving t
 
 If the launcher reports `Release preflight failed`, do not alter files to make the warning disappear. Ask the technical maintainer to restore the deployed repository to a clean `main` checkout whose `HEAD` matches local `origin/main`. The preflight does not download updates.
 
-If Python is missing, install Python 3.10 or newer and select `Add python.exe to PATH`.
+If Python is missing, install Python 3.10-3.12 and select `Add python.exe to PATH`.
 
 A normal weekly run verifies the existing local environment and does not
 reinstall packages. Technical maintainers can explicitly repair it with
@@ -289,13 +320,14 @@ persistence and stability rules, materiality thresholds, display aliases, and
 exclusions. Only the technical maintainer should edit this file or anything
 else in `Red Onion Weekly Metrics Automation`.
 
-The master workbook also contains a `Management Setup` sheet. Blue target cells
-in columns `B:G` hold optional store/group targets. These targets and rolling
-store baselines remain store-level business context; person-level prompts use
-the qualified same-store peer reference described above. The visible Owner
-Roster begins at `A20` with `Owner Name` and `Active` columns. Add a manager
-once and mark departed managers inactive instead of deleting history. The
-`Action Board` Owner dropdown reflects active roster names immediately in
+The visible `Management Center` contains the optional store/group targets and
+owner roster. The `ManagementTargets` table spans `C:I`: Entity in column `C`
+is locked, while the blue target cells in `D:I` are editable. Targets and
+rolling store baselines remain store-level business context; person-level
+prompts use the qualified same-store peer reference described above. The Owner
+Roster occupies `K:L`, with editable `Owner Name` and `Active` fields. Add a
+manager once and mark departed managers inactive instead of deleting history.
+The Current Actions Owner dropdown reflects active roster names immediately in
 Excel; the next successful run carries the roster forward and flags assignments
 that are inactive or no longer listed.
 
@@ -307,6 +339,9 @@ neutral band, and the larger of the business minimum and the R-7 90th
 percentile for a strong band. Values are rounded half-up to $0.50 for
 Sales/Guest and 0.001 for Wine Percentage. Thresholds are frozen for a
 methodology release and are not recomputed during an ordinary weekly run.
+The descriptive `2026.08-v1` layer reuses the configured Sales/Guest and Wine
+movement neutral/strong bands as its performance and High/Moderate consistency
+boundaries. Its weekly run is deterministic and does not recalibrate them.
 
 Rate of Sale, Ticket Time, Check Count, Sales/Check, and Guests/Check have no
 people-review scoring thresholds. They remain descriptive operating context
@@ -316,10 +351,17 @@ under the aggregation and completeness rules above.
 
 Workbook protection is designed to prevent accidental changes while preserving the management workflow:
 
-- `Management Setup`: configured-entity target cells in `B:G` and the Owner Roster input table are editable.
-- `Action Board`: only Status, Owner, Due Date, Context Notes, Review
-  Disposition, Reviewed By, and Review Date data cells are editable.
-- Other workbook cells are locked, technical sheets are `veryHidden`, and workbook structure is protected.
+- `Management Center`: only configured-entity target cells in `D:I` (Entity in
+  `C` stays locked), Owner Roster cells in `K:L`, and Current Actions cells for
+  Status (`D`), Owner (`E`), Due Date (`F`), Context Notes (`N`), Review
+  Disposition (`U`), Reviewed By (`V`), and Review Date (`W`) are editable.
+  Its readiness summary and Action History section are locked.
+- `Performance Dashboard`, `Server Scorecards`, `Weekly Performance`, `Shared &
+  Area Trends`, and `Methodology` are protected and read-only by default.
+  `_Consistency Calc` is protected and `veryHidden`.
+- Other workbook cells are locked. Detailed `Data Quality`, `Evidence Detail`,
+  and `Run Notes`, legacy presentation sheets, and technical calculation/raw
+  sheets are `veryHidden`; workbook structure is protected.
 
 Generated rows begin with `Pending Review`. A completed disposition requires a
 reviewer and review date. Valid dispositions are `Coaching Accepted`,
@@ -327,7 +369,7 @@ reviewer and review date. Valid dispositions are `Coaching Accepted`,
 Invalid or incomplete combinations remain visibly pending and are rejected by
 the next protected run.
 
-This protection is an operational guardrail, not encryption or a security boundary. Anyone who can download a workbook can keep a separate copy, and an authorized Dropbox editor can replace files. Use the manifests and restricted Dropbox roles to detect or reduce inappropriate changes.
+This protection is an operational guardrail, not encryption or a security boundary. Authorized users can choose **Review > Unprotect Sheet** (or unprotect workbook structure) with the documented lowercase password `redonion`. Use a separate copy for exploratory edits: saving generated values or formulas, sheet structure, visibility, material styles, chart definitions or bindings, meaningful worksheet-view settings, row or column sizes, editability, or protection into the managed master changes its substantive digest and can stop the next protected run. Enumerated Excel serializer defaults and derived chart-cache changes can instead surface as a non-blocking metadata-drift warning; review or regenerate the workbook whenever that warning appears. Anyone who can download a workbook can keep a separate copy, and an authorized Dropbox editor can replace files. Use the manifests and restricted Dropbox roles to detect or reduce inappropriate changes.
 
 ## Dropbox Access And Recovery
 
@@ -351,7 +393,12 @@ validation limits are documented in [MODEL_CARD.md](MODEL_CARD.md).
 
 The tracked `Run Weekly Snapshot.cmd` also works when this repository is copied outside the named `Red Onion Weekly Metrics Automation` deployment folder. In that standalone layout, the numbered runtime folders are created in the repository root and a `.git` directory is not required. The deployed-release Git preflight is deliberately limited to the canonical named deployment; standalone mode does not claim that its code is a verified release.
 
-The management tabs are shown first. Raw daily, weekly, ranking, and calculation tabs remain in the workbook as `veryHidden` technical sheets for auditability and chart sources.
+The operator-facing workbook has exactly seven visible tabs: `How to Use`,
+`Performance Dashboard`, `Server Scorecards`, `Weekly Performance`, `Shared &
+Area Trends`, `Methodology`, and `Management Center`. Detailed audit/support,
+legacy presentation, raw daily/weekly/ranking, and calculation tabs—including
+`Data Quality`, `Evidence Detail`, `Run Notes`, and `_Consistency Calc`—remain
+`veryHidden` for auditability and chart sources.
 
 ## What Is Not Redundant
 

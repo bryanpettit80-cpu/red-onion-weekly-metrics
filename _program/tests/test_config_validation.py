@@ -48,6 +48,64 @@ def test_partial_config_is_deep_merged(tmp_path: Path) -> None:
     )
 
 
+def test_weekly_area_and_shared_number_mappings_are_deep_merged(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path / "config.json",
+        {
+            "weekly_area_name_patterns": {"Wine Dinners": ["Special Event"]},
+            "weekly_shared_number_areas": {"7070": "Wine Dinners"},
+        },
+    )
+
+    config = metrics.load_config(path)
+
+    assert config["weekly_area_name_patterns"]["Wine Dinners"] == ["Special Event"]
+    assert config["weekly_area_name_patterns"]["Bar"] == ["Bar"]
+    assert config["weekly_shared_number_areas"] == {"7070": "Wine Dinners"}
+
+
+def test_validated_string_values_are_retained_in_normalized_form(
+    tmp_path: Path,
+) -> None:
+    path = write_config(
+        tmp_path / "config.json",
+        {
+            "locations": {
+                " RC Richmond ": {"short_code": " RVA "},
+            },
+            "dashboard_exclude_name_contains": [" Banquet ", " Server "],
+            "public_name_aliases": {" Special POS ": " Dining Room "},
+            "weekly_area_name_patterns": {
+                "Wine Dinners": [" Special Event "],
+            },
+            "weekly_shared_number_areas": {" 7070 ": " Wine Dinners "},
+            "management_threshold_calibration": {
+                "calibration_start": " 2026-03-24 ",
+                "calibration_end": " 2026-07-19 ",
+                "version": " 2026.07-v3 ",
+            },
+        },
+    )
+
+    config = metrics.load_config(path)
+
+    assert " RC Richmond " not in config["locations"]
+    assert config["locations"]["RC Richmond"]["short_code"] == "RVA"
+    assert config["dashboard_exclude_name_contains"] == ["Banquet", "Server"]
+    assert config["public_name_aliases"]["Special POS"] == "Dining Room"
+    assert config["weekly_area_name_patterns"]["Wine Dinners"] == [
+        "Special Event"
+    ]
+    assert config["weekly_shared_number_areas"] == {"7070": "Wine Dinners"}
+    assert config["management_threshold_calibration"]["calibration_start"] == (
+        "2026-03-24"
+    )
+    assert config["management_threshold_calibration"]["calibration_end"] == (
+        "2026-07-19"
+    )
+    assert config["management_threshold_calibration"]["version"] == "2026.07-v3"
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
@@ -129,6 +187,18 @@ def test_partial_config_is_deep_merged(tmp_path: Path) -> None:
                 }
             },
             "require_leave_one_active_day_stability must be true",
+        ),
+        (
+            {"weekly_area_name_patterns": {"Roof": ["Roof"]}},
+            "Unknown configuration field: weekly_area_name_patterns.Roof",
+        ),
+        (
+            {"weekly_shared_number_areas": {"70": "Wine Dinners"}},
+            "four-digit POS numbers",
+        ),
+        (
+            {"weekly_shared_number_areas": {"7070": "Roof"}},
+            "must name a configured weekly area",
         ),
     ],
 )

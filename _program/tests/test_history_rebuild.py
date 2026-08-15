@@ -67,6 +67,57 @@ def rebuild_args(tmp_path: Path) -> Namespace:
     )
 
 
+def test_manifest_pinned_archive_capture_is_parsed_one_payload_at_a_time(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    archive_dir = tmp_path / "03 Archive"
+    raw_root = archive_dir / metrics.CANONICAL_DAILY_ARCHIVE_FOLDER
+    raw_root.mkdir(parents=True)
+    report_dates = (date(2026, 7, 14), date(2026, 7, 15), date(2026, 7, 16))
+    source_paths: list[Path] = []
+    records_by_name: dict[str, list[metrics.MetricRecord]] = {}
+    for report_date in report_dates:
+        source = raw_root / f"Daily Report {report_date.isoformat()}.xls"
+        source.write_bytes(f"manifest-pinned-{report_date.isoformat()}".encode())
+        source_paths.append(source)
+        records_by_name[source.name] = reconciled_day(report_date, source.name)
+    expected_inventory = tuple(
+        metrics.fingerprint_file(raw_root, source) for source in source_paths
+    )
+
+    events: list[tuple[str, str]] = []
+    real_capture = metrics.capture_regular_file
+
+    def tracked_capture(source: Path, *, fingerprint_path: str):
+        capture = real_capture(source, fingerprint_path=fingerprint_path)
+        events.append(("capture", source.name))
+        return capture
+
+    def tracked_parse(path: Path, config: dict) -> list[metrics.MetricRecord]:
+        events.append(("parse", path.name))
+        return records_by_name[path.name]
+
+    monkeypatch.setattr(metrics, "capture_regular_file", tracked_capture)
+    monkeypatch.setattr(metrics, "parse_daily_report", tracked_parse)
+
+    records = metrics.read_captured_reports_by_path(
+        metrics.capture_archived_report_inputs(
+            archive_dir,
+            expected_inventory=expected_inventory,
+        ),
+        metrics.DEFAULT_CONFIG,
+    )
+
+    expected_events = [
+        event
+        for source in source_paths
+        for event in (("capture", source.name), ("parse", source.name))
+    ]
+    assert events == expected_events
+    assert tuple(records) == tuple(source_paths)
+
+
 def test_history_rebuild_ignores_active_intake_and_commits_one_manifest(
     tmp_path: Path,
     monkeypatch,

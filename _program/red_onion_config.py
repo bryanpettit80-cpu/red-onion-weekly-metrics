@@ -6,6 +6,7 @@ from datetime import date
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -97,6 +98,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "Bar Server": "Bar",
         "BarPatio Bartender Patio": "Patio",
     },
+    "weekly_area_name_patterns": {
+        "Bar": ["Bar"],
+        "Patio": ["Patio"],
+        "Dining Room": ["Dining Room"],
+        "Banquets": ["Banquet"],
+        "Wine Dinners": ["Wine Dinner", "WineDinner"],
+    },
+    "weekly_shared_number_areas": {},
     "public_exclude_name_contains": [
         "Banquet",
         "Takeout",
@@ -254,21 +263,34 @@ def _validate_effective_locations(locations_value: Any) -> None:
 
 
 def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # Validate a private copy so every accepted string can be retained in the
+    # same stripped form that the validator evaluated.
+    payload = copy.deepcopy(payload)
     _reject_unknown_fields(payload, set(DEFAULT_CONFIG), "")
 
     if "locations" in payload:
         locations = _require_mapping(payload["locations"], "locations")
         if not locations:
             raise ConfigError("locations must define at least one location.")
+        normalized_locations: dict[str, Any] = {}
+        normalized_location_keys: set[str] = set()
         for location, settings_value in locations.items():
-            _require_string(location, "locations key")
+            normalized_location = _require_string(location, "locations key")
+            normalized_key = normalized_location.casefold()
+            if normalized_key in normalized_location_keys:
+                raise ConfigError("locations names must be unique ignoring case.")
+            normalized_location_keys.add(normalized_key)
             settings = _require_mapping(settings_value, f"locations.{location}")
             _reject_unknown_fields(settings, {"short_code"}, f"locations.{location}")
             if "short_code" not in settings:
                 raise ConfigError(f"locations.{location}.short_code is required.")
-            _require_string(
+            normalized_short_code = _require_string(
                 settings["short_code"], f"locations.{location}.short_code"
             )
+            normalized_locations[normalized_location] = {
+                "short_code": normalized_short_code,
+            }
+        payload["locations"] = normalized_locations
 
     for field in POSITIVE_INTEGER_FIELDS & set(payload):
         _require_positive_integer(payload[field], field)
@@ -279,13 +301,62 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "public_exclude_name_contains",
     ):
         if field in payload:
-            _validate_string_list(payload[field], field)
+            payload[field] = _validate_string_list(payload[field], field)
 
     if "public_name_aliases" in payload:
         aliases = _require_mapping(payload["public_name_aliases"], "public_name_aliases")
+        normalized_aliases: dict[str, str] = {}
         for source, target in aliases.items():
-            _require_string(source, "public_name_aliases key")
-            _require_string(target, f"public_name_aliases.{source}")
+            normalized_source = _require_string(source, "public_name_aliases key")
+            if normalized_source in normalized_aliases:
+                raise ConfigError(
+                    "public_name_aliases keys must be unique after trimming whitespace."
+                )
+            normalized_aliases[normalized_source] = _require_string(
+                target, f"public_name_aliases.{source}"
+            )
+        payload["public_name_aliases"] = normalized_aliases
+
+    if "weekly_area_name_patterns" in payload:
+        patterns = _require_mapping(
+            payload["weekly_area_name_patterns"], "weekly_area_name_patterns"
+        )
+        _reject_unknown_fields(
+            patterns,
+            set(DEFAULT_CONFIG["weekly_area_name_patterns"]),
+            "weekly_area_name_patterns",
+        )
+        for area, values in patterns.items():
+            patterns[area] = _validate_string_list(
+                values, f"weekly_area_name_patterns.{area}"
+            )
+
+    if "weekly_shared_number_areas" in payload:
+        shared_areas = _require_mapping(
+            payload["weekly_shared_number_areas"], "weekly_shared_number_areas"
+        )
+        normalized_shared_areas: dict[str, str] = {}
+        for number, area in shared_areas.items():
+            normalized_number = _require_string(
+                number, "weekly_shared_number_areas key"
+            )
+            if not re.fullmatch(r"\d{4}", normalized_number):
+                raise ConfigError(
+                    "weekly_shared_number_areas keys must be four-digit POS numbers."
+                )
+            normalized_area = _require_string(
+                area, f"weekly_shared_number_areas.{number}"
+            )
+            if normalized_area not in DEFAULT_CONFIG["weekly_area_name_patterns"]:
+                raise ConfigError(
+                    f"weekly_shared_number_areas.{number} must name a configured weekly area."
+                )
+            if normalized_number in normalized_shared_areas:
+                raise ConfigError(
+                    "weekly_shared_number_areas keys must be unique after trimming whitespace."
+                )
+            normalized_shared_areas[normalized_number] = normalized_area
+        payload["weekly_shared_number_areas"] = normalized_shared_areas
 
     for threshold_family in (
         "management_score_thresholds",
@@ -461,10 +532,14 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ConfigError(
                     f"management_threshold_calibration.{field} must be YYYY-MM-DD."
                 ) from exc
-        _require_string(
+            if field in calibration:
+                calibration[field] = value
+        normalized_version = _require_string(
             effective_calibration["version"],
             "management_threshold_calibration.version",
         )
+        if "version" in calibration:
+            calibration["version"] = normalized_version
 
     if "management_materiality" in payload:
         materiality = _require_mapping(

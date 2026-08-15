@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import date
 
 from openpyxl import Workbook
@@ -73,6 +74,79 @@ def test_operational_rollup_uses_harmonic_ros_and_check_weighted_ticket_time() -
     assert rollup["sales_per_check"] == pytest.approx(37.5)
     assert rollup["guests_per_check"] == pytest.approx(3.75)
     assert rollup["ticket_time_weight_basis"] == "Check Count"
+
+
+def test_zero_check_count_keeps_count_available_but_per_check_ratios_unavailable() -> None:
+    rollup = metrics.aggregate_records(
+        [
+            record(
+                "A",
+                gross_sales=1_000,
+                guests=100,
+                checks=0,
+                rate=5,
+                ticket_seconds=100,
+            )
+        ],
+        ("location",),
+    )[0]
+
+    assert rollup["check_count"] == 0
+    assert rollup["check_count_available"] is True
+    assert rollup["per_check_available"] is False
+    assert metrics.management_metric_available(rollup, "sales_per_check") is False
+    assert metrics.management_metric_available(rollup, "guests_per_check") is False
+
+
+def test_check_only_day_does_not_increase_active_days_or_review_eligibility() -> None:
+    source = [
+        replace(
+            record(
+                "A",
+                gross_sales=1_000,
+                guests=100,
+                checks=10,
+                rate=5,
+                ticket_seconds=100,
+            ),
+            report_date=date(2026, 7, 21),
+        ),
+        replace(
+            record(
+                "A",
+                gross_sales=1_000,
+                guests=100,
+                checks=10,
+                rate=5,
+                ticket_seconds=100,
+            ),
+            report_date=date(2026, 7, 22),
+        ),
+        replace(
+            record(
+                "A",
+                gross_sales=0,
+                guests=0,
+                checks=5,
+                rate=0,
+                ticket_seconds=100,
+            ),
+            report_date=date(2026, 7, 23),
+        ),
+    ]
+
+    rollup = metrics.aggregate_records(
+        source,
+        ("location", "raw_user_name", "display_name"),
+        {
+            "week_start": date(2026, 7, 21),
+            "week_end": date(2026, 7, 26),
+        },
+    )[0]
+
+    assert rollup["active_days"] == 2
+    assert rollup["source_days"] == 2
+    assert metrics.dashboard_trend_eligible(rollup, metrics.DEFAULT_CONFIG) is False
 
 
 def test_all_dict_rollup_paths_use_the_same_operational_semantics() -> None:
