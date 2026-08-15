@@ -149,6 +149,64 @@ def test_dashboard_is_one_screen_and_deduplicates_actions() -> None:
         assert ws.cell(row=row, column=6).border.right.style == "thin"
 
 
+def test_dashboard_action_dedup_keeps_same_topic_for_distinct_stores() -> None:
+    richmond = action("store|rc richmond|traffic-watch", "RC Richmond", "Review")
+    richmond.update(
+        {
+            "Location": "RC Richmond",
+            "Action": "Store Review",
+            "Signal": "Traffic Watch",
+        }
+    )
+    virginia_beach = action(
+        "store|rc virginia beach|traffic-watch",
+        "RC Virginia Beach",
+        "Review",
+    )
+    virginia_beach.update(
+        {
+            "Location": "RC Virginia Beach",
+            "Action": "Store Review",
+            "Signal": "Traffic Watch",
+        }
+    )
+
+    selected = metrics.deduplicated_dashboard_actions(
+        [richmond, dict(richmond), virginia_beach],
+        {"Review"},
+    )
+
+    assert [row["Entity Key"] for row in selected] == [
+        "store|rc richmond|traffic-watch",
+        "store|rc virginia beach|traffic-watch",
+    ]
+
+
+def test_dashboard_does_not_display_zero_denominator_per_check_values() -> None:
+    wb = Workbook()
+    records, weekly_locations, stores, groups, actions = dashboard_inputs()
+    for store in stores:
+        store["latest"].update(
+            {
+                "check_count": 0.0,
+                "check_count_available": True,
+                "per_check_available": False,
+                "sales_per_check": 0.0,
+                "guests_per_check": 0.0,
+            }
+        )
+
+    metrics.write_management_dashboard_sheet(
+        wb, records, weekly_locations, [], [], stores, groups, actions
+    )
+
+    dashboard = wb["Dashboard"]
+    for row in (19, 20):
+        assert dashboard.cell(row=row, column=7).value == 0
+        assert dashboard.cell(row=row, column=9).value == "n/a"
+        assert dashboard.cell(row=row, column=10).value == "n/a"
+
+
 def test_incomplete_week_pauses_comparisons_actions_and_recognition() -> None:
     wb = Workbook()
     records, weekly_locations, stores, groups, actions = dashboard_inputs(source_days=5)

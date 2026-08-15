@@ -10,6 +10,19 @@ import pytest
 import red_onion_weekly_metrics as metrics
 
 
+def test_compact_action_row_height_accounts_for_wrapping_and_newlines() -> None:
+    values: list[object] = [None] * len(metrics.ACTION_HEADERS)
+    values[11] = "x" * 101
+    assert metrics.compact_action_row_height(values) == 45
+
+    values[11] = None
+    values[13] = "x" * 140
+    assert metrics.compact_action_row_height(values) == 75
+
+    values[13] = "one\ntwo\nthree\nfour\nfive\nsix"
+    assert metrics.compact_action_row_height(values) == 90
+
+
 @pytest.mark.parametrize(
     ("hidden_columns", "expected_bounds"),
     [
@@ -53,6 +66,17 @@ def test_management_menu_preserves_column_widths_and_visibility(
     }
     assert after == before
     assert metrics.management_menu_bounds(worksheet) == expected_bounds
+
+
+def test_management_menu_reads_excel_grouped_hidden_columns_without_mutation() -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Management Center"
+    worksheet.column_dimensions.group("A", "B", hidden=True)
+
+    assert "B" not in worksheet.column_dimensions
+    assert metrics.management_menu_bounds(worksheet) == (3, 14)
+    assert "B" not in worksheet.column_dimensions
 
 
 def make_record(
@@ -940,8 +964,22 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Store Week Trends"].sheet_state == "veryHidden"
     assert wb.active.title == "How to Use"
     assert wb["How to Use"].sheet_state == "visible"
-    assert wb["Dashboard"].sheet_state == "visible"
-    assert wb["Action Board"].sheet_state == "visible"
+    assert wb["Management Center"].sheet_state == "visible"
+    assert all(
+        wb[name].sheet_state == "veryHidden"
+        for name in (
+            "Dashboard",
+            "Team Trends",
+            "Store & Group Scorecards",
+            "Evidence Detail",
+            "Data Quality",
+            "Run Notes",
+        )
+    )
+    assert all(
+        name not in wb.sheetnames
+        for name in ("Action Board", "Action History", "Management Setup")
+    )
 
     guide = wb["How to Use"]
     guide_values = {
@@ -963,13 +1001,14 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         guide.column_dimensions[metrics.get_column_letter(column)].width == 13
         for column in range(1, 13)
     )
-    assert guide.row_dimensions[1].height == 32
+    assert guide.row_dimensions[1].height == pytest.approx(32.1)
     assert guide.row_dimensions[2].height == 24
     assert guide.row_dimensions[3].height == 24
     assert guide.row_dimensions[4].height == 54
     assert guide.row_dimensions[30].height == 42
-    assert guide.row_dimensions[58].height == 24
-    assert guide.row_dimensions[59].height == 72
+    assert guide.row_dimensions[28].height == 66
+    assert guide.row_dimensions[53].height == 24
+    assert guide.row_dimensions[54].height == 72
     assert guide["A44"].value == metrics.HOW_TO_USE_SECTION_HEADINGS[6]
     assert metrics.MANAGEMENT_METHODOLOGY_VERSION in "\n".join(guide_values)
     for phrase in (
@@ -978,6 +1017,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         "ExternalCheckRequired",
         "Rate of Sale is opportunities divided by qualifying sales",
         "Ticket Time is weighted only by complete Check Count coverage",
+        metrics.WORKBOOK_OPERATOR_PASSWORD,
     ):
         assert phrase in "\n".join(guide_values)
     for field in (
@@ -1078,9 +1118,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         frozen_at = worksheet.freeze_panes
         assert frozen_at is not None
         assert int("".join(character for character in str(frozen_at) if character.isdigit())) >= 3
-    assert metrics.management_menu_bounds(wb["Action Board"]) == (3, 21)
-    assert metrics.management_menu_bounds(wb["Action History"]) == (3, 14)
-    assert metrics.management_menu_bounds(wb["Evidence Detail"]) == (1, 14)
+    assert metrics.management_menu_bounds(wb["Management Center"]) == (3, 21)
     assert "Action Focus" not in wb.sheetnames
     assert "Server Scorecard" not in wb.sheetnames
     assert "Recent Movement Signals" not in wb.sheetnames
@@ -1101,9 +1139,10 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Store & Group Scorecards"]._charts[0].anchor._from.row == 3
     assert wb["Store & Group Scorecards"]._charts[1].anchor._from.row == 16
 
+    center = wb["Management Center"]
     action_values = {
         value
-        for row in wb["Action Board"].iter_rows(values_only=True)
+        for row in center.iter_rows(values_only=True)
         for value in row
         if isinstance(value, str)
     }
@@ -1111,27 +1150,104 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert "Due Date" in action_values
     assert "Status" in action_values
     assert "Recommended Next Step" in action_values
-    assert len(wb["Action Board"].data_validations.dataValidation) == 3
-    assert len(wb["Action Board"].conditional_formatting) >= 3
-    assert wb["Action Board"]["C3"].value.startswith("Single action queue:")
+    assert {
+        "ManagementTargets",
+        metrics.OWNER_ROSTER_TABLE_NAME,
+        "ActionBoardTable",
+    }.issubset(center.tables)
+    assert len(center.data_validations.dataValidation) == 4
+    assert len(center.conditional_formatting) >= 3
+    assert center["C3"].value.startswith("Weekly control center:")
     assert "C3:W3" in {
-        str(merged) for merged in wb["Action Board"].merged_cells.ranges
+        str(merged) for merged in center.merged_cells.ranges
     }
-    assert wb["Action Board"].row_dimensions[3].height == 36
+    assert {
+        "C5:I5",
+        "C11:I11",
+        "K11:L11",
+    }.issubset({str(merged) for merged in center.merged_cells.ranges})
+    assert center.row_dimensions[3].height == 42
     assert all(
-        wb["Action Board"].column_dimensions[column].hidden is True
+        center.column_dimensions[column].hidden is True
         for column in ("A", "B", "J", "M", "O", "P", "Q", "R", "T")
     )
-    assert wb["Action Board"].row_dimensions[4].height == 30
-    assert wb["Action Board"].row_dimensions[5].height == 60
-    assert wb["Action Board"]["L5"].alignment.wrap_text is True
-    assert wb["Action Board"]["N5"].alignment.wrap_text is True
-    assert wb["Action Board"]["F5"].number_format == "m/d/yyyy"
-    assert wb["Action Board"]["M5"].number_format == "m/d/yyyy"
-    assert wb["Action Board"]["Q5"].number_format == "m/d/yyyy"
-    assert wb["Action Board"]["W5"].number_format == "m/d/yyyy"
-    assert wb["Action History"].row_dimensions[4].height == 30
+    assert center.row_dimensions[12].height == 45
+    action_min_col, action_header_row, action_max_col, action_last_row = (
+        metrics.range_boundaries(center.tables["ActionBoardTable"].ref)
+    )
+    assert (action_min_col, action_max_col) == (1, len(metrics.ACTION_HEADERS))
+    assert center.row_dimensions[action_header_row].height == 30
+    assert center.row_dimensions[action_header_row + 1].height == 45
+    assert center.cell(action_header_row + 1, 12).alignment.wrap_text is True
+    assert center.cell(action_header_row + 1, 14).alignment.wrap_text is True
+    assert (
+        center.cell(action_header_row + 1, 6).number_format
+        == metrics.EXCEL_DATE_NUMBER_FORMAT
+    )
+    assert (
+        center.cell(action_header_row + 1, 13).number_format
+        == metrics.EXCEL_DATE_NUMBER_FORMAT
+    )
+    assert (
+        center.cell(action_header_row + 1, 17).number_format
+        == metrics.EXCEL_DATE_NUMBER_FORMAT
+    )
+    assert (
+        center.cell(action_header_row + 1, 23).number_format
+        == metrics.EXCEL_DATE_NUMBER_FORMAT
+    )
+    assert any(
+        isinstance(value, str) and value.startswith("ACTION HISTORY |")
+        for value in action_values
+    )
+    history_title_row = next(
+        row
+        for row in range(1, center.max_row + 1)
+        if isinstance(center.cell(row, 3).value, str)
+        and center.cell(row, 3).value.startswith("ACTION HISTORY |")
+    )
+    assert center.print_area == f"'Management Center'!$A$1:$W${action_last_row}"
+    assert action_last_row < history_title_row
+    assert center.page_setup.fitToHeight == 1
+    assert center.page_setup.pageOrder == "overThenDown"
+    assert all(center.row_dimensions[row].hidden is not True for row in range(13, 28))
+    assert all(center.row_dimensions[row].hidden is True for row in range(28, 63))
     evidence = wb["Evidence Detail"]
+    action_id_column = next(
+        column
+        for column in range(action_min_col, action_max_col + 1)
+        if center.cell(action_header_row, column).value == "Action ID"
+    )
+    action_rows_by_id = {
+        str(center.cell(row, action_id_column).value): row
+        for row in range(action_header_row + 1, action_last_row + 1)
+        if center.cell(row, action_id_column).value not in (None, "")
+    }
+    evidence_action_id = str(evidence["B5"].value)
+    assert metrics.workbook_internal_hyperlink_destination(
+        evidence["A5"].hyperlink,
+        sheet_name=evidence.title,
+        coordinate="A5",
+    ) == (
+        f"'{metrics.MANAGEMENT_CENTER_SHEET}'!"
+        f"C{action_rows_by_id[evidence_action_id]}"
+    )
+    for worksheet in wb.worksheets:
+        for cell in worksheet._cells.values():
+            if cell.hyperlink is None:
+                continue
+            destination = metrics.workbook_internal_hyperlink_destination(
+                cell.hyperlink,
+                sheet_name=worksheet.title,
+                coordinate=cell.coordinate,
+            )
+            assert destination is not None
+            if "!" not in destination:
+                continue
+            target_sheet = destination.rsplit("!", 1)[0]
+            if target_sheet.startswith("'") and target_sheet.endswith("'"):
+                target_sheet = target_sheet[1:-1].replace("''", "'")
+            assert target_sheet in wb.sheetnames
     assert evidence.row_dimensions[3].height == 54
     assert "exact raw Evidence Sources and Metric Evidence columns are hidden" in (
         evidence["A3"].value
@@ -1178,8 +1294,8 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             column=2,
         ).alignment.wrap_text is True
     assert "Check Count Coverage" in run_note_rows
-    assert wb["Management Setup"].row_dimensions[5].height == 30
-    assert wb["Management Setup"]["C5"].alignment.wrap_text is True
+    assert center.row_dimensions[12].height == 45
+    assert center["D12"].alignment.wrap_text is True
     assert all(
         wb["Store & Group Scorecards"].row_dimensions[row].height == 30
         for row in range(18, 30)
@@ -1196,13 +1312,12 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
     assert wb["Dashboard"].row_dimensions[20].height == 60
     assert wb["Dashboard"]["K19"].alignment.wrap_text is True
     assert wb["Dashboard"]["K20"].alignment.wrap_text is True
-    assert wb["Dashboard"].row_dimensions[9].height == 32
+    assert wb["Dashboard"].row_dimensions[9].height == pytest.approx(32.1)
     trends = wb["Team Trends"]
     assert trends.row_dimensions[1].height == 42
     assert trends.row_dimensions[3].height == 30
     assert trends.row_dimensions[4].height == 54
     assert trends.freeze_panes == "E4"
-    assert trends.page_setup.fitToWidth == 2
     assert trends.max_row == 5
     assert "TeamTrends" in trends.tables
     assert [trends.cell(row=row, column=1).value for row in (4, 5)] == [
@@ -1242,7 +1357,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
             "Q": 52,
         },
         "Data Quality": {"D": 13, "F": 69},
-        "Management Setup": {"D": 25, "E": 48},
+        "Management Center": {"D": 14, "K": 46, "L": 48},
         "Run Notes": {"A": 30, "B": 96},
         "Evidence Detail": {"D": 46},
     }.items():
@@ -1251,7 +1366,7 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
                 wb[sheet_name].column_dimensions[column].width
                 == expected_width
             )
-    assert "ManagementTargets" in wb["Management Setup"].tables
+    assert "ManagementTargets" in center.tables
     assert "Alex Rising" in {
         cell.value for row in trends.iter_rows() for cell in row
     }
@@ -1338,20 +1453,38 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
         date(2026, 6, 16), date(2026, 6, 21),
     )
     wb = load_workbook(output_path)
-    setup = wb["Management Setup"]
-    setup["D7"] = 28.0
-    setup["A21"] = "Pat Manager"
-    setup["B21"] = "Yes"
-    actions = wb["Action Board"]
-    assert actions.max_row >= 5
-    actions["D5"] = "In Progress"
-    actions["E5"] = "Pat Manager"
-    actions["F5"] = date(2026, 6, 30)
-    actions["N5"] = "Follow up Friday"
-    actions["U5"] = "Coaching Accepted"
-    actions["V5"] = "Pat Manager"
-    actions["W5"] = date(2026, 6, 23)
-    action_id = actions["A5"].value
+    center = wb["Management Center"]
+    target_min_col, target_header_row, target_max_col, target_last_row = (
+        metrics.range_boundaries(center.tables["ManagementTargets"].ref)
+    )
+    target_headers = {
+        center.cell(target_header_row, column).value: column
+        for column in range(target_min_col, target_max_col + 1)
+    }
+    richmond_row = next(
+        row
+        for row in range(target_header_row + 1, target_last_row + 1)
+        if center.cell(row, target_headers["Entity"]).value == "RC Richmond"
+    )
+    center.cell(richmond_row, target_headers["Check Average Target"]).value = 28.0
+    roster_min_col, roster_header_row, _, _ = metrics.range_boundaries(
+        center.tables[metrics.OWNER_ROSTER_TABLE_NAME].ref
+    )
+    center.cell(roster_header_row + 1, roster_min_col).value = "Pat Manager"
+    center.cell(roster_header_row + 1, roster_min_col + 1).value = "Yes"
+    _, action_header_row, _, action_last_row = metrics.range_boundaries(
+        center.tables["ActionBoardTable"].ref
+    )
+    assert action_last_row > action_header_row
+    action_row_number = action_header_row + 1
+    center.cell(action_row_number, 4).value = "In Progress"
+    center.cell(action_row_number, 5).value = "Pat Manager"
+    center.cell(action_row_number, 6).value = date(2026, 6, 30)
+    center.cell(action_row_number, 14).value = "Follow up Friday"
+    center.cell(action_row_number, 21).value = "Coaching Accepted"
+    center.cell(action_row_number, 22).value = "Pat Manager"
+    center.cell(action_row_number, 23).value = date(2026, 6, 23)
+    action_id = center.cell(action_row_number, 1).value
     wb.save(output_path)
     wb.close()
 
@@ -1361,12 +1494,15 @@ def test_master_regeneration_preserves_targets_and_manual_action_fields(tmp_path
     )
 
     regenerated = load_workbook(output_path, data_only=False)
-    assert regenerated["Management Setup"]["D7"].value == 28.0
-    roster = regenerated["Management Setup"].tables[metrics.OWNER_ROSTER_TABLE_NAME]
-    assert roster.ref == "A20:B70"
-    assert regenerated["Management Setup"]["A21"].value == "Pat Manager"
-    assert regenerated["Management Setup"]["B21"].value == "Yes"
-    action_rows = metrics.records_from_sheet(regenerated["Action Board"], "Action ID")
+    center = regenerated["Management Center"]
+    target_rows = metrics.records_from_table(center, "ManagementTargets")
+    richmond = next(row for row in target_rows if row["Entity"] == "RC Richmond")
+    assert richmond["Check Average Target"] == 28.0
+    roster = center.tables[metrics.OWNER_ROSTER_TABLE_NAME]
+    assert roster.ref == "K12:L62"
+    assert center["K13"].value == "Pat Manager"
+    assert center["L13"].value == "Yes"
+    action_rows = metrics.records_from_table(center, "ActionBoardTable")
     carried = next(row for row in action_rows if row["Action ID"] == action_id)
     assert carried["Status"] == "In Progress"
     assert carried["Owner"] == "Pat Manager"

@@ -25,6 +25,21 @@ The approval does not authorize a different file, a regenerated package, a
 different purpose, or broader distribution. Existing V1 packages remain
 readable for audit and retention, but all newly generated packages use V2.
 
+## Aggregate Operational Views
+
+Leading four-digit shared POS identities are shared operating records, not
+person identities. They must remain outside server scorecards, peer cohorts,
+people-review signals, evidence packages, and employment decisions.
+
+Bar, Patio, Dining Room, Banquets, and Wine Dinners trends are operational
+aggregates across complete weeks. Sales/Guest is guest-weighted: total Gross
+Sales divided by total Guests. Dining Room is the fallback for eligible named
+rows not assigned to another area. Wine Dinners must show as unavailable until
+the source supplies an explicitly configured name or
+`weekly_shared_number_areas` maps a shared POS number to that area. These views
+may support high-level operating observation, but they cannot create, change,
+or escalate a person-level review action.
+
 ## Prohibited Use
 
 The signal or evidence package must never be the sole or determinative basis
@@ -71,6 +86,24 @@ workbooks. Raw workbooks are not automatically attached, uploaded, or sent.
 V1 packages remain readable but are never silently upgraded or treated as if
 they contain V2 review evidence.
 
+## Workbook Presentation And Edit Boundaries
+
+The operator-facing workbook has seven visible tabs: `How to Use`,
+`Performance Dashboard`, `Server Scorecards`, `Weekly Performance`, `Shared &
+Area Trends`, `Methodology`, and `Management Center`. `Management Center`
+consolidates the data-readiness summary, editable targets and owner roster,
+Current Actions, and locked Action History that previously occupied separate
+operator tabs.
+
+The permitted workbook inputs are target values in `D:I` (Entity in `C` stays
+locked), Owner Roster values in `K:L`, and Current Actions Status (`D`), Owner
+(`E`), Due Date (`F`), Context Notes (`N`), Review Disposition (`U`), Reviewed
+By (`V`), and Review Date (`W`). The readiness summary and Action History are
+read-only. Detailed `Data Quality`, `Evidence Detail`, and `Run Notes`, legacy
+presentation sheets, and technical calculation/raw layers remain protected
+`veryHidden` audit/support sheets. Their visibility does not change their
+classification, retention, review, or access requirements.
+
 ## Retention
 
 - Identifiable action/coaching workbook and approved-AI evidence: 365 days.
@@ -89,6 +122,13 @@ they contain V2 review evidence.
   administered, with two-factor authentication and access review.
 - Do not forward, place in personal collaboration tools, or make offline copies
   outside an approved business purpose.
+
+The lowercase workbook password `redonion` is only a convenience against
+accidental edits for authorized operators. It is not encryption, does not grant
+Dropbox access, and does not weaken role restrictions, recovery controls, the
+manifest chain, or the machine-local trusted head. A saved change to generated
+workbook content or structure still fails the substantive-digest check; correct
+source/configuration and regenerate instead of editing the managed master.
 
 The one-time Gmail history backfill is restricted to original Marketing Vitals
 TM report attachments needed for the approved historical window. Retrieve them

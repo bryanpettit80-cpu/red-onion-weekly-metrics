@@ -114,6 +114,14 @@
     "Bar Server": "Bar",
     "BarPatio Bartender Patio": "Patio"
   },
+  "weekly_area_name_patterns": {
+    "Bar": ["Bar"],
+    "Patio": ["Patio"],
+    "Dining Room": ["Dining Room"],
+    "Banquets": ["Banquet"],
+    "Wine Dinners": ["Wine Dinner", "WineDinner"]
+  },
+  "weekly_shared_number_areas": {},
   "public_exclude_name_contains": [
     "Banquet",
     "Takeout",

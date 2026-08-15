@@ -83,7 +83,7 @@ Each successful run also creates tamper-detection evidence, not immutable storag
 
 Hash verification detects a later change. It cannot prevent an editor from changing or deleting Dropbox content, so these artifacts do not replace restricted folder permissions, version history, or an independently retained backup.
 
-A maintainer must explicitly initialize or verify the starting state before the first protected run, using `.\Run-WeeklySnapshot.ps1 -InitializeIntegrityBaseline` (or `python red_onion_weekly_metrics.py --initialize-integrity-baseline`). Ordinary runs fail closed when the baseline or manifest history is missing and never silently replace it. A manifest-pinned owner-roster workbook from the immediately preceding protection contract may be adopted without rewriting it; history-only migration is blocked until the next ordinary weekly run regenerates that workbook with current strict controls. Subsequent runs fail before workbook generation if the chain, archived raw inputs, archived generated workbooks, published public reports, or protected generated portions of the master no longer match. The weekly publish is staged and run-locked; exact captured source bytes are used for calculation and archiving, and active source files are quarantined and deleted only after verified archive copies, final outputs, the generated-workbook snapshot, and the new manifest are committed.
+A maintainer must explicitly initialize or verify the starting state before the first protected run, using `.\Run-WeeklySnapshot.ps1 -InitializeIntegrityBaseline` (or `python red_onion_weekly_metrics.py --initialize-integrity-baseline`). Ordinary runs fail closed when the baseline or manifest history is missing and never silently replace it. A manifest-pinned owner-roster workbook from the immediately preceding supported layout or protection contract may be adopted without rewriting it; history-only migration is blocked until the next ordinary weekly run regenerates that workbook with the current layout and strict controls. Subsequent runs fail before workbook generation if the chain, archived raw inputs, archived generated workbooks, published public reports, or protected generated portions of the master no longer match. The weekly publish is staged and run-locked; exact captured source bytes are used for calculation and archiving, and active source files are quarantined and deleted only after verified archive copies, final outputs, the generated-workbook snapshot, and the new manifest are committed.
 
 The launcher stores the trusted manifest-head anchor outside Dropbox under `%LOCALAPPDATA%\RedOnionMetrics\integrity-anchors`. Keep access to that machine-local location restricted to the Windows account that runs the automation, and include it in the maintainer's independent recovery backup. The anchor pins the exact latest manifest path and hash and advances only after a verified manifest commit. Once present, neither an ordinary run nor `--initialize-integrity-baseline` will accept a deleted chain or a rewritten raw-data/manifest pair. There is intentionally no automated reset option; reconcile and restore trusted history before adopting an existing chain on a replacement runner.
 
@@ -100,7 +100,7 @@ The launcher permits existing ignored Python bytecode but isolates each run by d
 
 ## Operational Context And Person-Action Scope
 
-Methodology `2026.07-v3` maintains two calculation scopes:
+The generator maintains three calculation scopes:
 
 - `SERVER_PERSON_ACTION_FIELDS` contains only `check_average` (displayed as
   Sales/Guest) and `wine_pct`. Only these two fields may affect person-level
@@ -110,6 +110,13 @@ Methodology `2026.07-v3` maintains two calculation scopes:
   `average_ticket_time_seconds`. These fields, Check Count, Sales/Check, and
   Guests/Check remain visible descriptive context and must not affect a
   person-level action.
+- Descriptive methodology `2026.08-v1` independently computes the protected
+  performance/consistency views from Sales/Guest and Wine %; its rows and
+  classifications never enter `SERVER_PERSON_ACTION_FIELDS`, composite
+  direction, persistence, stability, or action classification.
+- Shared four-digit POS identities and operating-area aggregates are a separate
+  operations view. They never enter the person roster, peer pool, persistence,
+  stability, or action classification.
 
 Red Onion defines Rate of Sale as
 `opportunities / qualifying sales`; lower is better. For positive available
@@ -138,7 +145,47 @@ Guests/Check           = sum(guests) / sum(Check Count)
 Incomplete Check Count coverage makes the combined Ticket Time and derived
 per-check context unavailable; guest weighting is not a fallback.
 
-## Coaching-Signal Interpretation
+## Descriptive Performance And Consistency Scope
+
+Methodology `2026.08-v1` uses the latest eight globally complete weeks and the
+current non-excluded roster. A person-week requires at least 25 guests and
+three active days. Its leave-one-person-out comparison is the median of at
+least five other qualified current-roster servers in the same store and week.
+The summary peer gaps use a weekly weight of `min(guests, 50)`; eight-week
+Sales/Guest and Wine % use aggregated qualified sales, guests, and wine sales.
+
+Weekly bands are `Strong`, `Below`, `Near Peer`, `Mixed`, or `Not Qualified`.
+The Strong/Below boundaries are plus or minus $11.50 for Sales/Guest and 4.1
+percentage points for Wine, with the other gap required on the same side of
+zero. Data-sufficiency `Confidence` is `High` at six qualified weeks and 200
+qualified guests, `Provisional` at four weeks and 150 guests, and `Insufficient`
+otherwise. It is not statistical confidence.
+
+Consistency is the sample standard deviation of qualified weekly peer gaps.
+High requires both SDs at or below $11.50 and 4.1 percentage points; Moderate
+requires both at or below $17.50 and 5.7 points. Recent movement is the
+capped-weighted recent-four gap minus the prior-four gap and is highlighted at
+$5 or 1.5 percentage points. Missing and unqualified weeks are unavailable,
+not zero. The weekly runner regenerates static protected values from source;
+Excel does not recalculate this layer live.
+
+The operator-facing workbook has exactly seven visible tabs: `How to Use`,
+`Performance Dashboard`, `Server Scorecards`, `Weekly Performance`, `Shared &
+Area Trends`, `Methodology`, and `Management Center`. The five analytical tabs
+are read-only by default.
+`Performance Dashboard` includes an all-stores location-total card for the
+latest complete week and comparison with the preceding four complete weeks.
+`Shared & Area Trends` groups leading four-digit shared POS identities by store
+and reports guest-weighted `Gross Sales / Guests` for Bar, Patio, Dining Room,
+Banquets, and Wine Dinners across the latest eight complete shared weeks.
+Dining Room is the residual eligible named-server population. Wine Dinners
+remains unavailable until a source label or shared number is configured in
+`weekly_area_name_patterns` or `weekly_shared_number_areas`. `_Consistency
+Calc` is protected and `veryHidden`. `Management Center` consolidates data
+readiness, targets and owner roster, current actions, and locked action history
+on one operator-facing sheet.
+
+## `2026.07-v3` Coaching-Signal Interpretation
 
 Methodology `2026.07-v3` is a deterministic, rule-based screening aid. It does
 not estimate statistical confidence, predict future performance, establish
@@ -181,42 +228,54 @@ scheduling, discipline, promotion, or termination. See
 [MODEL_CARD.md](../MODEL_CARD.md) and
 [DATA_GOVERNANCE.md](../DATA_GOVERNANCE.md).
 
-The management `Team Trends` sheet shows every current non-excluded server with
-current sample, exact consecutive-week Sales/Guest and Wine % changes,
-descriptive four-week movement, peer comparison, eight-week direction, evidence
-status, gated action outcome, and exact history used. Descriptive movement is
-visible even when action gates are not met; it does not create or strengthen a
-person-level prompt.
-
-`Action Board` is the single execution view and retains the seven editable
-management fields. `Evidence Detail` is protected/read-only and records stable
-codes, exact evidence weeks, source SHA-256/format/parser/date-source,
-methodology version, and metric evidence.
-
-`Data Quality` begins with the latest-week detail and a latest-first 16-week
-location completeness matrix. The matrix labels every location-week as
-Complete, Partial, or Missing before the historical exception, owner review,
-and source-provenance sections.
+The `Management Center` Current Actions section is the single execution view
+and retains the seven editable management fields. Its readiness summary brings
+forward the information needed for an ordinary review. Detailed `Data Quality`
+retains the latest-week detail, latest-first 16-week Complete/Partial/Missing
+matrix, exceptions, owner review, and source provenance. `Evidence Detail`
+retains stable codes, exact evidence weeks, source
+SHA-256/format/parser/date-source, methodology version, and metric evidence.
+Those detailed sheets, `Run Notes`, and legacy presentation sheets such as
+`Team Trends`, `Store & Group Scorecards`, and `Dashboard` are protected
+`veryHidden` audit/support layers rather than operator tabs.
 
 Before recording a disposition, the manager should ask whether the source and
 identity are correct, whether the work was reasonably comparable, whether
 check volume or a common store condition explains the movement, and what
 independent evidence supports the coaching or recognition conclusion.
 
-`Management Setup` targets, owner names, and manual `Action Board` fields are read from the existing master before regeneration. The new workbook is written to a temporary file and atomically replaces the prior master only after validation succeeds.
+Targets, owner names, and manual current-action fields are read from the
+existing master before regeneration. The immediately preceding supported
+layout with separate `Management Setup`, `Action Board`, `Action History`, and
+`Data Quality` tabs is migrated into the consolidated `Management Center` on
+the next successful ordinary run. The new workbook is written to a temporary
+file and atomically replaces the prior master only after validation succeeds.
 
 The supported management edit surface is intentionally narrow:
 
-- `Management Setup` configured-entity target cells in columns `B:G`.
-- The visible Owner Roster table beginning at `A20:B20`, with `Owner Name` and `Active` fields. Add new managers and mark departing managers inactive so historical assignments remain readable.
-- `Action Board` data cells for Status (`D`), Owner (`E`), Due Date (`F`),
+- `Management Center` target data cells in `D:I`; the Entity field in `C` is
+  locked.
+- Owner Roster cells in `K:L`, with `Owner Name` and `Active` fields. Add new
+  managers and mark departing managers inactive so historical assignments
+  remain readable.
+- Current Actions data cells for Status (`D`), Owner (`E`), Due Date (`F`),
   Context Notes (`N`), Review Disposition (`U`), Reviewed By (`V`), and Review
   Date (`W`). A generated item starts at `Review Needed`; it cannot advance
   without a non-pending disposition, reviewer, and review date.
 
-All other cells are locked, technical sheets are `veryHidden`, and workbook structure is protected. This guards against accidental manipulation but is not encryption; Dropbox access and the manifest/backup controls remain necessary.
+The `Management Center` readiness summary and Action History section are
+locked and read-only.
 
-Technical calculation and raw-detail sheets remain in the workbook as `veryHidden` sheets. Do not delete them from the generator; they provide auditability and chart sources.
+All other cells are locked, technical sheets are `veryHidden`, and workbook structure is protected. This guards against accidental manipulation but is not encryption. Authorized users can use **Review > Unprotect Sheet** or unprotect workbook structure with the documented lowercase password `redonion`. Exploratory changes belong in a separate copy: saving generated-content or structure changes into the managed master changes the substantive digest and can stop the next protected run. Dropbox access and the manifest/backup controls remain necessary.
+
+The five new analytical sheets have no supported editable cells or comments.
+Their values, tables, chart bindings, styles, visibility, and protection are
+covered by the substantive generated-content digest.
+
+Detailed `Data Quality`, `Evidence Detail`, and `Run Notes`, legacy
+presentation sheets, and technical calculation/raw-detail sheets remain in the
+workbook as `veryHidden` audit/support layers. Do not delete them from the
+generator; they provide auditability, run provenance, and chart sources.
 
 ## History Migration And Rebuild
 

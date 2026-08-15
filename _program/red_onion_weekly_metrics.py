@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from statistics import median
+from statistics import median, stdev
 from typing import Any, Iterable
 
 import pandas as pd
@@ -34,6 +34,7 @@ from openpyxl.utils import column_index_from_string, get_column_letter, range_bo
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.workbook.protection import WorkbookProtection
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -199,6 +200,38 @@ REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
 )
 MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v3"
 PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v2"
+PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION = "2026.08-v1"
+PERFORMANCE_CONSISTENCY_WINDOW_WEEKS = 8
+PERFORMANCE_CONSISTENCY_BLOCK_WEEKS = 4
+PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP = 50.0
+PERFORMANCE_CONSISTENCY_HIGH_MIN_WEEKS = 6
+PERFORMANCE_CONSISTENCY_HIGH_MIN_GUESTS = 200.0
+PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_WEEKS = 4
+PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_GUESTS = 150.0
+PERFORMANCE_CONSISTENCY_RECENT_SPG_THRESHOLD = 5.0
+PERFORMANCE_CONSISTENCY_RECENT_WINE_THRESHOLD = 0.015
+WEEKLY_SHARED_AREA_WINDOW_WEEKS = 8
+WEEKLY_AREA_ORDER = ("Bar", "Patio", "Dining Room", "Banquets", "Wine Dinners")
+PERFORMANCE_CONSISTENCY_COLORS: dict[str, tuple[str, str]] = {
+    "Consistently Strong": ("E8F3E8", "1F5B23"),
+    "Consistent / Near Peer": ("E3F0EF", "2F6F6D"),
+    "Strong / Variable": ("FFF4CC", "B77900"),
+    "Mixed / Monitor": ("FFF4CC", "B77900"),
+    "Inconsistent": ("FFF4CC", "B77900"),
+    "Consistently Below": ("F8E8E9", "8B1E23"),
+    "Below / Variable": ("F8E8E9", "8B1E23"),
+    "Insufficient Data": ("E9E9E9", "5C5C5C"),
+    "High": ("E8F3E8", "1F5B23"),
+    "Moderate": ("FFF4CC", "B77900"),
+    "Low": ("F8E8E9", "8B1E23"),
+    "Insufficient": ("E9E9E9", "5C5C5C"),
+    "Strong": ("E8F3E8", "1F5B23"),
+    "Near Peer": ("E8F0FA", "3E6FA8"),
+    "Mixed": ("FFF4CC", "B77900"),
+    "Below": ("F8E8E9", "8B1E23"),
+    "Not Qualified": ("E9E9E9", "5C5C5C"),
+    "—": ("F5F5F5", "7F7F7F"),
+}
 PREVIOUS_RATE_OF_SALE_GUIDANCE = (
     "Rate of Sale currently assumes lower is better."
 )
@@ -292,7 +325,7 @@ PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS = [
     "How to Use",
     *PRE_GUIDE_VISIBLE_MANAGEMENT_SHEETS,
 ]
-VISIBLE_MANAGEMENT_SHEETS = [
+PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS = [
     "How to Use",
     "Dashboard",
     "Action Board",
@@ -303,6 +336,32 @@ VISIBLE_MANAGEMENT_SHEETS = [
     "Data Quality",
     "Management Setup",
     "Run Notes",
+]
+PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS = [
+    "How to Use",
+    "Performance Dashboard",
+    "Server Scorecards",
+    "Weekly Performance",
+    "Shared & Area Trends",
+    "Methodology",
+    "Dashboard",
+    "Action Board",
+    "Team Trends",
+    "Store & Group Scorecards",
+    "Evidence Detail",
+    "Action History",
+    "Data Quality",
+    "Management Setup",
+    "Run Notes",
+]
+VISIBLE_MANAGEMENT_SHEETS = [
+    "How to Use",
+    "Performance Dashboard",
+    "Server Scorecards",
+    "Weekly Performance",
+    "Shared & Area Trends",
+    "Methodology",
+    "Management Center",
 ]
 PRE_CONSOLIDATION_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Guide", "How to Use"),
@@ -318,7 +377,7 @@ PRE_CONSOLIDATION_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Setup", "Management Setup"),
     ("Run", "Run Notes"),
 )
-MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
+PRE_PERFORMANCE_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Guide", "How to Use"),
     ("Dashboard", "Dashboard"),
     ("Actions", "Action Board"),
@@ -330,27 +389,79 @@ MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
     ("Setup", "Management Setup"),
     ("Run", "Run Notes"),
 )
+PRE_SIMPLIFICATION_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
+    ("Guide", "How to Use"),
+    ("Performance", "Performance Dashboard"),
+    ("Scorecards", "Server Scorecards"),
+    ("Weekly", "Weekly Performance"),
+    ("Areas", "Shared & Area Trends"),
+    ("Method", "Methodology"),
+    ("Dashboard", "Dashboard"),
+    ("Actions", "Action Board"),
+    ("Trends", "Team Trends"),
+    ("Stores", "Store & Group Scorecards"),
+    ("Evidence", "Evidence Detail"),
+    ("History", "Action History"),
+    ("Quality", "Data Quality"),
+    ("Setup", "Management Setup"),
+    ("Run", "Run Notes"),
+)
+MANAGEMENT_NAVIGATION_LINKS: tuple[tuple[str, str], ...] = (
+    ("Guide", "How to Use"),
+    ("Performance", "Performance Dashboard"),
+    ("Scorecards", "Server Scorecards"),
+    ("Weekly", "Weekly Performance"),
+    ("Areas", "Shared & Area Trends"),
+    ("Method", "Methodology"),
+    ("Manage", "Management Center"),
+)
 MANAGEMENT_MENU_LABEL = "Workbook Menu - click to choose a sheet on How to Use"
 MANAGEMENT_MENU_TARGET = "#'How to Use'!A44"
 MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT = 12
 MANAGEMENT_PRINT_WIDTHS: dict[str, int] = {
     "How to Use": 1,
-    "Dashboard": 1,
-    "Action Board": 2,
-    "Team Trends": 2,
-    "Store & Group Scorecards": 1,
-    "Evidence Detail": 3,
-    "Action History": 3,
-    "Data Quality": 1,
-    "Management Setup": 2,
-    "Run Notes": 1,
+    "Performance Dashboard": 1,
+    "Server Scorecards": 1,
+    "Weekly Performance": 1,
+    "Shared & Area Trends": 1,
+    "Methodology": 1,
+    "Management Center": 1,
 }
-HOW_TO_USE_SECTION_HEADINGS: tuple[str, ...] = (
+SHARED_AREA_TRENDS_COLUMN_WIDTHS: dict[str, float] = {
+    "A": 20.7109375,
+    "B": 19.140625,
+    "C": 30.85546875,
+    "D": 18.140625,
+    "E": 18.5703125,
+    "F": 18.5703125,
+    "G": 18.140625,
+    "H": 18.140625,
+    "I": 18.5703125,
+    "J": 18.5703125,
+    "K": 18.5703125,
+    "L": 15.85546875,
+    "M": 17.42578125,
+    "N": 21.140625,
+    "O": 17.42578125,
+    "P": 21.140625,
+    "Q": 13.0,
+}
+PRE_SIMPLIFICATION_HOW_TO_USE_SECTION_HEADINGS: tuple[str, ...] = (
     "SCOPE AND PROHIBITED USE",
     "SIX-STEP WEEKLY WORKFLOW",
     "REQUIRED EVIDENCE REVIEW",
     "SIGNAL INTERPRETATION",
     "ACTION BOARD EDIT SURFACE",
+    "DISPOSITION MEANINGS",
+    "WORKBOOK MAP",
+    "LIMITS, ASSUMPTIONS, AND ESCALATION",
+)
+HOW_TO_USE_SECTION_HEADINGS: tuple[str, ...] = (
+    "SCOPE AND PROHIBITED USE",
+    "SIX-STEP WEEKLY WORKFLOW",
+    "REQUIRED EVIDENCE REVIEW",
+    "SIGNAL INTERPRETATION",
+    "MANAGEMENT CENTER EDIT SURFACE",
     "DISPOSITION MEANINGS",
     "WORKBOOK MAP",
     "LIMITS, ASSUMPTIONS, AND ESCALATION",
@@ -375,15 +486,21 @@ GENERATED_WORKBOOK_ARCHIVE_FOLDER = "generated-workbooks"
 OWNER_ROSTER_TABLE_NAME = "OwnerRoster"
 OWNER_ROSTER_DEFINED_NAME = "ActiveOwnerChoices"
 OWNER_VALIDATION_SHEET = "_Validation Lists"
+MANAGEMENT_CENTER_SHEET = "Management Center"
 OWNER_ROSTER_HEADERS = ("Owner Name", "Active")
 OWNER_ROSTER_MIN_EDIT_ROWS = 50
 OWNER_ROSTER_SPARE_ROWS = 10
 OWNER_ROSTER_MAX_ROWS = 200
+OWNER_ROSTER_VISIBLE_EDIT_ROWS = 15
 LEGACY_WORKBOOK_DIGEST_SCHEME = "red-onion-generated-content-v2"
-WORKBOOK_DIGEST_SCHEME = "red-onion-substantive-content-v3"
+PREVIOUS_WORKBOOK_DIGEST_SCHEME = "red-onion-substantive-content-v3"
+WORKBOOK_DIGEST_SCHEME = "red-onion-substantive-content-v4"
 RUN_NOTES_DIGEST_LABEL = "Generated Content SHA-256"
 WORKBOOK_PROTECTION_CONTRACT_LABEL = "Protection Contract"
 WORKBOOK_PROTECTION_CONTRACT = "objects-scenarios-stop-validation-v1"
+WORKBOOK_OPERATOR_PASSWORD = "redonion"
+WORKBOOK_OPERATOR_UNLOCK_LABEL = "Operator Unlock"
+EXCEL_DATE_NUMBER_FORMAT = "mm-dd-yy"
 EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 UNTRUSTED_WORKBOOK_TEXT_HEADERS = frozenset(
     {"Raw Server", "Display Name", "Source File", "Server", "Person / Area"}
@@ -1230,19 +1347,18 @@ def capture_archived_report_inputs(
     archive_dir: Path,
     *,
     expected_inventory: Iterable[FileFingerprint] | None = None,
-) -> list[CapturedActiveInput]:
-    """Pin canonical history bytes before parsing and bind them to the manifest."""
+) -> Iterable[CapturedActiveInput]:
+    """Yield manifest-pinned history captures so parsing retains one payload at a time."""
 
     raw_root = canonical_daily_archive_dir(archive_dir)
-    captures: list[CapturedActiveInput] = []
     if expected_inventory is None:
         for supplied in archived_daily_report_paths(archive_dir):
             source = managed_recursive_file(
                 [raw_root], supplied, purpose="canonical archived daily report"
             )
             relative = source.absolute().relative_to(raw_root.resolve()).as_posix()
-            captures.append(capture_regular_file(source, fingerprint_path=relative))
-        return captures
+            yield capture_regular_file(source, fingerprint_path=relative)
+        return
 
     expected_reports = sorted(
         (
@@ -1263,16 +1379,15 @@ def capture_archived_report_inputs(
                 f"Archived daily report changed before it could be pinned: {source.name}. "
                 "No outputs or archive files were changed."
             )
-        captures.append(capture)
-    return captures
+        yield capture
+        del capture
 
 
 def read_captured_reports_by_path(
     captures: Iterable[CapturedActiveInput], config: dict[str, Any]
 ) -> dict[Path, list[MetricRecord]]:
-    """Parse only staged copies of already captured report bytes."""
+    """Parse staged captures one at a time, releasing each byte payload after use."""
 
-    captures = list(captures)
     records_by_path: dict[Path, list[MetricRecord]] = {}
     with tempfile.TemporaryDirectory(prefix=".archived-report-read-") as stage_name:
         stage_root = Path(stage_name)
@@ -1294,6 +1409,7 @@ def read_captured_reports_by_path(
             if not records:
                 raise ValueError(f"No metric rows were found in {capture.source}")
             records_by_path[capture.source] = records
+            del capture
     return records_by_path
 
 
@@ -2309,11 +2425,9 @@ def aggregate_records(
         group["check_count"] += (
             record.check_count if record.check_count_available else 0.0
         )
-        active_row = (
-            record.guest_count > 0
-            or record.gross_sales > 0
-            or (record.check_count_available and record.check_count > 0)
-        )
+        # Check Count is operational context only. A check-only row must not
+        # create an active day or make a person eligible for review.
+        active_row = record.guest_count > 0 or record.gross_sales > 0
         if active_row:
             group["has_active_rows"] = True
             group["check_count_available"] = (
@@ -2378,14 +2492,17 @@ def aggregate_records(
         rollup["check_count_available"] = bool(
             group["has_active_rows"] and group["check_count_available"]
         )
+        rollup["per_check_available"] = bool(
+            rollup["check_count_available"] and group["check_count"] > 0
+        )
         rollup["sales_per_check"] = (
             gross_sales / group["check_count"]
-            if rollup["check_count_available"] and group["check_count"]
+            if rollup["per_check_available"]
             else 0.0
         )
         rollup["guests_per_check"] = (
             guest_count / group["check_count"]
-            if rollup["check_count_available"] and group["check_count"]
+            if rollup["per_check_available"]
             else 0.0
         )
         rollup["rate_available"] = bool(
@@ -2702,7 +2819,7 @@ def write_table_sheet(
                 value = excel_safe_text(value)
             cell = ws.cell(row=row_index, column=col_index, value=value)
             if "Date" in header or header in {"Week Start", "Week End", "Latest Week End"}:
-                cell.number_format = "m/d/yyyy"
+                cell.number_format = EXCEL_DATE_NUMBER_FORMAT
             elif "Composite Score" in header or "Rank Movement" in header:
                 cell.number_format = "0.0"
             elif "Rank" in header:
@@ -3708,7 +3825,7 @@ def apply_dashboard_number_formats(ws, row_start: int, row_end: int) -> None:
             header = str(ws.cell(row=row_start - 1, column=col).value or "")
             cell = ws.cell(row=row, column=col)
             if "Date" in header or "Week End" in header:
-                cell.number_format = "m/d/yyyy"
+                cell.number_format = EXCEL_DATE_NUMBER_FORMAT
             elif "Composite Score" in header or "Rank Movement" in header:
                 cell.number_format = "0.0"
             elif "Wine %" in header:
@@ -4109,7 +4226,7 @@ def write_data_quality_sheet(
         for col_index, value in enumerate(row, start=1):
             cell = ws.cell(row=row_index, column=col_index, value=value)
             if col_index == 2:
-                cell.number_format = "m/d/yyyy"
+                cell.number_format = EXCEL_DATE_NUMBER_FORMAT
     if source_rows:
         ref = f"A3:{get_column_letter(len(source_headers))}{len(source_rows) + 3}"
         table = Table(displayName="DataQualitySources", ref=ref)
@@ -4147,7 +4264,9 @@ def write_data_quality_sheet(
     for offset, report_date in enumerate(expected_dates, start=2):
         row_index = check_row + offset
         status = "OK" if report_date in all_dates else "Missing"
-        ws.cell(row=row_index, column=1, value=report_date).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=1, value=report_date).number_format = (
+            EXCEL_DATE_NUMBER_FORMAT
+        )
         ws.cell(row=row_index, column=2, value=status)
         ws.cell(
             row=row_index,
@@ -4174,7 +4293,9 @@ def write_data_quality_sheet(
     for offset, row in enumerate(sorted(weekly_location_rows, key=lambda item: (item["week_end"], item["location"])), start=2):
         row_index = location_check_row + offset
         status = "OK" if row["source_days"] >= OPERATING_WEEK_DAYS else "Short Week"
-        ws.cell(row=row_index, column=1, value=row["week_end"]).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=1, value=row["week_end"]).number_format = (
+            EXCEL_DATE_NUMBER_FORMAT
+        )
         ws.cell(row=row_index, column=2, value=row["location"])
         ws.cell(row=row_index, column=3, value=row["active_days"])
         ws.cell(row=row_index, column=4, value=row["source_days"])
@@ -5063,10 +5184,6 @@ def operational_context_rollup(rows: Iterable[dict[str, Any]]) -> dict[str, Any]
         if (
             float(row.get("guest_count", 0) or 0) > 0
             or float(row.get("gross_sales", 0) or 0) > 0
-            or (
-                bool(row.get("check_count_available", False))
-                and float(row.get("check_count", 0) or 0) > 0
-            )
         )
     ]
     check_count_available = bool(active_rows) and all(
@@ -5077,6 +5194,7 @@ def operational_context_rollup(rows: Iterable[dict[str, Any]]) -> dict[str, Any]
         for row in selected
         if bool(row.get("check_count_available", False))
     )
+    per_check_available = bool(check_count_available and check_count > 0)
 
     rate_rows = [
         row
@@ -5127,6 +5245,7 @@ def operational_context_rollup(rows: Iterable[dict[str, Any]]) -> dict[str, Any]
     return {
         "check_count": check_count,
         "check_count_available": check_count_available,
+        "per_check_available": per_check_available,
         "sales_per_check": 0.0,
         "guests_per_check": 0.0,
         "rate_of_sale_by_guest_count": (
@@ -5155,7 +5274,7 @@ def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any] | No
     guest_count = sum(float(row.get("guest_count", 0) or 0) for row in selected)
     wine_sales = sum(float(row.get("wine_sales", 0) or 0) for row in selected)
     context = operational_context_rollup(selected)
-    if context["check_count_available"] and context["check_count"]:
+    if context["per_check_available"]:
         context["sales_per_check"] = gross_sales / context["check_count"]
         context["guests_per_check"] = guest_count / context["check_count"]
     return {
@@ -5165,6 +5284,238 @@ def aggregate_weekly_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any] | No
         "wine_sales": wine_sales,
         "wine_pct": wine_sales / gross_sales if gross_sales else 0.0,
         **context,
+    }
+
+
+def shared_pos_number(row: dict[str, Any]) -> str | None:
+    """Return a leading four-digit shared POS identity, when one is present."""
+
+    for field in ("raw_user_name", "display_name"):
+        value = row.get(field)
+        text = "" if is_blank(value) else str(value).strip()
+        match = re.match(r"^(\d{4})\b", text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def weekly_area_for_row(
+    row: dict[str, Any], config: dict[str, Any]
+) -> str | None:
+    """Map a weekly POS row into one non-person area without guessing shared IDs."""
+
+    number = shared_pos_number(row)
+    if number is not None:
+        mapped_area = config.get("weekly_shared_number_areas", {}).get(number)
+        return str(mapped_area) if mapped_area in WEEKLY_AREA_ORDER else None
+    patterns = config.get(
+        "weekly_area_name_patterns",
+        DEFAULT_CONFIG.get("weekly_area_name_patterns", {}),
+    )
+    # Specific multi-word concepts precede broader matches such as Bar.
+    for area in ("Wine Dinners", "Patio", "Banquets", "Bar", "Dining Room"):
+        if row_matches_name_patterns(row, patterns.get(area, [])):
+            return area
+    # Remaining dashboard-eligible named people are the dining-room population.
+    # Managers, takeout, generic placeholders, and other excluded identities are
+    # intentionally not swept into this residual bucket.
+    if dashboard_excluded(row, config):
+        return None
+    return "Dining Room"
+
+
+def weekly_trend_summary(
+    weekly_metrics: dict[date, dict[str, Any]],
+    week_ends: tuple[date, ...],
+) -> dict[str, Any]:
+    latest_week = week_ends[-1] if week_ends else None
+    prior_week = week_ends[-2] if len(week_ends) >= 2 else None
+    latest = weekly_metrics.get(latest_week) if latest_week else None
+    prior = weekly_metrics.get(prior_week) if prior_week else None
+    window = aggregate_weekly_rows(weekly_metrics.values())
+    return {
+        "weekly_metrics": weekly_metrics,
+        "available_weeks": len(weekly_metrics),
+        "latest_gross_sales": latest["gross_sales"] if latest else None,
+        "latest_guest_count": latest["guest_count"] if latest else None,
+        "latest_check_average": latest["check_average"] if latest else None,
+        "latest_wine_pct": latest["wine_pct"] if latest else None,
+        "wow_check_average": (
+            float(latest["check_average"]) - float(prior["check_average"])
+            if latest is not None and prior is not None
+            else None
+        ),
+        "window_check_average": window["check_average"] if window else None,
+    }
+
+
+def build_shared_area_trends_model(
+    weekly_server_rows: list[dict[str, Any]],
+    weekly_location_rows: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Build high-level shared-number and operating-area weekly trend views."""
+
+    _, global_full = full_week_ends_by_location(
+        weekly_location_rows,
+        config.get("locations", {}),
+    )
+    week_ends = tuple(sorted(global_full)[-WEEKLY_SHARED_AREA_WINDOW_WEEKS:])
+    if not week_ends:
+        return {
+            "week_ends": (),
+            "latest_complete_week_end": None,
+            "shared_rows": [],
+            "area_rows": [],
+        }
+
+    selected = set(week_ends)
+    shared_buckets: dict[tuple[str, str, date], list[dict[str, Any]]] = defaultdict(list)
+    area_buckets: dict[tuple[str, str, date], list[dict[str, Any]]] = defaultdict(list)
+    shared_labels: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in weekly_server_rows:
+        week_end = row.get("week_end")
+        if week_end not in selected:
+            continue
+        location = str(row.get("location") or "")
+        number = shared_pos_number(row)
+        if number is not None:
+            shared_buckets[(location, number, week_end)].append(row)
+            shared_labels[(location, number)].add(
+                str(row.get("raw_user_name") or row.get("display_name") or number)
+            )
+        area = weekly_area_for_row(row, config)
+        if area is None:
+            continue
+        area_buckets[(location, area, week_end)].append(row)
+        area_buckets[("All Stores", area, week_end)].append(row)
+
+    shared_rows: list[dict[str, Any]] = []
+    for location, number in sorted(shared_labels):
+        weekly_metrics = {
+            week_end: aggregate_weekly_rows(
+                shared_buckets[(location, number, week_end)]
+            )
+            for week_end in week_ends
+            if shared_buckets.get((location, number, week_end))
+        }
+        normalized = {
+            week_end: value
+            for week_end, value in weekly_metrics.items()
+            if value is not None
+        }
+        shared_rows.append(
+            {
+                "location": location,
+                "shared_number": number,
+                "pos_label": ", ".join(sorted(shared_labels[(location, number)])),
+                **weekly_trend_summary(normalized, week_ends),
+            }
+        )
+
+    configured_locations = [str(location) for location in config.get("locations", {})]
+    location_order = ["All Stores", *configured_locations]
+    area_rows: list[dict[str, Any]] = []
+    for location in location_order:
+        for area in WEEKLY_AREA_ORDER:
+            weekly_metrics = {
+                week_end: aggregate_weekly_rows(area_buckets[(location, area, week_end)])
+                for week_end in week_ends
+                if area_buckets.get((location, area, week_end))
+            }
+            normalized = {
+                week_end: value
+                for week_end, value in weekly_metrics.items()
+                if value is not None
+            }
+            mapping_status = (
+                "Awaiting POS mapping"
+                if area == "Wine Dinners" and not normalized
+                else "Named-server fallback"
+                if area == "Dining Room"
+                else "Configured name match"
+            )
+            area_rows.append(
+                {
+                    "location": location,
+                    "area": area,
+                    "mapping_status": mapping_status,
+                    **weekly_trend_summary(normalized, week_ends),
+                }
+            )
+    return {
+        "week_ends": week_ends,
+        "latest_complete_week_end": week_ends[-1],
+        "shared_rows": shared_rows,
+        "area_rows": area_rows,
+    }
+
+
+def overall_store_performance(
+    weekly_location_rows: list[dict[str, Any]],
+    week_ends: Iterable[date],
+) -> dict[str, Any] | None:
+    selected_weeks = tuple(sorted(set(week_ends)))
+    if not selected_weeks:
+        return None
+    weekly = {
+        week_end: aggregate_weekly_rows(
+            row for row in weekly_location_rows if row.get("week_end") == week_end
+        )
+        for week_end in selected_weeks
+    }
+    latest = weekly.get(selected_weeks[-1])
+    if latest is None:
+        return None
+    baseline_weeks = selected_weeks[:-1][-PERFORMANCE_CONSISTENCY_BLOCK_WEEKS:]
+    baseline_rows = [weekly[week_end] for week_end in baseline_weeks if weekly.get(week_end)]
+    baseline = aggregate_weekly_rows(baseline_rows)
+    baseline_count = len(baseline_rows)
+    baseline_sales = (
+        sum(float(row["gross_sales"]) for row in baseline_rows) / baseline_count
+        if baseline_count
+        else None
+    )
+    baseline_guests = (
+        sum(float(row["guest_count"]) for row in baseline_rows) / baseline_count
+        if baseline_count
+        else None
+    )
+
+    def pct_change(current: float, comparison: float | None) -> float | None:
+        return current / comparison - 1 if comparison else None
+
+    return {
+        "week_end": selected_weeks[-1],
+        "complete_location_count": len(
+            {
+                str(row.get("location") or "")
+                for row in weekly_location_rows
+                if row.get("week_end") == selected_weeks[-1]
+                and int(row.get("source_days", 0) or 0) >= OPERATING_WEEK_DAYS
+            }
+        ),
+        "baseline_week_count": baseline_count,
+        "gross_sales": float(latest["gross_sales"]),
+        "gross_sales_change_pct": pct_change(
+            float(latest["gross_sales"]), baseline_sales
+        ),
+        "guest_count": float(latest["guest_count"]),
+        "guest_count_change_pct": pct_change(
+            float(latest["guest_count"]), baseline_guests
+        ),
+        "check_average": float(latest["check_average"]),
+        "check_average_change": (
+            float(latest["check_average"]) - float(baseline["check_average"])
+            if baseline
+            else None
+        ),
+        "wine_pct": float(latest["wine_pct"]),
+        "wine_pct_change": (
+            float(latest["wine_pct"]) - float(baseline["wine_pct"])
+            if baseline
+            else None
+        ),
     }
 
 
@@ -5239,8 +5590,13 @@ def server_trend_context(recent_momentum: str, long_term_direction: str) -> str:
 
 def full_week_ends_by_location(
     weekly_location_rows: list[dict[str, Any]],
+    required_locations: Iterable[str] | None = None,
 ) -> tuple[dict[str, set[date]], set[date]]:
-    locations = sorted({row["location"] for row in weekly_location_rows})
+    observed_locations = {str(row["location"]) for row in weekly_location_rows}
+    configured_locations = {
+        str(location) for location in (required_locations or ()) if str(location)
+    }
+    locations = sorted(configured_locations or observed_locations)
     by_location = {
         location: {
             row["week_end"]
@@ -5253,6 +5609,428 @@ def full_week_ends_by_location(
         return by_location, set()
     global_full = set.intersection(*(by_location[location] for location in locations))
     return by_location, global_full
+
+
+def performance_consistency_weighted_average(
+    rows: Iterable[dict[str, Any]], field: str
+) -> float | None:
+    selected = [
+        row
+        for row in rows
+        if row.get(field) is not None and float(row.get("guest_weight", 0) or 0) > 0
+    ]
+    total_weight = sum(float(row["guest_weight"]) for row in selected)
+    if not selected or total_weight <= 0:
+        return None
+    return sum(float(row[field]) * float(row["guest_weight"]) for row in selected) / total_weight
+
+
+def performance_consistency_level(
+    spg_gap: float | None,
+    wine_gap: float | None,
+    *,
+    spg_boundary: float,
+    wine_boundary: float,
+) -> str:
+    """Classify peer-adjusted selling outcomes without collapsing the two axes."""
+
+    if spg_gap is None or wine_gap is None:
+        return "Not Evaluated"
+    if (
+        (spg_gap >= spg_boundary and wine_gap >= 0)
+        or (wine_gap >= wine_boundary and spg_gap >= 0)
+    ):
+        return "Strong"
+    if (
+        (spg_gap <= -spg_boundary and wine_gap <= 0)
+        or (wine_gap <= -wine_boundary and spg_gap <= 0)
+    ):
+        return "Below"
+    return "On Track / Mixed"
+
+
+def performance_consistency_weekly_band(
+    spg_gap: float | None,
+    wine_gap: float | None,
+    *,
+    spg_boundary: float,
+    wine_boundary: float,
+) -> str:
+    level = performance_consistency_level(
+        spg_gap,
+        wine_gap,
+        spg_boundary=spg_boundary,
+        wine_boundary=wine_boundary,
+    )
+    if level in {"Strong", "Below"}:
+        return level
+    if level == "Not Evaluated":
+        return "Not Qualified"
+    return "Near Peer" if float(spg_gap) * float(wine_gap) >= 0 else "Mixed"
+
+
+def build_performance_consistency_model(
+    weekly_server_rows: list[dict[str, Any]],
+    weekly_location_rows: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the protected eight-week performance/consistency review layer.
+
+    The model intentionally remains separate from the gated Action Board signal.
+    It uses only complete shared weeks, a current-roster snapshot, same-store
+    leave-one-person-out weekly medians, and explicit sample/confidence gates.
+    """
+
+    _, global_full = full_week_ends_by_location(
+        weekly_location_rows,
+        config.get("locations", {}),
+    )
+    week_ends = sorted(global_full)[-PERFORMANCE_CONSISTENCY_WINDOW_WEEKS:]
+    if not week_ends:
+        return {
+            "methodology_version": PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION,
+            "week_ends": (),
+            "complete_week_count": 0,
+            "latest_complete_week_end": None,
+            "summary_rows": [],
+            "detail_rows": [],
+            "category_counts": {
+                "Consistently Strong": 0,
+                "Consistent / Near Peer": 0,
+                "Variable / Inconsistent": 0,
+                "Below / Review": 0,
+                "Insufficient Data": 0,
+            },
+            "store_consistency": [],
+            "overall_store": None,
+        }
+
+    latest_complete_week_end = week_ends[-1]
+    spg_threshold = management_threshold(config, "check_average")
+    wine_threshold = management_threshold(config, "wine_pct")
+    spg_boundary = float(spg_threshold["neutral"])
+    wine_boundary = float(wine_threshold["neutral"])
+    spg_moderate_max = float(spg_threshold["strong"])
+    wine_moderate_max = float(wine_threshold["strong"])
+    min_peers = int(
+        config.get("management_peer_reference", {}).get(
+            "min_distinct_peers_per_week",
+            DEFAULT_CONFIG["management_peer_reference"]["min_distinct_peers_per_week"],
+        )
+    )
+
+    current_rows = [
+        row
+        for row in weekly_server_rows
+        if row["week_end"] == latest_complete_week_end
+        and not dashboard_excluded(row, config)
+    ]
+    roster = {
+        (str(row["location"]), str(row["raw_user_name"])): row
+        for row in current_rows
+    }
+    selected_weeks = set(week_ends)
+    row_lookup = {
+        (row["week_end"], str(row["location"]), str(row["raw_user_name"])): row
+        for row in weekly_server_rows
+        if row["week_end"] in selected_weeks and not dashboard_excluded(row, config)
+    }
+    qualified_peer_pool: dict[tuple[date, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in weekly_server_rows:
+        identity = (str(row["location"]), str(row["raw_user_name"]))
+        if (
+            row["week_end"] in selected_weeks
+            and identity in roster
+            and not dashboard_excluded(row, config)
+            and dashboard_trend_eligible(row, config)
+        ):
+            qualified_peer_pool[(row["week_end"], str(row["location"]))].append(row)
+
+    detail_rows: list[dict[str, Any]] = []
+    detail_by_server: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    weekly_bands_by_server: dict[tuple[str, str], dict[date, str]] = {
+        key: {week_end: "—" for week_end in week_ends} for key in roster
+    }
+    recent_week_ends = set(week_ends[-PERFORMANCE_CONSISTENCY_BLOCK_WEEKS:])
+
+    for location, raw_user_name in sorted(roster):
+        roster_row = roster[(location, raw_user_name)]
+        for week_end in week_ends:
+            row = row_lookup.get((week_end, location, raw_user_name))
+            if row is None:
+                continue
+            base_sample = dashboard_trend_eligible(row, config)
+            peers = (
+                [
+                    peer
+                    for peer in qualified_peer_pool.get((week_end, location), [])
+                    if str(peer["raw_user_name"]) != raw_user_name
+                ]
+                if base_sample
+                else []
+            )
+            distinct_peer_count = len(
+                {str(peer["raw_user_name"]) for peer in peers}
+            )
+            qualified = base_sample and distinct_peer_count >= min_peers
+            peer_spg = (
+                float(median(float(peer["check_average"]) for peer in peers))
+                if qualified
+                else None
+            )
+            peer_wine = (
+                float(median(float(peer["wine_pct"]) for peer in peers))
+                if qualified
+                else None
+            )
+            spg_gap = (
+                float(row["check_average"]) - peer_spg
+                if peer_spg is not None
+                else None
+            )
+            wine_gap = (
+                float(row["wine_pct"]) - peer_wine
+                if peer_wine is not None
+                else None
+            )
+            weekly_band = performance_consistency_weekly_band(
+                spg_gap,
+                wine_gap,
+                spg_boundary=spg_boundary,
+                wine_boundary=wine_boundary,
+            )
+            guest_count = float(row.get("guest_count", 0) or 0)
+            detail = {
+                "week_end": week_end,
+                "location": location,
+                "raw_user_name": raw_user_name,
+                "display_name": str(roster_row.get("display_name") or raw_user_name),
+                "gross_sales": float(row.get("gross_sales", 0) or 0),
+                "guest_count": guest_count,
+                "check_average": float(row.get("check_average", 0) or 0),
+                "wine_sales": float(row.get("wine_sales", 0) or 0),
+                "wine_pct": float(row.get("wine_pct", 0) or 0),
+                "active_days": int(row.get("active_days", 0) or 0),
+                "base_sample": base_sample,
+                "distinct_peer_count": distinct_peer_count if base_sample else 0,
+                "peer_spg": peer_spg,
+                "peer_wine_pct": peer_wine,
+                "spg_gap": spg_gap,
+                "wine_gap": wine_gap,
+                "guest_weight": min(
+                    guest_count, PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP
+                )
+                if qualified
+                else 0.0,
+                "qualified": qualified,
+                "qualified_gross_sales": (
+                    float(row.get("gross_sales", 0) or 0) if qualified else None
+                ),
+                "qualified_guests": guest_count if qualified else None,
+                "qualified_wine_sales": (
+                    float(row.get("wine_sales", 0) or 0) if qualified else None
+                ),
+                "period": "Recent 4" if week_end in recent_week_ends else "Prior 4",
+                "weekly_band": weekly_band,
+            }
+            detail_rows.append(detail)
+            detail_by_server[(location, raw_user_name)].append(detail)
+            weekly_bands_by_server[(location, raw_user_name)][week_end] = weekly_band
+
+    summary_rows: list[dict[str, Any]] = []
+    for key, current in roster.items():
+        location, raw_user_name = key
+        qualified_rows = [row for row in detail_by_server[key] if row["qualified"]]
+        qualified_weeks = len(qualified_rows)
+        qualified_guests = sum(float(row["guest_count"]) for row in qualified_rows)
+        qualified_sales = sum(float(row["gross_sales"]) for row in qualified_rows)
+        qualified_wine_sales = sum(float(row["wine_sales"]) for row in qualified_rows)
+        eight_week_spg = (
+            qualified_sales / qualified_guests if qualified_guests else None
+        )
+        eight_week_wine_pct = (
+            qualified_wine_sales / qualified_sales if qualified_sales else None
+        )
+        average_spg_gap = performance_consistency_weighted_average(
+            qualified_rows, "spg_gap"
+        )
+        average_wine_gap = performance_consistency_weighted_average(
+            qualified_rows, "wine_gap"
+        )
+        spg_values = [float(row["spg_gap"]) for row in qualified_rows]
+        wine_values = [float(row["wine_gap"]) for row in qualified_rows]
+        weekly_spg_gap_sd = float(stdev(spg_values)) if len(spg_values) >= 2 else None
+        weekly_wine_gap_sd = float(stdev(wine_values)) if len(wine_values) >= 2 else None
+
+        performance_level = performance_consistency_level(
+            average_spg_gap,
+            average_wine_gap,
+            spg_boundary=spg_boundary,
+            wine_boundary=wine_boundary,
+        )
+        confidence = (
+            "High"
+            if qualified_weeks >= PERFORMANCE_CONSISTENCY_HIGH_MIN_WEEKS
+            and qualified_guests >= PERFORMANCE_CONSISTENCY_HIGH_MIN_GUESTS
+            else "Provisional"
+            if qualified_weeks >= PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_WEEKS
+            and qualified_guests >= PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_GUESTS
+            else "Insufficient"
+        )
+        if confidence == "Insufficient":
+            consistency = "Insufficient"
+        elif (
+            weekly_spg_gap_sd is not None
+            and weekly_wine_gap_sd is not None
+            and weekly_spg_gap_sd <= spg_boundary
+            and weekly_wine_gap_sd <= wine_boundary
+        ):
+            consistency = "High"
+        elif (
+            weekly_spg_gap_sd is not None
+            and weekly_wine_gap_sd is not None
+            and weekly_spg_gap_sd <= spg_moderate_max
+            and weekly_wine_gap_sd <= wine_moderate_max
+        ):
+            consistency = "Moderate"
+        else:
+            consistency = "Low"
+
+        if confidence == "Insufficient":
+            overall_read = "Insufficient Data"
+        elif performance_level == "Strong":
+            overall_read = (
+                "Consistently Strong" if consistency == "High" else "Strong / Variable"
+            )
+        elif performance_level == "Below":
+            overall_read = (
+                "Consistently Below" if consistency == "High" else "Below / Variable"
+            )
+        elif consistency == "High":
+            overall_read = "Consistent / Near Peer"
+        elif consistency == "Moderate":
+            overall_read = "Mixed / Monitor"
+        else:
+            overall_read = "Inconsistent"
+
+        recent_rows = [row for row in qualified_rows if row["period"] == "Recent 4"]
+        prior_rows = [row for row in qualified_rows if row["period"] == "Prior 4"]
+        recent_spg = performance_consistency_weighted_average(recent_rows, "spg_gap")
+        prior_spg = performance_consistency_weighted_average(prior_rows, "spg_gap")
+        recent_wine = performance_consistency_weighted_average(recent_rows, "wine_gap")
+        prior_wine = performance_consistency_weighted_average(prior_rows, "wine_gap")
+        recent_spg_delta = (
+            recent_spg - prior_spg
+            if recent_spg is not None and prior_spg is not None
+            else None
+        )
+        recent_wine_delta = (
+            recent_wine - prior_wine
+            if recent_wine is not None and prior_wine is not None
+            else None
+        )
+        performance_score = (
+            float(average_spg_gap) / spg_boundary
+            + float(average_wine_gap) / wine_boundary
+            if average_spg_gap is not None and average_wine_gap is not None
+            else float("-inf")
+        )
+        summary_rows.append(
+            {
+                "location": location,
+                "raw_user_name": raw_user_name,
+                "display_name": str(current.get("display_name") or raw_user_name),
+                "overall_read": overall_read,
+                "performance_level": performance_level,
+                "consistency": consistency,
+                "confidence": confidence,
+                "eight_week_spg": eight_week_spg,
+                "average_spg_gap": average_spg_gap,
+                "eight_week_wine_pct": eight_week_wine_pct,
+                "average_wine_gap": average_wine_gap,
+                "weekly_spg_gap_sd": weekly_spg_gap_sd,
+                "weekly_wine_gap_sd": weekly_wine_gap_sd,
+                "qualified_weeks": qualified_weeks,
+                "qualified_guests": qualified_guests,
+                "recent_spg_delta": recent_spg_delta,
+                "recent_wine_delta": recent_wine_delta,
+                "performance_score": performance_score,
+                "weekly_bands": weekly_bands_by_server[key],
+            }
+        )
+
+    category_order = {
+        "Consistently Strong": 0,
+        "Consistent / Near Peer": 1,
+        "Strong / Variable": 2,
+        "Mixed / Monitor": 3,
+        "Inconsistent": 4,
+        "Consistently Below": 5,
+        "Below / Variable": 6,
+        "Insufficient Data": 7,
+    }
+    summary_rows.sort(
+        key=lambda row: (
+            category_order.get(str(row["overall_read"]), 99),
+            -float(row["performance_score"]),
+            str(row["location"]),
+            str(row["display_name"]),
+        )
+    )
+    detail_rows.sort(
+        key=lambda row: (
+            row["week_end"],
+            str(row["location"]),
+            str(row["display_name"]),
+        )
+    )
+
+    category_counts = {
+        "Consistently Strong": sum(
+            row["overall_read"] == "Consistently Strong" for row in summary_rows
+        ),
+        "Consistent / Near Peer": sum(
+            row["overall_read"] == "Consistent / Near Peer" for row in summary_rows
+        ),
+        "Variable / Inconsistent": sum(
+            row["overall_read"] in {"Strong / Variable", "Mixed / Monitor", "Inconsistent"}
+            for row in summary_rows
+        ),
+        "Below / Review": sum(
+            row["overall_read"] in {"Consistently Below", "Below / Variable"}
+            for row in summary_rows
+        ),
+        "Insufficient Data": sum(
+            row["overall_read"] == "Insufficient Data" for row in summary_rows
+        ),
+    }
+    store_consistency = []
+    for location in sorted({str(row["location"]) for row in summary_rows}):
+        location_rows = [row for row in summary_rows if row["location"] == location]
+        store_consistency.append(
+            {
+                "location": location,
+                "High": sum(row["consistency"] == "High" for row in location_rows),
+                "Moderate": sum(
+                    row["consistency"] == "Moderate" for row in location_rows
+                ),
+                "Low": sum(row["consistency"] == "Low" for row in location_rows),
+                "Insufficient": sum(
+                    row["consistency"] == "Insufficient" for row in location_rows
+                ),
+            }
+        )
+    return {
+        "methodology_version": PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION,
+        "week_ends": tuple(week_ends),
+        "complete_week_count": len(global_full),
+        "latest_complete_week_end": latest_complete_week_end,
+        "summary_rows": summary_rows,
+        "detail_rows": detail_rows,
+        "category_counts": category_counts,
+        "store_consistency": store_consistency,
+        "overall_store": overall_store_performance(weekly_location_rows, week_ends),
+    }
 
 
 def metric_driver(field: str, change: float) -> str:
@@ -5323,6 +6101,16 @@ def recommended_server_follow_up(row: dict[str, Any]) -> str:
 
 
 def management_metric_available(row: dict[str, Any], field: str) -> bool:
+    if field == "check_count":
+        return bool(row.get("check_count_available", False))
+    if field in {"sales_per_check", "guests_per_check"}:
+        return bool(
+            row.get(
+                "per_check_available",
+                bool(row.get("check_count_available", False))
+                and float(row.get("check_count", 0) or 0) > 0,
+            )
+        )
     if field == "rate_of_sale_by_guest_count":
         return bool(row.get("rate_available", True))
     if field == "average_ticket_time_seconds":
@@ -5391,14 +6179,10 @@ def weekly_row_from_daily_records(
         if (
             float(row.get("guest_count", 0) or 0) > 0
             or float(row.get("gross_sales", 0) or 0) > 0
-            or (
-                bool(row.get("check_count_available", False))
-                and float(row.get("check_count", 0) or 0) > 0
-            )
         )
     }
     context = operational_context_rollup(rows)
-    if context["check_count_available"] and context["check_count"]:
+    if context["per_check_available"]:
         context["sales_per_check"] = gross_sales / context["check_count"]
         context["guests_per_check"] = guest_count / context["check_count"]
     return {
@@ -5619,7 +6403,7 @@ def evaluate_server_week_signal(
 
     daily_records = list(current.get("daily_records", []) or [])
     leave_one_day_polarities: list[CandidatePolarity] = []
-    if candidate_qualified and daily_records:
+    if candidate_qualified and shock.guard_passed and daily_records:
         active_dates = sorted(
             {
                 as_date(item.get("report_date"))
@@ -5627,10 +6411,6 @@ def evaluate_server_week_signal(
                 if (
                     float(item.get("guest_count", 0) or 0) > 0
                     or float(item.get("gross_sales", 0) or 0) > 0
-                    or (
-                        bool(item.get("check_count_available", False))
-                        and float(item.get("check_count", 0) or 0) > 0
-                    )
                 )
                 and as_date(item.get("report_date")) is not None
             }
@@ -5736,8 +6516,11 @@ def evaluate_server_week_signal(
                 if reduced_candidate.eligible and reduced_shock.guard_passed
                 else CandidatePolarity.NONE
             )
-    day_stable = leave_one_day_stability(
-        full_candidate_polarity, leave_one_day_polarities
+    # When the store-shock guard alone blocks an otherwise qualified candidate,
+    # day-removal stability is not the failing gate. Preserve a neutral/pass
+    # value here so the persistence result reports the actual store-shock cause.
+    day_stable = bool(candidate_qualified and not shock.guard_passed) or (
+        leave_one_day_stability(full_candidate_polarity, leave_one_day_polarities)
     )
 
     if not full_latest:
@@ -5748,11 +6531,15 @@ def evaluate_server_week_signal(
         evidence_status = "Limited History"
     elif any(
         not management_metric_available(current, field)
+        or baseline is None
+        or not management_metric_available(baseline, field)
         for field in SERVER_TREND_FIELDS
     ):
         evidence_status = "Data Issue"
     elif not peer_reference_available:
         evidence_status = "Reference Unavailable"
+    elif candidate_qualified and not shock.guard_passed:
+        evidence_status = "Store Shock"
     elif candidate_qualified and not day_stable:
         evidence_status = "Sensitive"
     elif candidate_qualified and shock.guard_passed:
@@ -5918,11 +6705,17 @@ def management_server_rows(
         recent_history = aggregate_weekly_rows(recent_history_rows)
         earlier_history = aggregate_weekly_rows(earlier_history_rows)
         long_term_changes: dict[str, float | None] = {}
-        long_term_metric_scores: dict[str, int] = {}
+        long_term_metric_scores: dict[str, int | None] = {}
         for field in SERVER_TREND_FIELDS:
+            available = bool(
+                recent_history
+                and earlier_history
+                and management_metric_available(recent_history, field)
+                and management_metric_available(earlier_history, field)
+            )
             change = (
                 recent_history[field] - earlier_history[field]
-                if recent_history and earlier_history
+                if available and recent_history and earlier_history
                 else None
             )
             long_term_changes[field] = change
@@ -6086,6 +6879,11 @@ def management_server_rows(
                 "check_count_available": current.get(
                     "check_count_available", False
                 ),
+                "per_check_available": current.get(
+                    "per_check_available",
+                    bool(current.get("check_count_available", False))
+                    and float(current.get("check_count", 0) or 0) > 0,
+                ),
                 "sales_per_check": current.get("sales_per_check", 0.0),
                 "guests_per_check": current.get("guests_per_check", 0.0),
                 "rate_of_sale_by_guest_count": current.get(
@@ -6114,6 +6912,10 @@ def management_server_rows(
             "persistence_reason": persistence.reason,
             "recurring_driver_fields": list(persistence.recurring_drivers),
             "stability_result": (
+                "Store-shock guard not passed; day-removal stability not applicable"
+                if evaluated["candidate_qualified"]
+                and not evaluated["store_shock"].guard_passed
+                else
                 "Stable under every active-day removal"
                 if evaluated["day_stable"]
                 else "Sensitive to at least one active-day removal"
@@ -6341,16 +7143,38 @@ def records_from_sheet(ws, required_header: str) -> list[dict[str, Any]]:
     return records
 
 
+def records_from_table(ws, table_name: str) -> list[dict[str, Any]]:
+    """Read records from one exact table without relying on its sheet position."""
+
+    if table_name not in ws.tables:
+        return []
+    min_col, min_row, max_col, max_row = range_boundaries(
+        ws.tables[table_name].ref
+    )
+    headers = [
+        ws.cell(row=min_row, column=column).value
+        for column in range(min_col, max_col + 1)
+    ]
+    records: list[dict[str, Any]] = []
+    for row in range(min_row + 1, max_row + 1):
+        record = {
+            str(header): excel_safe_cell_value(ws.cell(row=row, column=column))
+            for header, column in zip(
+                headers, range(min_col, max_col + 1), strict=True
+            )
+            if header
+        }
+        if any(not is_blank(value) for value in record.values()):
+            records.append(record)
+    return records
+
+
 def validate_action_board_records(
     records: list[dict[str, Any]],
     *,
     allowed_reviewers: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Normalize legacy headers and reject pasted workflow values that bypass Excel."""
-    canonical_statuses = {
-        status.casefold(): status
-        for status in ACTION_STATUS_CHOICES
-    }
     canonical_dispositions = {
         disposition.casefold(): disposition
         for disposition in REVIEW_DISPOSITION_CHOICES
@@ -6364,9 +7188,15 @@ def validate_action_board_records(
         if allowed_reviewers is not None
         else None
     )
-    allowed_text = ", ".join(ACTION_STATUS_CHOICES)
     for row_number, record in enumerate(records, start=5):
         legacy_schema = "Manager Notes" in record and "Context Notes" not in record
+        status_choices = (
+            LEGACY_ACTION_STATUS_CHOICES if legacy_schema else ACTION_STATUS_CHOICES
+        )
+        canonical_statuses = {
+            status.casefold(): status for status in status_choices
+        }
+        allowed_text = ", ".join(status_choices)
         for old, new in (
             ("Manager Notes", "Context Notes"),
             ("Performance Level", "Peer Comparison"),
@@ -6504,9 +7334,16 @@ def owner_roster_from_sheet(ws) -> list[dict[str, str]]:
     if OWNER_ROSTER_TABLE_NAME in ws.tables:
         table = ws.tables[OWNER_ROSTER_TABLE_NAME]
         min_col, min_row, max_col, max_row = range_boundaries(table.ref)
-        if (min_col, min_row, max_col) != (1, 20, 2):
+        supported_anchor = (
+            (min_col, min_row, max_col) == (1, 20, 2)
+            or (
+                ws.title == MANAGEMENT_CENTER_SHEET
+                and (min_col, min_row, max_col) == (11, 12, 12)
+            )
+        )
+        if not supported_anchor:
             raise ValueError(
-                "Owner Roster must remain anchored at A20 with exactly two columns. "
+                "Owner Roster must remain at its supported two-column anchor. "
                 "No workbooks were created and no source files were moved."
             )
         if max_row - min_row > OWNER_ROSTER_MAX_ROWS:
@@ -6610,38 +7447,80 @@ def read_management_state(
         wb.close()
         raise
     try:
-        if "Management Setup" in wb.sheetnames:
-            ws = wb["Management Setup"]
-            target_header_row = find_sheet_header_row(ws, "Entity")
-            if target_header_row:
-                headers = {
-                    ws.cell(row=target_header_row, column=col).value: col
-                    for col in range(1, ws.max_column + 1)
-                    if ws.cell(row=target_header_row, column=col).value
-                }
-                row = target_header_row + 1
-                while row <= ws.max_row:
-                    entity = ws.cell(row=row, column=headers["Entity"]).value
-                    if not entity:
-                        break
-                    values: dict[str, float | None] = {}
-                    for field, label in TARGET_FIELDS:
-                        value = ws.cell(row=row, column=headers[label]).value if label in headers else None
-                        if isinstance(value, (int, float)):
-                            values[field] = float(value) * 60 if field == "average_ticket_time_seconds" else float(value)
-                        else:
-                            values[field] = None
-                    state["targets"][str(entity)] = values
-                    row += 1
+        setup_sheet_name = (
+            MANAGEMENT_CENTER_SHEET
+            if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+            and "ManagementTargets" in wb[MANAGEMENT_CENTER_SHEET].tables
+            and OWNER_ROSTER_TABLE_NAME in wb[MANAGEMENT_CENTER_SHEET].tables
+            else "Management Setup"
+            if "Management Setup" in wb.sheetnames
+            else None
+        )
+        if setup_sheet_name is not None:
+            ws = wb[setup_sheet_name]
+            target_rows = records_from_table(ws, "ManagementTargets")
+            if not target_rows:
+                target_header_row = find_sheet_header_row(ws, "Entity")
+                if target_header_row:
+                    headers = {
+                        ws.cell(row=target_header_row, column=col).value: col
+                        for col in range(1, ws.max_column + 1)
+                        if ws.cell(row=target_header_row, column=col).value
+                    }
+                    row = target_header_row + 1
+                    while row <= ws.max_row:
+                        entity = ws.cell(row=row, column=headers["Entity"]).value
+                        if not entity:
+                            break
+                        target_rows.append(
+                            {
+                                str(header): excel_safe_cell_value(
+                                    ws.cell(row=row, column=column)
+                                )
+                                for header, column in headers.items()
+                            }
+                        )
+                        row += 1
+            for target_row in target_rows:
+                entity = target_row.get("Entity")
+                if is_blank(entity):
+                    continue
+                values: dict[str, float | None] = {}
+                for field, label in TARGET_FIELDS:
+                    value = target_row.get(label)
+                    if isinstance(value, (int, float)):
+                        values[field] = (
+                            float(value) * 60
+                            if field == "average_ticket_time_seconds"
+                            else float(value)
+                        )
+                    else:
+                        values[field] = None
+                state["targets"][str(entity)] = values
             state["owner_roster"] = owner_roster_from_sheet(ws)
             state["owners"] = active_owner_names(state["owner_roster"])
             state["owner_roster_capacity"] = owner_roster_capacity_from_sheet(ws)
-        if "Action Board" in wb.sheetnames:
+        if (
+            MANAGEMENT_CENTER_SHEET in wb.sheetnames
+            and "ActionBoardTable" in wb[MANAGEMENT_CENTER_SHEET].tables
+        ):
+            state["active_actions"] = validate_action_board_records(
+                records_from_table(wb[MANAGEMENT_CENTER_SHEET], "ActionBoardTable"),
+                allowed_reviewers=state["owners"],
+            )
+        elif "Action Board" in wb.sheetnames:
             state["active_actions"] = validate_action_board_records(
                 records_from_sheet(wb["Action Board"], "Action ID"),
                 allowed_reviewers=state["owners"],
             )
-        if "Action History" in wb.sheetnames:
+        if (
+            MANAGEMENT_CENTER_SHEET in wb.sheetnames
+            and "ActionHistoryTable" in wb[MANAGEMENT_CENTER_SHEET].tables
+        ):
+            state["action_history"] = validate_action_board_records(
+                records_from_table(wb[MANAGEMENT_CENTER_SHEET], "ActionHistoryTable")
+            )
+        elif "Action History" in wb.sheetnames:
             state["action_history"] = validate_action_board_records(
                 records_from_sheet(wb["Action History"], "Action ID")
             )
@@ -6664,6 +7543,20 @@ def workbook_digest_value(value: Any) -> Any:
         raise IntegrityError("Workbook integrity cannot hash NaN or infinite values.")
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, ArrayFormula):
+        return {
+            "type": "ArrayFormula",
+            "ref": value.ref,
+            "text": value.text,
+        }
+    if isinstance(value, DataTableFormula):
+        return {
+            "type": "DataTableFormula",
+            **{
+                key: item
+                for key, item in sorted(value.__dict__.items())
+            },
+        }
     formula_text = getattr(value, "text", None)
     if isinstance(formula_text, str):
         return {"type": type(value).__name__, "value": formula_text}
@@ -6768,7 +7661,18 @@ def reject_external_formula_reference(
 ) -> None:
     if data_type != "f":
         return
-    formula = str(value or "")
+    if isinstance(value, ArrayFormula):
+        formula_fields = (value.ref, value.text)
+    elif isinstance(value, DataTableFormula):
+        formula_fields = tuple(value.__dict__.values())
+    elif isinstance(value, str):
+        formula_fields = (value,)
+    else:
+        raise IntegrityError(
+            "Unsupported formula object in protected master workbook: "
+            f"{sheet_name}!{coordinate} ({type(value).__name__})."
+        )
+    formula = "\n".join(str(item) for item in formula_fields if item is not None)
     if (
         re.search(r"\[(?:\d+|[^\]]+\.(?:xlsx?|xlsm|xlsb|csv))\]", formula, re.I)
         or re.search(r"(?:https?|file)://|\\\\|[A-Za-z]:\\", formula, re.I)
@@ -7100,21 +8004,50 @@ def workbook_digest_excluded_cells(wb: Workbook) -> set[tuple[str, str]]:
 
 def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
     approved: set[tuple[str, str]] = set()
-    if "Management Setup" in wb.sheetnames:
-        ws = wb["Management Setup"]
-        target_header_row = find_sheet_header_row(ws, "Entity")
-        if target_header_row:
+    setup_sheet_name = (
+        MANAGEMENT_CENTER_SHEET
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+        and "ManagementTargets" in wb[MANAGEMENT_CENTER_SHEET].tables
+        and OWNER_ROSTER_TABLE_NAME in wb[MANAGEMENT_CENTER_SHEET].tables
+        else "Management Setup"
+        if "Management Setup" in wb.sheetnames
+        else None
+    )
+    if setup_sheet_name is not None:
+        ws = wb[setup_sheet_name]
+        if "ManagementTargets" in ws.tables:
+            min_col, min_row, max_col, max_row = range_boundaries(
+                ws.tables["ManagementTargets"].ref
+            )
             headers = {
-                ws.cell(row=target_header_row, column=col).value: col
-                for col in range(1, ws.max_column + 1)
-                if ws.cell(row=target_header_row, column=col).value
+                ws.cell(row=min_row, column=col).value: col
+                for col in range(min_col, max_col + 1)
+                if ws.cell(row=min_row, column=col).value
             }
-            target_columns = [headers[label] for _, label in TARGET_FIELDS if label in headers]
-            row = target_header_row + 1
-            while row <= ws.max_row and not is_blank(ws.cell(row=row, column=headers["Entity"]).value):
+            target_columns = [
+                headers[label] for _, label in TARGET_FIELDS if label in headers
+            ]
+            for row in range(min_row + 1, max_row + 1):
                 for col in target_columns:
                     approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
-                row += 1
+        else:
+            target_header_row = find_sheet_header_row(ws, "Entity")
+            if target_header_row:
+                headers = {
+                    ws.cell(row=target_header_row, column=col).value: col
+                    for col in range(1, ws.max_column + 1)
+                    if ws.cell(row=target_header_row, column=col).value
+                }
+                target_columns = [
+                    headers[label] for _, label in TARGET_FIELDS if label in headers
+                ]
+                row = target_header_row + 1
+                while row <= ws.max_row and not is_blank(
+                    ws.cell(row=row, column=headers["Entity"]).value
+                ):
+                    for col in target_columns:
+                        approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
+                    row += 1
         if OWNER_ROSTER_TABLE_NAME in ws.tables:
             min_col, min_row, max_col, max_row = range_boundaries(
                 ws.tables[OWNER_ROSTER_TABLE_NAME].ref
@@ -7125,13 +8058,27 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
         else:
             for row in range(6, 26):
                 approved.add((ws.title, f"J{row}"))
-    if "Action Board" in wb.sheetnames:
-        ws = wb["Action Board"]
-        header_row = find_sheet_header_row(ws, "Action ID")
+    action_sheet_name = (
+        MANAGEMENT_CENTER_SHEET
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+        and "ActionBoardTable" in wb[MANAGEMENT_CENTER_SHEET].tables
+        else "Action Board"
+        if "Action Board" in wb.sheetnames
+        else None
+    )
+    if action_sheet_name is not None:
+        ws = wb[action_sheet_name]
+        if "ActionBoardTable" in ws.tables:
+            min_col, header_row, max_col, max_row = range_boundaries(
+                ws.tables["ActionBoardTable"].ref
+            )
+        else:
+            header_row = find_sheet_header_row(ws, "Action ID")
+            min_col, max_col, max_row = 1, ws.max_column, ws.max_row
         if header_row:
             headers = {
                 ws.cell(row=header_row, column=col).value: col
-                for col in range(1, ws.max_column + 1)
+                for col in range(min_col, max_col + 1)
                 if ws.cell(row=header_row, column=col).value
             }
             for header in (
@@ -7147,7 +8094,7 @@ def approved_management_input_cells(wb: Workbook) -> set[tuple[str, str]]:
                 col = headers.get(header)
                 if col is None:
                     continue
-                for row in range(header_row + 1, ws.max_row + 1):
+                for row in range(header_row + 1, max_row + 1):
                     approved.add((ws.title, ws.cell(row=row, column=col).coordinate))
     return approved
 
@@ -7334,7 +8281,16 @@ def workbook_internal_hyperlink_destination(
             "External hyperlinks are not allowed in the protected master workbook: "
             f"{sheet_name}!{coordinate}."
         )
-    destinations = [value.lstrip("#").strip() for value in (target, location) if value]
+    def canonical_destination(value: str) -> str:
+        stripped = value.strip()
+        if stripped.startswith("##"):
+            raise IntegrityError(
+                "Workbook hyperlink has more than one leading fragment marker: "
+                f"{sheet_name}!{coordinate}."
+            )
+        return stripped[1:].strip() if stripped.startswith("#") else stripped
+
+    destinations = [canonical_destination(value) for value in (target, location) if value]
     if any(
         re.search(r"(?:https?|file)://|\\\\|[A-Za-z]:[\\/]", value, re.I)
         or value.startswith(("/", "../", "..\\"))
@@ -7360,9 +8316,16 @@ def workbook_semantic_hyperlink_payload(
     *,
     sheet_name: str,
     coordinate: str,
+    cell_value: Any = None,
 ) -> dict[str, Any] | None:
     if hyperlink is None:
         return None
+    display = hyperlink.display
+    if display is not None and cell_value is not None and str(display) == str(cell_value):
+        # Excel materializes the visible cell text into the optional display
+        # attribute when it saves an internal hyperlink.  The cell value is already
+        # protected separately, so the two serializations are equivalent.
+        display = None
     return {
         "destination": workbook_internal_hyperlink_destination(
             hyperlink,
@@ -7370,7 +8333,7 @@ def workbook_semantic_hyperlink_payload(
             coordinate=coordinate,
         ),
         "tooltip": hyperlink.tooltip,
-        "display": hyperlink.display,
+        "display": display,
     }
 
 
@@ -7387,10 +8350,22 @@ def workbook_hyperlink_matches(
         hyperlink,
         sheet_name=sheet_name,
         coordinate=coordinate,
-    ) == str(expected).strip().lstrip("#")
+    ) == (
+        str(expected).strip()[1:].strip()
+        if str(expected).strip().startswith("#")
+        else str(expected).strip()
+    )
 
 
 def workbook_semantic_table_payload(table: Any) -> dict[str, Any]:
+    def formula_payload(formula: Any) -> dict[str, Any] | None:
+        if formula is None:
+            return None
+        return {
+            "text": getattr(formula, "text", None),
+            "array": bool(getattr(formula, "array", False)),
+        }
+
     columns = []
     for column in table.tableColumns:
         calculated = getattr(column, "calculatedColumnFormula", None)
@@ -7409,31 +8384,71 @@ def workbook_semantic_table_payload(table: Any) -> dict[str, Any]:
                 "header_row_cell_style": getattr(column, "headerRowCellStyle", None),
                 "data_cell_style": getattr(column, "dataCellStyle", None),
                 "totals_row_cell_style": getattr(column, "totalsRowCellStyle", None),
-                "calculated_formula": getattr(calculated, "text", None),
-                "totals_formula": getattr(totals, "text", None),
+                "calculated_formula": formula_payload(calculated),
+                "totals_formula": formula_payload(totals),
+                "xml_column_properties": workbook_digest_serialisable(
+                    getattr(column, "xmlColumnPr", None)
+                ),
+                "extensions": workbook_digest_serialisable(
+                    getattr(column, "extLst", None)
+                ),
             }
         )
     return {
+        "id": table.id,
         "name": table.name,
         "display_name": table.displayName,
+        "comment": table.comment,
         "ref": table.ref,
         "table_type": table.tableType,
         "header_row_count": table.headerRowCount,
+        "insert_row": bool(table.insertRow),
+        "insert_row_shift": bool(table.insertRowShift),
         "totals_row_count": table.totalsRowCount,
-        "totals_row_shown": table.totalsRowShown,
+        "totals_row_shown": table.totalsRowShown is not False,
+        "published": bool(table.published),
+        "header_row_dxf_id": table.headerRowDxfId,
+        "data_dxf_id": table.dataDxfId,
+        "totals_row_dxf_id": table.totalsRowDxfId,
+        "header_row_border_dxf_id": table.headerRowBorderDxfId,
+        "table_border_dxf_id": table.tableBorderDxfId,
+        "totals_row_border_dxf_id": table.totalsRowBorderDxfId,
+        "header_row_cell_style": table.headerRowCellStyle,
+        "data_cell_style": table.dataCellStyle,
+        "totals_row_cell_style": table.totalsRowCellStyle,
+        "connection_id": table.connectionId,
         "auto_filter": workbook_digest_serialisable(table.autoFilter),
         "sort_state": workbook_digest_serialisable(table.sortState),
-        "style": workbook_digest_serialisable(table.tableStyleInfo),
+        "style": (
+            {
+                "name": table.tableStyleInfo.name,
+                "show_first_column": bool(table.tableStyleInfo.showFirstColumn),
+                "show_last_column": bool(table.tableStyleInfo.showLastColumn),
+                "show_row_stripes": bool(table.tableStyleInfo.showRowStripes),
+                "show_column_stripes": bool(table.tableStyleInfo.showColumnStripes),
+            }
+            if table.tableStyleInfo is not None
+            else None
+        ),
         "columns": columns,
     }
+
+
+def workbook_semantic_validation_formula(value: Any) -> Any:
+    if value is None:
+        return None
+    text = str(value)
+    if re.fullmatch(r"=?[A-Za-z_\\][A-Za-z0-9_.]*", text):
+        return text.lstrip("=")
+    return value
 
 
 def workbook_semantic_validation_payload(validation: Any) -> dict[str, Any]:
     return {
         "type": validation.type,
         "operator": validation.operator,
-        "formula1": validation.formula1,
-        "formula2": validation.formula2,
+        "formula1": workbook_semantic_validation_formula(validation.formula1),
+        "formula2": workbook_semantic_validation_formula(validation.formula2),
         "sqref": str(validation.sqref),
         "allow_blank": bool(validation.allowBlank),
         "show_drop_down": bool(validation.showDropDown),
@@ -7454,12 +8469,18 @@ def workbook_semantic_validation_payload(validation: Any) -> dict[str, Any]:
 def workbook_semantic_workbook_protection_payload(protection: Any) -> dict[str, Any] | None:
     if protection is None:
         return None
-    return {
+    payload = {
         "lock_structure": bool(protection.lockStructure),
         "lock_windows": bool(protection.lockWindows),
         "lock_revision": bool(protection.lockRevision),
         "workbook_password": protection.workbookPassword,
+        "workbook_password_character_set": (
+            protection.workbookPasswordCharacterSet
+        ),
         "revisions_password": protection.revisionsPassword,
+        "revisions_password_character_set": (
+            protection.revisionsPasswordCharacterSet
+        ),
         "workbook_algorithm": protection.workbookAlgorithmName,
         "workbook_hash": protection.workbookHashValue,
         "workbook_salt": protection.workbookSaltValue,
@@ -7469,24 +8490,158 @@ def workbook_semantic_workbook_protection_payload(protection: Any) -> dict[str, 
         "revisions_salt": protection.revisionsSaltValue,
         "revisions_spin_count": protection.revisionsSpinCount,
     }
+    if not any(value not in (None, False) for value in payload.values()):
+        return None
+    return payload
 
 
 def workbook_semantic_number_format(number_format: str) -> str:
     """Normalize only Excel escape spelling that preserves literal display text."""
 
-    return re.sub(r"\\([$+\-])", r"\1", number_format)
+    # Backslashes inside a quoted literal are visible characters. Track quoted
+    # runs explicitly because Excel permits an escaped quote (\") inside them.
+    result: list[str] = []
+    in_quote = False
+    for index, character in enumerate(number_format):
+        preceding_backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and number_format[cursor] == "\\":
+            preceding_backslashes += 1
+            cursor -= 1
+        if character == '"' and preceding_backslashes % 2 == 0:
+            in_quote = not in_quote
+        if (
+            character == "\\"
+            and not in_quote
+            and index + 1 < len(number_format)
+            and number_format[index + 1] in "$+-"
+            and preceding_backslashes % 2 == 0
+        ):
+            continue
+        result.append(character)
+    return "".join(result)
+
+
+def workbook_semantic_color_payload(color: Any) -> dict[str, Any] | None:
+    """Capture effective color semantics while ignoring OOXML alpha spelling."""
+
+    if color is None:
+        return None
+    color_type = getattr(color, "type", None)
+    payload: dict[str, Any] = {"type": color_type}
+    if color_type == "rgb":
+        rgb = getattr(color, "rgb", None)
+        payload["value"] = str(rgb)[-6:].upper() if rgb else None
+    elif color_type == "indexed":
+        payload["value"] = getattr(color, "indexed", None)
+    elif color_type == "theme":
+        payload["value"] = getattr(color, "theme", None)
+    elif color_type == "auto":
+        payload["value"] = bool(getattr(color, "auto", False))
+    else:
+        payload.update(
+            {
+                "rgb": getattr(color, "rgb", None),
+                "indexed": getattr(color, "indexed", None),
+                "theme": getattr(color, "theme", None),
+                "auto": getattr(color, "auto", None),
+            }
+        )
+    tint = float(getattr(color, "tint", 0.0) or 0.0)
+    payload["tint"] = round(tint, 8)
+    return payload
+
+
+def workbook_semantic_border_side_payload(side: Any) -> dict[str, Any] | None:
+    if side is None or getattr(side, "style", None) is None:
+        return None
+    return {
+        "style": side.style,
+        "color": workbook_semantic_color_payload(side.color),
+    }
 
 
 def workbook_semantic_style_payload(styleable: Any) -> dict[str, Any]:
     """Capture visible style semantics without relying on workbook style IDs."""
 
+    font = styleable.font
+    fill = styleable.fill
+    border = styleable.border
+    alignment = styleable.alignment
+    protection = styleable.protection
+    fill_type = fill.fill_type
+    fill_payload: dict[str, Any] = {"type": fill_type}
+    if fill_type is not None:
+        foreground = getattr(fill, "fgColor", None)
+        background = getattr(fill, "bgColor", None)
+        if foreground is not None:
+            fill_payload["foreground"] = workbook_semantic_color_payload(foreground)
+        if fill_type != "solid" and background is not None:
+            fill_payload["background"] = workbook_semantic_color_payload(background)
+        for attribute in ("degree", "left", "right", "top", "bottom"):
+            value = getattr(fill, attribute, None)
+            if value is not None:
+                fill_payload[attribute] = value
+        stops = getattr(fill, "stop", None)
+        if stops:
+            fill_payload["stops"] = [
+                {
+                    "position": stop.position,
+                    "color": workbook_semantic_color_payload(stop.color),
+                }
+                for stop in stops
+            ]
     return {
-        "font": workbook_digest_serialisable(styleable.font),
-        "fill": workbook_digest_serialisable(styleable.fill),
-        "border": workbook_digest_serialisable(styleable.border),
-        "alignment": workbook_digest_serialisable(styleable.alignment),
+        "font": {
+            # Excel writes the workbook default font name into otherwise explicit
+            # font records.  In this workbook that default is Calibri.
+            "name": font.name or "Calibri",
+            "size": float(font.sz) if font.sz is not None else 11.0,
+            "bold": bool(font.b),
+            "italic": bool(font.i),
+            "underline": font.u,
+            "strike": bool(font.strike),
+            "outline": bool(font.outline),
+            "shadow": bool(font.shadow),
+            "condense": bool(font.condense),
+            "extend": bool(font.extend),
+            "vertical_align": font.vertAlign,
+            "charset": font.charset,
+            "family": font.family,
+            "scheme": font.scheme,
+            "color": workbook_semantic_color_payload(font.color),
+        },
+        "fill": fill_payload,
+        "border": {
+            "left": workbook_semantic_border_side_payload(border.left),
+            "right": workbook_semantic_border_side_payload(border.right),
+            "top": workbook_semantic_border_side_payload(border.top),
+            "bottom": workbook_semantic_border_side_payload(border.bottom),
+            "diagonal": workbook_semantic_border_side_payload(border.diagonal),
+            "vertical": workbook_semantic_border_side_payload(border.vertical),
+            "horizontal": workbook_semantic_border_side_payload(border.horizontal),
+            "start": workbook_semantic_border_side_payload(border.start),
+            "end": workbook_semantic_border_side_payload(border.end),
+            "diagonal_up": bool(border.diagonalUp),
+            "diagonal_down": bool(border.diagonalDown),
+            "outline": border.outline is not False,
+        },
+        "alignment": {
+            "horizontal": alignment.horizontal,
+            "vertical": alignment.vertical,
+            "text_rotation": int(alignment.textRotation or 0),
+            "wrap_text": bool(alignment.wrapText),
+            "shrink_to_fit": bool(alignment.shrinkToFit),
+            "indent": float(alignment.indent or 0.0),
+            "relative_indent": float(alignment.relativeIndent or 0.0),
+            "justify_last_line": bool(alignment.justifyLastLine),
+            "reading_order": float(alignment.readingOrder or 0.0),
+        },
         "number_format": workbook_semantic_number_format(styleable.number_format),
-        "protection": workbook_digest_serialisable(styleable.protection),
+        "protection": {
+            "locked": protection.locked is not False,
+            "hidden": bool(protection.hidden),
+        },
     }
 
 
@@ -7534,26 +8689,36 @@ def workbook_chart_semantic_xml(node: Any) -> dict[str, Any] | None:
         # These values are derived from protected worksheet cells and Excel may add or
         # discard them on open/save. The source formula remains part of the digest.
         return None
-    raw_attributes = {
-        str(key).rsplit("}", 1)[-1]: str(value)
-        for key, value in sorted(node.attrib.items(), key=lambda item: str(item[0]))
+    raw_attributes: dict[str, str] = {}
+    for key, value in sorted(node.attrib.items(), key=lambda item: str(item[0])):
+        expanded_key = str(key)
+        text_value = str(value)
+        if expanded_key.rsplit("}", 1)[-1] == "formatCode":
+            text_value = workbook_semantic_number_format(text_value)
+        raw_attributes[expanded_key] = text_value
+    attributes_by_local = {
+        key.rsplit("}", 1)[-1]: value for key, value in raw_attributes.items()
     }
-    if "formatCode" in raw_attributes:
-        raw_attributes["formatCode"] = workbook_semantic_number_format(
-            raw_attributes["formatCode"]
-        )
-    if local == "smooth" and raw_attributes.get("val", "0").casefold() in {
+    if local == "smooth" and attributes_by_local.get("val", "0").casefold() in {
         "0", "false",
     }:
         return None
-    text = (
-        str(node.text).strip()
-        if node.text is not None and str(node.text).strip()
-        else None
-    )
+    text = str(node.text) if node.text is not None else None
+    xml_space = "{http://www.w3.org/XML/1998/namespace}space"
+    if (
+        local == "t"
+        and raw_attributes.get(xml_space) == "preserve"
+        and text is not None
+        and text != text.strip()
+    ):
+        # Excel preserves the text while omitting this redundant marker on save.
+        raw_attributes.pop(xml_space)
+        attributes_by_local = {
+            key.rsplit("}", 1)[-1]: value for key, value in raw_attributes.items()
+        }
     if local == "f" and text is not None:
         # Excel may add/remove absolute-reference markers without changing the source.
-        text = text.replace("$", "")
+        text = workbook_chart_formula(text)
     children = [
         payload
         for child in list(node)
@@ -7565,23 +8730,149 @@ def workbook_chart_semantic_xml(node: Any) -> dict[str, Any] | None:
             "showPercent", "showBubbleSize", "showLeaderLines", "showMarker",
         }
         if all(
-            child["tag"] in false_label_tags
-            and child["attributes"].get("val", "0").casefold() in {"0", "false"}
+            child["local_tag"] in false_label_tags
+            and {
+                key.rsplit("}", 1)[-1]: value
+                for key, value in child["attributes"].items()
+            }.get("val", "0").casefold()
+            in {"0", "false"}
             and not child["children"]
             for child in children
         ):
             return None
     if (
         local == "numFmt"
-        and raw_attributes.get("formatCode") == "General"
-        and raw_attributes.get("sourceLinked", "1").casefold() in {"1", "true"}
-        and set(raw_attributes) <= {"formatCode", "sourceLinked"}
+        and attributes_by_local.get("formatCode") == "General"
+        and attributes_by_local.get("sourceLinked", "1").casefold()
+        in {"1", "true"}
+        and set(attributes_by_local) <= {"formatCode", "sourceLinked"}
         and text is None
         and not children
     ):
         return None
+    if local == "lstStyle" and not raw_attributes and text is None and not children:
+        return None
+    if local == "layout" and not raw_attributes and text is None and not children:
+        return None
+    if local == "spPr" and not raw_attributes and text is None and len(children) == 1:
+        [line] = children
+        if (
+            line["tag"]
+            == "{http://schemas.openxmlformats.org/drawingml/2006/main}ln"
+            and not line["attributes"]
+            and line["text"] is None
+            and len(line["children"]) == 1
+            and line["children"][0]["tag"]
+            == "{http://schemas.openxmlformats.org/drawingml/2006/main}prstDash"
+            and line["children"][0]["attributes"] == {"val": "solid"}
+            and line["children"][0]["text"] is None
+            and not line["children"][0]["children"]
+        ):
+            # openpyxl emits this no-op marker outline; Excel removes it.
+            return None
+    if (
+        local == "rPr"
+        and attributes_by_local == {"lang": "en-US"}
+        and text is None
+        and not children
+    ):
+        return None
+    if (
+        local == "autoTitleDeleted"
+        and attributes_by_local.get("val", "0").casefold() in {"0", "false"}
+        and text is None
+        and not children
+    ):
+        return None
+    if (
+        local == "showDLblsOverMax"
+        and attributes_by_local.get("val", "1").casefold() in {"1", "true"}
+        and text is None
+        and not children
+    ):
+        return None
+    if (
+        local == "date1904"
+        and attributes_by_local.get("val", "0").casefold() in {"0", "false"}
+        and text is None
+        and not children
+    ):
+        return None
+    if (
+        local == "lang"
+        and attributes_by_local.get("val", "").casefold() == "en-us"
+        and text is None
+        and not children
+    ):
+        return None
+    if (
+        local == "roundedCorners"
+        and attributes_by_local.get("val", "1").casefold() in {"1", "true"}
+        and text is None
+        and not children
+    ):
+        # Desktop Excel materializes the schema/default rounded-corner setting
+        # on first save even when the generated chart part omits it.
+        return None
+    if (
+        local == "style"
+        and attributes_by_local.get("val") == "2"
+        and text is None
+        and not children
+    ):
+        # Style 2 is Excel's first-save materialization for an omitted chart style.
+        return None
+    if local == "printSettings" and not raw_attributes and text is None:
+        child_by_tag = {child["local_tag"]: child for child in children}
+        header_footer = child_by_tag.get("headerFooter")
+        page_margins = child_by_tag.get("pageMargins")
+        page_setup = child_by_tag.get("pageSetup")
+        if (
+            set(child_by_tag) == {"headerFooter", "pageMargins", "pageSetup"}
+            and header_footer is not None
+            and not header_footer["attributes"]
+            and header_footer["text"] is None
+            and not header_footer["children"]
+            and page_margins is not None
+            and page_margins["attributes"]
+            == {
+                "b": "0.75",
+                "footer": "0.3",
+                "header": "0.3",
+                "l": "0.7",
+                "r": "0.7",
+                "t": "0.75",
+            }
+            and page_margins["text"] is None
+            and not page_margins["children"]
+            and page_setup is not None
+            and not page_setup["attributes"]
+            and page_setup["text"] is None
+            and not page_setup["children"]
+        ):
+            return None
+    if local == "extLst" and not raw_attributes and text is None and len(children) == 1:
+        [extension] = children
+        extension_attributes = {
+            key.rsplit("}", 1)[-1]: value
+            for key, value in extension["attributes"].items()
+        }
+        if (
+            extension["tag"]
+            == "{http://schemas.openxmlformats.org/drawingml/2006/chart}ext"
+            and extension_attributes.get("uri")
+            == "{C3380CC4-5D6E-409C-BE32-E72D297353CC}"
+            and extension["text"] is None
+            and len(extension["children"]) == 1
+            and extension["children"][0]["tag"]
+            == "{http://schemas.microsoft.com/office/drawing/2014/chart}uniqueId"
+        ):
+            # Excel generates a series UUID on first save; it is identity metadata,
+            # while the series index/order/formulas remain protected separately.
+            return None
     return {
-        "tag": local,
+        "tag": str(node.tag),
+        "local_tag": local,
         "attributes": raw_attributes,
         "text": text,
         "children": children,
@@ -7630,6 +8921,7 @@ def workbook_chart_anchor_payload(anchor: Any) -> dict[str, Any]:
 
     extent = getattr(anchor, "ext", None)
     position = getattr(anchor, "pos", None)
+    client_data = getattr(anchor, "clientData", None)
     return {
         "type": type(anchor).__name__,
         "from": marker(getattr(anchor, "_from", None)),
@@ -7645,32 +8937,356 @@ def workbook_chart_anchor_payload(anchor: Any) -> dict[str, Any]:
             else None
         ),
         "edit_as": getattr(anchor, "editAs", None),
+        "client_data": (
+            {
+                "locks_with_sheet": getattr(client_data, "fLocksWithSheet", None),
+                "prints_with_sheet": getattr(client_data, "fPrintsWithSheet", None),
+            }
+            if client_data is not None
+            else None
+        ),
+    }
+
+
+def workbook_raw_chart_parts_payload(path: Path) -> list[dict[str, Any]]:
+    """Hash chart-space XML that openpyxl does not fully restore when reading."""
+
+    from xml.etree import ElementTree
+    from zipfile import BadZipFile, ZipFile
+
+    try:
+        with ZipFile(path) as archive:
+            names = sorted(
+                name
+                for name in archive.namelist()
+                if name.startswith("xl/charts/chart") and name.endswith(".xml")
+            )
+            return [
+                {
+                    "part": name,
+                    "definition": workbook_chart_semantic_xml(
+                        ElementTree.fromstring(archive.read(name))
+                    ),
+                }
+                for name in names
+            ]
+    except (BadZipFile, ElementTree.ParseError, KeyError, OSError) as exc:
+        raise IntegrityError(f"Workbook chart XML is invalid: {exc}") from exc
+
+
+def workbook_chart_frame_payload(path: Path) -> list[dict[str, Any]]:
+    """Hash visible and locking semantics from chart drawing frames."""
+
+    from xml.etree import ElementTree
+    from zipfile import BadZipFile, ZipFile
+
+    def local_name(node: Any) -> str:
+        return str(node.tag).rsplit("}", 1)[-1]
+
+    def truthy(value: Any) -> bool:
+        return str(value or "0").casefold() in {"1", "true"}
+
+    try:
+        payload: list[dict[str, Any]] = []
+        with ZipFile(path) as archive:
+            names = sorted(
+                name
+                for name in archive.namelist()
+                if name.startswith("xl/drawings/drawing")
+                and name.endswith(".xml")
+            )
+            for name in names:
+                root = ElementTree.fromstring(archive.read(name))
+                for frame_index, frame in enumerate(
+                    node for node in root.iter() if local_name(node) == "graphicFrame"
+                ):
+                    nonvisual = next(
+                        (
+                            node
+                            for node in frame.iter()
+                            if local_name(node) == "cNvPr"
+                        ),
+                        None,
+                    )
+                    frame_properties = next(
+                        (
+                            node
+                            for node in frame.iter()
+                            if local_name(node) == "cNvGraphicFramePr"
+                        ),
+                        None,
+                    )
+                    locks = next(
+                        (
+                            node
+                            for node in (frame_properties.iter() if frame_properties is not None else ())
+                            if local_name(node) == "graphicFrameLocks"
+                        ),
+                        None,
+                    )
+                    lock_attributes = (
+                        {
+                            key: truthy(locks.attrib.get(key))
+                            for key in (
+                                "noChangeAspect",
+                                "noDrilldown",
+                                "noGrp",
+                                "noMove",
+                                "noResize",
+                                "noSelect",
+                            )
+                        }
+                        if locks is not None
+                        else {
+                            key: False
+                            for key in (
+                                "noChangeAspect",
+                                "noDrilldown",
+                                "noGrp",
+                                "noMove",
+                                "noResize",
+                                "noSelect",
+                            )
+                        }
+                    )
+                    payload.append(
+                        {
+                            "part": name,
+                            "frame_index": frame_index,
+                            "macro": frame.attrib.get("macro") or None,
+                            "name": (
+                                nonvisual.attrib.get("name")
+                                if nonvisual is not None
+                                else None
+                            ),
+                            "description": (
+                                nonvisual.attrib.get("descr")
+                                if nonvisual is not None
+                                else None
+                            ),
+                            "title": (
+                                nonvisual.attrib.get("title")
+                                if nonvisual is not None
+                                else None
+                            ),
+                            "hidden": (
+                                truthy(nonvisual.attrib.get("hidden"))
+                                if nonvisual is not None
+                                else False
+                            ),
+                            "locks": lock_attributes,
+                        }
+                    )
+        return payload
+    except (BadZipFile, ElementTree.ParseError, KeyError, OSError) as exc:
+        raise IntegrityError(f"Workbook chart drawing XML is invalid: {exc}") from exc
+
+
+def workbook_chart_formula(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    # Preserve literal dollar signs in quoted sheet names, string literals, and
+    # external-workbook tokens. Only remove absolute markers inside A1 cell
+    # references, which desktop Excel may add or discard on a no-edit save.
+    protected_token = re.compile(
+        r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|\[[^\]]*\])"
+    )
+    cell_reference = re.compile(
+        r"(?<![A-Za-z0-9_.])\$?([A-Za-z]{1,3})\$?(\d+)(?![A-Za-z0-9_])"
+    )
+    parts = protected_token.split(text)
+    for index in range(0, len(parts), 2):
+        parts[index] = cell_reference.sub(r"\1\2", parts[index])
+    normalized = "".join(parts)
+    return re.sub(
+        r"^'([A-Za-z_][A-Za-z0-9_.]*)'!",
+        r"\1!",
+        normalized,
+    )
+
+
+def workbook_chart_text_payload(value: Any) -> dict[str, Any] | None:
+    """Extract visible text and source formulas without empty rich-text defaults."""
+
+    if value is None:
+        return None
+    to_tree = getattr(value, "to_tree", None)
+    if not callable(to_tree):
+        return {"text": str(value), "formulas": []}
+    try:
+        root = to_tree()
+    except Exception as exc:
+        raise IntegrityError(
+            f"Workbook integrity could not inspect chart text: {exc}"
+        ) from exc
+    text: list[str] = []
+    formulas: list[str] = []
+    for node in root.iter():
+        local = str(node.tag).rsplit("}", 1)[-1]
+        if node.text is None:
+            continue
+        if local == "t":
+            text.append(str(node.text))
+        elif local == "f":
+            formulas.append(workbook_chart_formula(node.text) or "")
+    return {"text": text, "formulas": formulas}
+
+
+def workbook_chart_color_choice_payload(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    for attribute in (
+        "srgbClr", "schemeClr", "prstClr", "sysClr", "scrgbClr", "hslClr",
+    ):
+        color = getattr(value, attribute, None)
+        if color is not None:
+            return {"type": attribute, "value": str(color)}
+    return workbook_chart_semantic_part(value)
+
+
+def workbook_chart_graphical_properties_payload(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    line = getattr(value, "line", None)
+    return {
+        "no_fill": bool(getattr(value, "noFill", False)),
+        "solid_fill": workbook_chart_color_choice_payload(
+            getattr(value, "solidFill", None)
+        ),
+        "line": (
+            {
+                "no_fill": bool(getattr(line, "noFill", False)),
+                "solid_fill": workbook_chart_color_choice_payload(
+                    getattr(line, "solidFill", None)
+                ),
+                "width": getattr(line, "width", None),
+                "dash": getattr(line, "prstDash", None) or "solid",
+            }
+            if line is not None
+            else None
+        ),
+    }
+
+
+def workbook_chart_data_source_payload(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    for attribute in ("strRef", "numRef", "multiLvlStrRef"):
+        reference = getattr(value, attribute, None)
+        if reference is not None and getattr(reference, "f", None) is not None:
+            return {
+                # Excel resolves a category source to strRef or numRef from the
+                # protected source cells when it saves.  The referenced range,
+                # not that derived cache type, is the substantive contract.
+                "type": (
+                    "multi_level_reference"
+                    if attribute == "multiLvlStrRef"
+                    else "reference"
+                ),
+                "formula": workbook_chart_formula(reference.f),
+            }
+    for attribute in ("strLit", "numLit"):
+        literal = getattr(value, attribute, None)
+        if literal is not None:
+            points = [
+                (point.idx, getattr(point, "v", None))
+                for point in (getattr(literal, "pt", None) or [])
+            ]
+            return {"type": attribute, "points": points}
+    return None
+
+
+def workbook_chart_series_payload(
+    series: Any,
+    *,
+    line_default: bool,
+    bar_default: bool,
+) -> dict[str, Any]:
+    title = getattr(series, "tx", None)
+    title_reference = getattr(title, "strRef", None)
+    return {
+        "index": getattr(series, "idx", None),
+        "order": getattr(series, "order", None),
+        "title": {
+            "formula": workbook_chart_formula(
+                getattr(title_reference, "f", None)
+            ),
+            "value": getattr(title, "v", None),
+        },
+        "categories": workbook_chart_data_source_payload(
+            getattr(series, "cat", None) or getattr(series, "xVal", None)
+        ),
+        "values": workbook_chart_data_source_payload(
+            getattr(series, "val", None) or getattr(series, "yVal", None)
+        ),
+        "bubble_size": workbook_chart_data_source_payload(
+            getattr(series, "bubbleSize", None)
+        ),
+        "graphical_properties": workbook_chart_graphical_properties_payload(
+            getattr(series, "graphicalProperties", None)
+        ),
+        "marker": {
+            "symbol": getattr(getattr(series, "marker", None), "symbol", None),
+            "size": getattr(getattr(series, "marker", None), "size", None),
+        },
+        "smooth": (
+            getattr(series, "smooth", None) if line_default else None
+        ),
+        "invert_if_negative": (
+            getattr(series, "invertIfNegative", None) if bar_default else None
+        ),
+    }
+
+
+def workbook_chart_axis_payload(axis: Any) -> dict[str, Any]:
+    scaling = getattr(axis, "scaling", None)
+    number_format = getattr(axis, "numFmt", None)
+    return {
+        "id": getattr(axis, "axId", None),
+        "deleted": getattr(axis, "delete", None),
+        "position": getattr(axis, "axPos", None),
+        "crosses": getattr(axis, "crosses", None),
+        "title": workbook_chart_text_payload(getattr(axis, "title", None)),
+        "number_format": (
+            {
+                "code": workbook_semantic_number_format(number_format.formatCode),
+                "source_linked": number_format.sourceLinked,
+            }
+            if number_format is not None
+            else None
+        ),
+        "tick_label_position": getattr(axis, "tickLblPos", None),
+        "scaling": {
+            "log_base": getattr(scaling, "logBase", None),
+            "orientation": getattr(scaling, "orientation", None) or "minMax",
+            "minimum": getattr(scaling, "min", None),
+            "maximum": getattr(scaling, "max", None),
+        },
+        "major_unit": getattr(axis, "majorUnit", None),
+        "minor_unit": getattr(axis, "minorUnit", None),
     }
 
 
 def workbook_chart_semantic_payload(chart: Any) -> dict[str, Any]:
-    """Keep chart sources, ordering, labels, titles, axes, and display semantics."""
+    """Keep complete chart semantics while normalizing enumerated Excel defaults."""
 
     plots = list(getattr(chart, "_charts", None) or [chart])
-    plot_payloads: list[dict[str, Any]] = []
     all_axes: dict[str, Any] = {}
     for plot in plots:
-        plot_payloads.append(
-            {
-                "type": type(plot).__name__,
-                "definition": workbook_chart_semantic_part(plot),
-            }
-        )
         axes = getattr(plot, "_axes", None) or {}
         axis_items = axes.items() if hasattr(axes, "items") else enumerate(axes)
         for axis_id, axis in axis_items:
             all_axes[str(axis_id)] = axis
     return {
         "type": type(chart).__name__,
-        "plots": plot_payloads,
-        # openpyxl's chart.to_tree() contains only the plot. These chart-space
-        # components must be serialized separately or visible title/axis tampering
-        # would not affect the digest.
+        "plots": [
+            {
+                "type": type(plot).__name__,
+                "definition": workbook_chart_semantic_part(plot),
+            }
+            for plot in plots
+        ],
         "title": workbook_chart_semantic_part(getattr(chart, "title", None)),
         "legend": workbook_chart_semantic_part(getattr(chart, "legend", None)),
         "layout": workbook_chart_semantic_part(getattr(chart, "layout", None)),
@@ -7734,26 +9350,62 @@ def workbook_semantic_conditional_formatting_payload(ws: Any) -> list[dict[str, 
 
     payload: list[dict[str, Any]] = []
     for conditional_format in ws.conditional_formatting:
+        priorities = [rule.priority for rule in conditional_format.rules]
+        if len(priorities) != len(set(priorities)):
+            raise IntegrityError(
+                "Conditional-format rules must have unique priorities in the "
+                f"protected master workbook ({ws.title}!{conditional_format.sqref})."
+            )
+        rules = [
+            {
+                "definition": normalized_xml(
+                    rule.to_tree(),
+                    ignored_attributes=frozenset({"dxfId"}),
+                ),
+                "differential_style": (
+                    normalized_xml(rule.dxf.to_tree(), normalize_argb=True)
+                    if rule.dxf is not None
+                    else None
+                ),
+            }
+            for rule in conditional_format.rules
+        ]
+        rules.sort(key=lambda item: json.dumps(item, sort_keys=True, default=str))
         payload.append(
             {
                 "range": str(conditional_format.sqref),
-                "rules": [
-                    {
-                        "definition": normalized_xml(
-                            rule.to_tree(),
-                            ignored_attributes=frozenset({"dxfId"}),
-                        ),
-                        "differential_style": (
-                            normalized_xml(rule.dxf.to_tree(), normalize_argb=True)
-                            if rule.dxf is not None
-                            else None
-                        ),
-                    }
-                    for rule in conditional_format.rules
-                ],
+                "pivot": bool(conditional_format.pivot),
+                "rules": rules,
             }
         )
-    return payload
+    return sorted(payload, key=lambda item: item["range"])
+
+
+def workbook_semantic_differential_style_payload(style: Any) -> dict[str, Any]:
+    def normalized_xml(node: Any) -> dict[str, Any]:
+        attributes: dict[str, str] = {}
+        for key, value in sorted(node.attrib.items(), key=lambda item: str(item[0])):
+            expanded_key = str(key)
+            local_key = expanded_key.rsplit("}", 1)[-1]
+            text = str(value)
+            if local_key == "formatCode":
+                text = workbook_semantic_number_format(text)
+            if local_key in {"rgb", "fgColor", "bgColor"}:
+                text = text[-6:].upper()
+            attributes[expanded_key] = text
+        return {
+            "tag": str(node.tag),
+            "attributes": attributes,
+            "text": node.text,
+            "children": [normalized_xml(child) for child in list(node)],
+        }
+
+    try:
+        return normalized_xml(style.to_tree())
+    except Exception as exc:
+        raise IntegrityError(
+            f"Workbook integrity could not inspect a differential style: {exc}"
+        ) from exc
 
 
 def workbook_semantic_dimension_payload(dimension: Any) -> dict[str, Any]:
@@ -7770,9 +9422,6 @@ def workbook_semantic_dimension_payload(dimension: Any) -> dict[str, Any]:
     for attribute in ("width", "bestFit", "height", "thickTop", "thickBot"):
         if hasattr(dimension, attribute):
             value = getattr(dimension, attribute)
-            if attribute in {"width", "height"} and value is not None:
-                # Excel may round effective widths/heights by a few hundredths.
-                value = round(float(value) * 4) / 4
             payload[attribute] = value
     return payload
 
@@ -7794,6 +9443,48 @@ def workbook_semantic_column_dimensions_payload(ws: Any) -> list[dict[str, Any]]
     ]
 
 
+EXCEL_AUTOFIT_ROW_HEIGHTS: dict[str, dict[int, float]] = {
+    "Methodology": {19: 30.0},
+    "Weekly Server Metrics": {1: 19.5, 3: 30.0},
+    "Weekly Server Rankings": {1: 19.5, 3: 30.0},
+    "Server Week-over-Week Detail": {1: 19.5, 3: 30.0},
+    "Weekly Location Metrics": {1: 19.5, 3: 45.0},
+    "Store Week Trends": {1: 19.5, 3: 30.0},
+    "Store Trend Summary": {1: 19.5, 3: 45.0},
+    "Group Week Trends": {1: 19.5, 3: 30.0},
+    "Group Trend Summary": {1: 19.5, 3: 45.0},
+    "Daily Server Detail": {1: 19.5, 3: 30.0},
+    "Daily Location Detail": {1: 19.5, 3: 45.0},
+    "Server Trend Summary": {1: 19.5, 3: 30.0},
+    "_Data Quality Detail": {1: 21.0, 3: 30.0},
+    "_Consistency Calc": {3: 30.0},
+    "Dashboard": {18: 30.0},
+}
+
+# Desktop Excel rewrites these explicit point sizes on its first save. Generated
+# output uses the observed persisted value up front so every row height can remain
+# exact in the substantive digest.
+EXCEL_ROW_HEIGHT_SERIALIZATION: dict[float, float] = {
+    20.0: 20.1,
+    22.0: 21.95,
+    26.0: 26.1,
+    28.0: 27.95,
+    32.0: 32.1,
+    34.0: 33.95,
+    38.0: 38.1,
+    46.0: 45.95,
+    50.0: 50.1,
+}
+
+
+def workbook_semantic_row_dimensions_payload(ws: Any) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for index, dimension in sorted(ws.row_dimensions.items()):
+        item = workbook_semantic_dimension_payload(dimension)
+        payload.append({"index": index, **item})
+    return payload
+
+
 def workbook_semantic_sheet_format_payload(sheet_format: Any) -> dict[str, Any]:
     def size(value: Any) -> float | None:
         return None if value is None else round(float(value), 4)
@@ -7811,10 +9502,115 @@ def workbook_semantic_sheet_format_payload(sheet_format: Any) -> dict[str, Any]:
     }
 
 
-def workbook_semantic_sheet_view_payload(view: Any) -> dict[str, Any]:
+def workbook_semantic_page_setup_payload(ws: Any) -> dict[str, Any]:
+    setup = ws.page_setup
+    payload = {
+        attribute: getattr(setup, attribute)
+        for attribute in type(setup).__attrs__
+    }
+    page_setup_properties = ws.sheet_properties.pageSetUpPr
+    if page_setup_properties is not None and bool(page_setup_properties.fitToPage):
+        # Excel omits explicit 1-by-1 fit values because they are the defaults
+        # while preserving sheetPr/fitToPage. Zero and non-default values remain.
+        if payload["fitToWidth"] is None:
+            payload["fitToWidth"] = 1
+        if payload["fitToHeight"] is None:
+            payload["fitToHeight"] = 1
+    return payload
+
+
+def workbook_semantic_sheet_properties_payload(properties: Any) -> dict[str, Any]:
+    def attributes(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return {
+            attribute: getattr(value, attribute)
+            for attribute in type(value).__attrs__
+        }
+
     return {
-        "show_formulas": bool(view.showFormulas),
-        "show_zeros": True if view.showZeros is None else bool(view.showZeros),
+        **{
+            attribute: getattr(properties, attribute)
+            for attribute in type(properties).__attrs__
+        },
+        "tab_color": workbook_semantic_color_payload(properties.tabColor),
+        "outline_properties": attributes(properties.outlinePr),
+        "page_setup_properties": attributes(properties.pageSetUpPr),
+    }
+
+
+def workbook_semantic_sheet_view_payload(
+    ws: Any,
+    *,
+    grouped_view_ids: frozenset[int],
+) -> dict[str, Any]:
+    freeze_panes = ws.freeze_panes
+    if hasattr(freeze_panes, "coordinate"):
+        freeze_panes = freeze_panes.coordinate
+    views: list[dict[str, Any]] = []
+    for view in ws.views.sheetView:
+        pane = view.pane
+        views.append(
+            {
+                "workbook_view_id": view.workbookViewId,
+                # A single selected tab is transient active-sheet state. Two or
+                # more selected tabs enable grouped edits, so that state is hashed.
+                "tab_selected": (
+                    bool(view.tabSelected)
+                    if view.workbookViewId in grouped_view_ids
+                    else False
+                ),
+                "show_formulas": bool(view.showFormulas),
+                "show_grid_lines": (
+                    True if view.showGridLines is None else bool(view.showGridLines)
+                ),
+                "show_row_col_headers": (
+                    True
+                    if view.showRowColHeaders is None
+                    else bool(view.showRowColHeaders)
+                ),
+                "show_zeros": True if view.showZeros is None else bool(view.showZeros),
+                "right_to_left": bool(view.rightToLeft),
+                "show_ruler": True if view.showRuler is None else bool(view.showRuler),
+                "show_outline_symbols": (
+                    True
+                    if view.showOutlineSymbols is None
+                    else bool(view.showOutlineSymbols)
+                ),
+                "default_grid_color": (
+                    True
+                    if view.defaultGridColor is None
+                    else bool(view.defaultGridColor)
+                ),
+                "grid_color_id": view.colorId,
+                "window_protection": bool(view.windowProtection),
+                "show_white_space": (
+                    True if view.showWhiteSpace is None else bool(view.showWhiteSpace)
+                ),
+                "view": view.view or "normal",
+                "zoom_scale": view.zoomScale or 100,
+                "zoom_scale_normal": view.zoomScaleNormal,
+                "zoom_scale_sheet_layout": view.zoomScaleSheetLayoutView,
+                "zoom_scale_page_layout": view.zoomScalePageLayoutView,
+                "zoom_to_fit": bool(view.zoomToFit),
+                # Excel drops an explicit A1 because it is the default scroll origin.
+                "top_left_cell": view.topLeftCell or "A1",
+                "pane": (
+                    {
+                        "x_split": pane.xSplit,
+                        "y_split": pane.ySplit,
+                        "top_left_cell": pane.topLeftCell,
+                        "active_pane": pane.activePane,
+                        "state": pane.state,
+                    }
+                    if pane is not None
+                    else None
+                ),
+            }
+        )
+    return {
+        "freeze_panes": freeze_panes,
+        "views": views,
     }
 
 
@@ -7825,11 +9621,20 @@ def workbook_semantic_defined_name_payload(
         "name": name,
         "text": defined_name.attr_text,
         "type": defined_name.type,
+        "comment": defined_name.comment,
+        "custom_menu": defined_name.customMenu,
+        "description": defined_name.description,
+        "help": defined_name.help,
+        "status_bar": defined_name.statusBar,
         "local_sheet_id": defined_name.localSheetId,
         "hidden": bool(defined_name.hidden),
         "function": bool(defined_name.function),
         "vb_procedure": bool(defined_name.vbProcedure),
         "xlm": bool(defined_name.xlm),
+        "function_group_id": defined_name.functionGroupId,
+        "shortcut_key": defined_name.shortcutKey,
+        "publish_to_server": bool(defined_name.publishToServer),
+        "workbook_parameter": bool(defined_name.workbookParameter),
     }
 
 
@@ -7852,9 +9657,9 @@ def workbook_semantic_theme_payload(theme: bytes | str | None) -> dict[str, Any]
             else None
         )
         return {
-            "tag": str(node.tag).rsplit("}", 1)[-1],
+            "tag": str(node.tag),
             "attributes": {
-                str(key).rsplit("}", 1)[-1]: str(value)
+                str(key): str(value)
                 for key, value in sorted(
                     node.attrib.items(), key=lambda item: str(item[0])
                 )
@@ -7866,10 +9671,324 @@ def workbook_semantic_theme_payload(theme: bytes | str | None) -> dict[str, Any]
     return semantic_xml(root)
 
 
+def reject_unsupported_workbook_extensions(path: Path) -> None:
+    """Reject extension features that openpyxl would silently discard on load."""
+
+    from xml.etree import ElementTree
+    from zipfile import BadZipFile, ZipFile
+
+    try:
+        with ZipFile(path) as archive:
+            spreadsheet_namespace = (
+                "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+            )
+            allowed_nonstandard_elements = {
+                "xl/workbook.xml": {
+                    (
+                        "http://schemas.openxmlformats.org/markup-compatibility/2006",
+                        "AlternateContent",
+                    ),
+                    (
+                        "http://schemas.openxmlformats.org/markup-compatibility/2006",
+                        "Choice",
+                    ),
+                    (
+                        "http://schemas.openxmlformats.org/markup-compatibility/2006",
+                        "Fallback",
+                    ),
+                    (
+                        "http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac",
+                        "absPath",
+                    ),
+                    (
+                        "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+                        "revisionPtr",
+                    ),
+                    (
+                        "http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures",
+                        "calcFeatures",
+                    ),
+                    (
+                        "http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures",
+                        "feature",
+                    ),
+                },
+                "xl/styles.xml": {
+                    (
+                        "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+                        "slicerStyles",
+                    ),
+                    (
+                        "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main",
+                        "timelineStyles",
+                    ),
+                },
+            }
+            relationship_namespace = (
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+            )
+            markup_compatibility_namespace = (
+                "http://schemas.openxmlformats.org/markup-compatibility/2006"
+            )
+            xml_namespace = "http://www.w3.org/XML/1998/namespace"
+            excel_2010_namespace = (
+                "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
+            )
+            excel_revision3_namespace = (
+                "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3"
+            )
+            transient_revision_namespaces = {
+                "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+                "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2",
+                "http://schemas.microsoft.com/office/spreadsheetml/2016/revision6",
+                "http://schemas.microsoft.com/office/spreadsheetml/2016/revision10",
+            }
+            excel_calc_features_namespace = (
+                "http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures"
+            )
+            excel_calc_feature_names = (
+                "microsoft.com:RD",
+                "microsoft.com:Single",
+                "microsoft.com:FV",
+                "microsoft.com:CNMTM",
+                "microsoft.com:LET_WF",
+                "microsoft.com:LAMBDA_WF",
+                "microsoft.com:ARRAYTEXT_WF",
+            )
+
+            def is_excel_default_calc_features(extension_list: Any) -> bool:
+                if name != "xl/workbook.xml" or len(extension_list) != 1:
+                    return False
+                [extension] = list(extension_list)
+                if (
+                    str(extension.tag).rsplit("}", 1)[-1] != "ext"
+                    or extension.attrib
+                    != {"uri": "{B58B0392-4F1F-4190-BB64-5DF3571DCE5F}"}
+                    or len(extension) != 1
+                ):
+                    return False
+                [features] = list(extension)
+                if features.tag != f"{{{excel_calc_features_namespace}}}calcFeatures":
+                    return False
+                feature_nodes = list(features)
+                return (
+                    not features.attrib
+                    and tuple(
+                        node.attrib.get("name")
+                        for node in feature_nodes
+                        if node.tag
+                        == f"{{{excel_calc_features_namespace}}}feature"
+                        and set(node.attrib) == {"name"}
+                        and not list(node)
+                    )
+                    == excel_calc_feature_names
+                    and len(feature_nodes) == len(excel_calc_feature_names)
+                )
+            names = [
+                name
+                for name in archive.namelist()
+                if name == "xl/workbook.xml"
+                or name == "xl/styles.xml"
+                or name.startswith("xl/worksheets/sheet")
+                or name.startswith("xl/tables/table")
+            ]
+            for name in names:
+                if not name.endswith(".xml"):
+                    continue
+                root = ElementTree.fromstring(archive.read(name))
+                for node in root.iter():
+                    tag = str(node.tag)
+                    namespace = (
+                        tag.split("}", 1)[0].lstrip("{") if "}" in tag else ""
+                    )
+                    local_name = tag.rsplit("}", 1)[-1]
+                    if (
+                        namespace != spreadsheet_namespace
+                        and (namespace, local_name)
+                        not in allowed_nonstandard_elements.get(name, set())
+                    ):
+                        raise IntegrityError(
+                            "Unsupported XML namespace is not allowed in the "
+                            f"protected master workbook ({name})."
+                        )
+                    for attribute_name, attribute_value in node.attrib.items():
+                        attribute_name = str(attribute_name)
+                        if "}" not in attribute_name:
+                            continue
+                        attribute_namespace = (
+                            attribute_name.split("}", 1)[0].lstrip("{")
+                        )
+                        attribute_local_name = attribute_name.rsplit("}", 1)[-1]
+                        if attribute_namespace in {
+                            relationship_namespace,
+                            markup_compatibility_namespace,
+                            xml_namespace,
+                            *transient_revision_namespaces,
+                        }:
+                            continue
+                        if (
+                            attribute_namespace == excel_2010_namespace
+                            and attribute_local_name == "knownFonts"
+                            and str(attribute_value) == "1"
+                            and name == "xl/styles.xml"
+                        ):
+                            continue
+                        if (
+                            attribute_namespace == excel_2010_namespace
+                            and attribute_local_name == "dyDescent"
+                            and str(attribute_value) in {"0.25", "0.3", "0.35"}
+                            and name.startswith("xl/worksheets/sheet")
+                        ):
+                            continue
+                        if (
+                            attribute_namespace == excel_revision3_namespace
+                            and attribute_local_name == "uid"
+                            and name.startswith("xl/tables/table")
+                            and re.fullmatch(
+                                r"\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}",
+                                str(attribute_value),
+                            )
+                        ):
+                            continue
+                        raise IntegrityError(
+                            "Unsupported namespaced XML attribute is not allowed in "
+                            f"the protected master workbook ({name})."
+                        )
+                unsupported_extension = next(
+                    (
+                        node
+                        for node in root.iter()
+                        if str(node.tag).rsplit("}", 1)[-1] == "extLst"
+                        and list(node)
+                        and name != "xl/styles.xml"
+                        and not is_excel_default_calc_features(node)
+                    ),
+                    None,
+                )
+                if unsupported_extension is not None:
+                    raise IntegrityError(
+                        "Unsupported workbook extension content is not allowed in "
+                        f"the protected master workbook ({name})."
+                    )
+                if name == "xl/workbook.xml":
+                    unsupported_workbook_tags = {
+                        "customWorkbookViews",
+                        "fileRecoveryPr",
+                        "fileSharing",
+                        "functionGroups",
+                        "smartTagPr",
+                        "smartTagTypes",
+                        "webPublishing",
+                        "webPublishingObjects",
+                    }
+                    unsupported_workbook_tag = next(
+                        (
+                            str(node.tag).rsplit("}", 1)[-1]
+                            for node in root.iter()
+                            if str(node.tag).rsplit("}", 1)[-1]
+                            in unsupported_workbook_tags
+                        ),
+                        None,
+                    )
+                    if unsupported_workbook_tag is not None:
+                        raise IntegrityError(
+                            f"Workbook {unsupported_workbook_tag} content is not allowed "
+                            "in the protected master workbook."
+                        )
+                if name.startswith("xl/worksheets/sheet"):
+                    if any(
+                        str(node.tag).rsplit("}", 1)[-1] == "protectedRanges"
+                        for node in root.iter()
+                    ):
+                        raise IntegrityError(
+                            "Protected edit ranges are not allowed in the protected "
+                            f"master workbook ({name})."
+                        )
+                    unsupported_sheet_tags = {
+                        "ignoredErrors",
+                        "customSheetViews",
+                        "webPublishItems",
+                    }
+                    unsupported_sheet_tag = next(
+                        (
+                            str(node.tag).rsplit("}", 1)[-1]
+                            for node in root.iter()
+                            if str(node.tag).rsplit("}", 1)[-1]
+                            in unsupported_sheet_tags
+                        ),
+                        None,
+                    )
+                    if unsupported_sheet_tag is not None:
+                        raise IntegrityError(
+                            f"Worksheet {unsupported_sheet_tag} content is not allowed "
+                            f"in the protected master workbook ({name})."
+                        )
+                    for formula in (
+                        node
+                        for node in root.iter()
+                        if str(node.tag).rsplit("}", 1)[-1] == "f"
+                    ):
+                        attributes = {
+                            str(key).rsplit("}", 1)[-1]: value
+                            for key, value in formula.attrib.items()
+                        }
+                        formula_type = attributes.get("t")
+                        if formula_type is None:
+                            allowed_attributes: set[str] = set()
+                        elif formula_type == "array":
+                            allowed_attributes = {"t", "ref"}
+                        elif formula_type == "dataTable":
+                            allowed_attributes = {
+                                "t", "ref", "ca", "dt2D", "dtr", "r1", "r2",
+                                "del1", "del2",
+                            }
+                        else:
+                            allowed_attributes = set()
+                        if (
+                            formula_type not in (None, "array", "dataTable")
+                            or set(attributes) - allowed_attributes
+                        ):
+                            raise IntegrityError(
+                                "Unsupported worksheet formula attributes are not allowed "
+                                f"in the protected master workbook ({name})."
+                            )
+    except IntegrityError:
+        raise
+    except (BadZipFile, ElementTree.ParseError, KeyError, OSError) as exc:
+        raise IntegrityError(f"Workbook extension XML is invalid: {exc}") from exc
+
+
+def workbook_raw_properties_payload(path: Path) -> dict[str, Any]:
+    from xml.etree import ElementTree
+    from zipfile import BadZipFile, ZipFile
+
+    try:
+        with ZipFile(path) as archive:
+            root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        properties = next(
+            (
+                node
+                for node in root
+                if str(node.tag).rsplit("}", 1)[-1] == "workbookPr"
+            ),
+            None,
+        )
+        return {
+            str(key): str(value)
+            for key, value in sorted(
+                (properties.attrib.items() if properties is not None else ()),
+                key=lambda item: str(item[0]),
+            )
+        }
+    except (BadZipFile, ElementTree.ParseError, KeyError, OSError) as exc:
+        raise IntegrityError(f"Workbook properties XML is invalid: {exc}") from exc
+
+
 def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
-    """Build the v3 substantive view with only proven equivalent serialization normalized."""
+    """Build the current substantive view with only proven equivalents normalized."""
 
     reject_unapproved_workbook_drawings(path)
+    reject_unsupported_workbook_extensions(path)
     try:
         wb = load_workbook(
             path,
@@ -7886,8 +10005,29 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
             )
         approved = approved_management_input_cells(wb)
         digest_cells = workbook_digest_excluded_cells(wb)
+        selected_view_count_by_id: dict[int, int] = defaultdict(int)
+        for worksheet in wb.worksheets:
+            for view in worksheet.views.sheetView:
+                if view.tabSelected:
+                    selected_view_count_by_id[int(view.workbookViewId)] += 1
+        grouped_view_ids = frozenset(
+            view_id
+            for view_id, count in selected_view_count_by_id.items()
+            if count > 1
+        )
         sheets: list[dict[str, Any]] = []
         for ws in wb.worksheets:
+            scenarios = ws.scenarios
+            if (
+                getattr(scenarios, "scenario", [])
+                or getattr(scenarios, "current", None) is not None
+                or getattr(scenarios, "show", None) is not None
+                or getattr(scenarios, "sqref", None) is not None
+            ):
+                raise IntegrityError(
+                    "What-if scenarios are not allowed in the protected master "
+                    f"workbook ({ws.title!r})."
+                )
             if ws._images:
                 raise IntegrityError(
                     "Images and non-chart drawings are not allowed in the protected master "
@@ -7913,6 +10053,7 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
                     cell.hyperlink,
                     sheet_name=ws.title,
                     coordinate=cell.coordinate,
+                    cell_value=cell.value,
                 )
                 if (
                     cell.value is None
@@ -7951,7 +10092,9 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
                         "value_type": value_type,
                         "value": value_payload,
                         "data_type": (
-                            None if is_approved or is_digest_cell else cell.data_type
+                            None
+                            if is_approved or is_digest_cell or cell.value is None
+                            else cell.data_type
                         ),
                         "quote_prefix": bool(cell.quotePrefix),
                         "pivot_button": bool(cell.pivotButton),
@@ -7987,6 +10130,8 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
                     ),
                     "data_validations": {
                         "disable_prompts": bool(ws.data_validations.disablePrompts),
+                        "prompt_x": ws.data_validations.xWindow,
+                        "prompt_y": ws.data_validations.yWindow,
                         "items": [
                             workbook_semantic_validation_payload(validation)
                             for validation in ws.data_validations.dataValidation
@@ -8002,19 +10147,35 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
                     "merged_cells": sorted(
                         str(cell_range) for cell_range in ws.merged_cells.ranges
                     ),
-                    "row_dimensions": [
-                        {
-                            "index": index,
-                            **workbook_semantic_dimension_payload(dimension),
-                        }
-                        for index, dimension in sorted(ws.row_dimensions.items())
+                    "print_area": str(ws.print_area) if ws.print_area else None,
+                    "print_title_rows": ws.print_title_rows,
+                    "print_title_columns": ws.print_title_cols,
+                    "local_defined_names": [
+                        workbook_semantic_defined_name_payload(name, defined_name)
+                        for name, defined_name in sorted(
+                            ws.defined_names.items(),
+                            key=lambda item: item[0].casefold(),
+                        )
                     ],
+                    "row_dimensions": workbook_semantic_row_dimensions_payload(ws),
                     "column_dimensions": workbook_semantic_column_dimensions_payload(ws),
                     "sheet_format": workbook_semantic_sheet_format_payload(
                         ws.sheet_format
                     ),
-                    "sheet_view": workbook_semantic_sheet_view_payload(ws.sheet_view),
+                    "sheet_properties": workbook_semantic_sheet_properties_payload(
+                        ws.sheet_properties
+                    ),
+                    "sheet_view": workbook_semantic_sheet_view_payload(
+                        ws,
+                        grouped_view_ids=grouped_view_ids,
+                    ),
                     "auto_filter": workbook_digest_serialisable(ws.auto_filter),
+                    "page_margins": workbook_digest_serialisable(ws.page_margins),
+                    "page_setup": workbook_semantic_page_setup_payload(ws),
+                    "print_options": workbook_digest_serialisable(ws.print_options),
+                    "header_footer": workbook_digest_serialisable(ws.HeaderFooter),
+                    "row_breaks": workbook_digest_serialisable(ws.row_breaks),
+                    "column_breaks": workbook_digest_serialisable(ws.col_breaks),
                     "unlocked_cells": sorted(
                         cell.coordinate
                         for cell in ws._cells.values()
@@ -8025,6 +10186,20 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
             )
         return {
             "digest_scheme": WORKBOOK_DIGEST_SCHEME,
+            "date_epoch": wb.epoch.isoformat(),
+            "workbook_properties": workbook_raw_properties_payload(path),
+            "workbook_views": [
+                {
+                    "visibility": view.visibility,
+                    "minimized": bool(view.minimized),
+                    "show_horizontal_scroll": view.showHorizontalScroll is not False,
+                    "show_vertical_scroll": view.showVerticalScroll is not False,
+                    "show_sheet_tabs": view.showSheetTabs is not False,
+                    "tab_ratio": view.tabRatio,
+                    "auto_filter_date_grouping": view.autoFilterDateGrouping is not False,
+                }
+                for view in wb.views
+            ],
             "sheet_order": list(wb.sheetnames),
             "calculation": workbook_semantic_calculation_payload(wb.calculation),
             "theme": workbook_semantic_theme_payload(wb.loaded_theme),
@@ -8032,6 +10207,23 @@ def workbook_generated_content_payload(path: Path) -> dict[str, Any]:
             "table_styles": workbook_digest_serialisable(
                 getattr(wb, "_table_styles", None)
             ),
+            "differential_styles": [
+                json.loads(serialized)
+                for serialized in sorted(
+                    {
+                        json.dumps(
+                            workbook_semantic_differential_style_payload(style),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        for style in getattr(
+                            wb._differential_styles, "styles", []
+                        )
+                    }
+                )
+            ],
+            "raw_chart_parts": workbook_raw_chart_parts_payload(path),
+            "chart_frames": workbook_chart_frame_payload(path),
             "workbook_protection": workbook_semantic_workbook_protection_payload(
                 wb.security
             ),
@@ -8156,7 +10348,9 @@ def require_stop_style_list_validation(
     matches = [
         validation
         for validation in ws.data_validations.dataValidation
-        if validation.type == "list" and validation.formula1 == formula1
+        if validation.type == "list"
+        and workbook_semantic_validation_formula(validation.formula1)
+        == workbook_semantic_validation_formula(formula1)
     ]
     if len(matches) != 1:
         raise IntegrityError(f"The {label} list validation is missing or duplicated.")
@@ -8181,22 +10375,38 @@ def expected_management_list_validations(
         first = f"{column}{first_row}"
         return first if first_row == last_row else f"{first}:{column}{last_row}"
 
-    setup = wb["Management Setup"]
+    setup = (
+        wb[MANAGEMENT_CENTER_SHEET]
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+        and OWNER_ROSTER_TABLE_NAME in wb[MANAGEMENT_CENTER_SHEET].tables
+        else wb["Management Setup"]
+    )
     min_col, min_row, max_col, max_row = range_boundaries(
         setup.tables[OWNER_ROSTER_TABLE_NAME].ref
     )
-    if (min_col, max_col) != (1, 2):
+    if max_col - min_col != 1:
         raise IntegrityError("The Owner Roster table has an unexpected shape.")
+    roster_headers = {
+        setup.cell(row=min_row, column=column).value: column
+        for column in range(min_col, max_col + 1)
+    }
+    if tuple(roster_headers) != OWNER_ROSTER_HEADERS:
+        raise IntegrityError("The Owner Roster table has unexpected headers.")
+    active_column = get_column_letter(roster_headers["Active"])
     expected = [
         (
-            "Management Setup",
+            setup.title,
             '"Yes,No"',
             True,
-            f"B{min_row + 1}:B{max_row}",
+            f"{active_column}{min_row + 1}:{active_column}{max_row}",
             "Owner Roster Active",
         )
     ]
-    action_board = wb["Action Board"]
+    action_board = (
+        wb[MANAGEMENT_CENTER_SHEET]
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+        else wb["Action Board"]
+    )
     if "ActionBoardTable" in action_board.tables:
         action_min_col, action_min_row, action_max_col, action_max_row = range_boundaries(
             action_board.tables["ActionBoardTable"].ref
@@ -8213,7 +10423,7 @@ def expected_management_list_validations(
         )
         actual_action_headers = [
             action_board.cell(row=action_min_row, column=column).value
-            for column in range(1, action_max_col + 1)
+            for column in range(action_min_col, action_max_col + 1)
         ]
         if actual_action_headers != expected_action_headers:
             raise IntegrityError(
@@ -8224,13 +10434,19 @@ def expected_management_list_validations(
             if action_max_col == len(ACTION_HEADERS)
             else LEGACY_ACTION_STATUS_CHOICES
         )
+        action_columns = {
+            header: get_column_letter(action_min_col + offset)
+            for offset, header in enumerate(actual_action_headers)
+        }
         expected.extend(
             [
                 (
-                    "Action Board",
+                    action_board.title,
                     f'"{",".join(action_status_choices)}"',
                     False,
-                    column_range("D", action_min_row + 1, action_max_row),
+                    column_range(
+                        action_columns["Status"], action_min_row + 1, action_max_row
+                    ),
                     "Action Board status",
                 ),
             ]
@@ -8239,21 +10455,33 @@ def expected_management_list_validations(
             expected.extend(
                 [
                     (
-                        "Action Board",
+                        action_board.title,
                         f"={OWNER_ROSTER_DEFINED_NAME}",
                         True,
                         (
-                            column_range("E", action_min_row + 1, action_max_row)
+                            column_range(
+                                action_columns["Owner"],
+                                action_min_row + 1,
+                                action_max_row,
+                            )
                             + " "
-                            + column_range("V", action_min_row + 1, action_max_row)
+                            + column_range(
+                                action_columns["Reviewed By"],
+                                action_min_row + 1,
+                                action_max_row,
+                            )
                         ),
                         "Action Board owner and reviewer",
                     ),
                     (
-                        "Action Board",
+                        action_board.title,
                         f'"{",".join(REVIEW_DISPOSITION_CHOICES)}"',
                         False,
-                        column_range("U", action_min_row + 1, action_max_row),
+                        column_range(
+                            action_columns["Review Disposition"],
+                            action_min_row + 1,
+                            action_max_row,
+                        ),
                         "Action Board review disposition",
                     ),
                 ]
@@ -8261,10 +10489,12 @@ def expected_management_list_validations(
         else:
             expected.append(
                 (
-                    "Action Board",
+                    action_board.title,
                     f"={OWNER_ROSTER_DEFINED_NAME}",
                     True,
-                    column_range("E", action_min_row + 1, action_max_row),
+                    column_range(
+                        action_columns["Owner"], action_min_row + 1, action_max_row
+                    ),
                     "Action Board owner",
                 )
             )
@@ -8360,15 +10590,30 @@ def validate_management_workbook_controls(
                 f"Worksheet {ws.title!r} does not match the pre-approved protection "
                 f"contract: it must {expected} drawing objects and scenarios."
             )
-    setup = wb["Management Setup"]
+    setup = (
+        wb[MANAGEMENT_CENTER_SHEET]
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+        and "ManagementTargets" in wb[MANAGEMENT_CENTER_SHEET].tables
+        and OWNER_ROSTER_TABLE_NAME in wb[MANAGEMENT_CENTER_SHEET].tables
+        else wb["Management Setup"]
+    )
     if "ManagementTargets" not in setup.tables or OWNER_ROSTER_TABLE_NAME not in setup.tables:
-        raise IntegrityError("Management Setup is missing a required protected input table.")
+        raise IntegrityError("The management input surface is missing a required protected table.")
     if OWNER_ROSTER_DEFINED_NAME not in wb.defined_names:
         raise IntegrityError("The active-owner workbook name is missing.")
     owner_roster = owner_roster_from_sheet(setup)
-    action_board = wb["Action Board"]
+    action_board = (
+        wb[MANAGEMENT_CENTER_SHEET]
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+        else wb["Action Board"]
+    )
+    action_records = (
+        records_from_table(action_board, "ActionBoardTable")
+        if "ActionBoardTable" in action_board.tables
+        else records_from_sheet(action_board, "Action ID")
+    )
     validate_action_board_records(
-        records_from_sheet(action_board, "Action ID"),
+        action_records,
         allowed_reviewers=active_owner_names(owner_roster),
     )
     return setup, action_board
@@ -8418,6 +10663,7 @@ def require_current_workbook_usability_contract(
     *,
     previous_v2: bool = False,
     previous_tab_navigation: bool = False,
+    previous_simplification: bool = False,
     visible_sheets: Iterable[str] | None = None,
     navigation_links: tuple[tuple[str, str], ...] | None = None,
 ) -> None:
@@ -8453,8 +10699,13 @@ def require_current_workbook_usability_contract(
         for cell in guide._cells.values()
         if cell.value not in (None, "")
     }
+    required_headings = (
+        PRE_SIMPLIFICATION_HOW_TO_USE_SECTION_HEADINGS
+        if previous_simplification
+        else HOW_TO_USE_SECTION_HEADINGS
+    )
     missing_headings = [
-        heading for heading in HOW_TO_USE_SECTION_HEADINGS if heading not in guide_text
+        heading for heading in required_headings if heading not in guide_text
     ]
     if missing_headings:
         raise IntegrityError(
@@ -8534,7 +10785,7 @@ def verify_recorded_workbook_digest(
     expected_scheme: str | None = None,
     legacy_reference_path: Path | None = None,
 ) -> str:
-    """Verify v3 directly or use a manifest-pinned archive for v2 drift."""
+    """Verify v4 directly or bridge a manifest-pinned v2/v3 workbook once."""
 
     required_digest = str(expected_digest or stamped_digest or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", required_digest):
@@ -8544,7 +10795,11 @@ def verify_recorded_workbook_digest(
             "Master workbook stamped digest does not match the manifest-recorded digest."
         )
     scheme = expected_scheme or stamped_scheme or LEGACY_WORKBOOK_DIGEST_SCHEME
-    if expected_scheme and stamped_scheme and expected_scheme != stamped_scheme:
+    if (
+        expected_scheme is not None
+        and stamped_scheme is not None
+        and expected_scheme != stamped_scheme
+    ):
         raise IntegrityError(
             "Master workbook digest scheme does not match the manifest-recorded scheme."
         )
@@ -8558,8 +10813,53 @@ def verify_recorded_workbook_digest(
                 "No outputs were replaced and no active source files were moved."
             )
         return actual_digest
-    if scheme != LEGACY_WORKBOOK_DIGEST_SCHEME:
+    if scheme not in {
+        LEGACY_WORKBOOK_DIGEST_SCHEME,
+        PREVIOUS_WORKBOOK_DIGEST_SCHEME,
+    }:
         raise IntegrityError(f"Unsupported master workbook digest scheme: {scheme!r}.")
+
+    if scheme == PREVIOUS_WORKBOOK_DIGEST_SCHEME:
+        if legacy_reference_path is None:
+            raise IntegrityError(
+                "The prior v3 master workbook requires its manifest-pinned archived "
+                "reference before it can be upgraded to the v4 digest contract."
+            )
+        reference = load_workbook(
+            legacy_reference_path,
+            data_only=False,
+            read_only=False,
+        )
+        try:
+            reference_digest = stamped_workbook_digest(reference)
+            reference_scheme = stamped_workbook_digest_scheme(reference)
+        finally:
+            reference.close()
+        if (
+            reference_digest != required_digest
+            or reference_scheme != PREVIOUS_WORKBOOK_DIGEST_SCHEME
+        ):
+            raise IntegrityError(
+                "The manifest-pinned archived master does not match its prior v3 "
+                "digest contract."
+            )
+        actual_substantive = workbook_generated_content_sha256(path)
+        reference_substantive = workbook_generated_content_sha256(
+            legacy_reference_path
+        )
+        if actual_substantive != reference_substantive:
+            raise IntegrityError(
+                "Master workbook generated-content verification failed: the current "
+                "v4 substantive view differs from the manifest-pinned prior v3 "
+                "master. Restore the archived generated workbook before rerunning."
+            )
+        warnings.warn(
+            "The manifest-pinned prior v3 master matches under the v4 substantive "
+            "contract and will be regenerated on the next successful run.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return required_digest
 
     actual_legacy_digest = workbook_metadata_sha256(path)
     if actual_legacy_digest == required_digest:
@@ -8600,6 +10900,7 @@ def validate_management_workbook(
     legacy_reference_path: Path | None = None,
     previous_v2_usability: bool = False,
     previous_tab_navigation: bool = False,
+    previous_simplification: bool = False,
     visible_sheets: Iterable[str] | None = None,
     navigation_links: tuple[tuple[str, str], ...] | None = None,
 ) -> str:
@@ -8627,6 +10928,7 @@ def validate_management_workbook(
                 wb,
                 previous_v2=previous_v2_usability,
                 previous_tab_navigation=previous_tab_navigation,
+                previous_simplification=previous_simplification,
                 visible_sheets=visible_sheet_names,
                 navigation_links=navigation_links,
             )
@@ -8985,6 +11287,129 @@ def workbook_uses_pre_consolidation_layout(wb: Workbook) -> bool:
     return True
 
 
+def workbook_uses_pre_performance_layout(wb: Workbook) -> bool:
+    """Identify the manifest-bound v0.4 layout before descriptive analytics."""
+
+    if (
+        stamped_workbook_protection_contract(wb)
+        != WORKBOOK_PROTECTION_CONTRACT
+        or "How to Use" not in wb.sheetnames
+        or any(
+            name in wb.sheetnames
+            for name in (
+                "Performance Dashboard",
+                "Server Scorecards",
+                "Weekly Performance",
+                "Shared & Area Trends",
+                "Methodology",
+            )
+        )
+        or any(
+            name not in wb.sheetnames
+            for name in PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS
+        )
+    ):
+        return False
+    guide_text = "\n".join(
+        str(cell.value)
+        for cell in wb["How to Use"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    if (
+        MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+        or PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
+    ):
+        return False
+    for ws in (
+        wb[name] for name in PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS
+    ):
+        start_column, end_column = management_menu_bounds(ws)
+        if (
+            ws.sheet_state != "visible"
+            or ws.cell(row=2, column=start_column).value != MANAGEMENT_MENU_LABEL
+            or not workbook_hyperlink_matches(
+                ws.cell(row=2, column=start_column).hyperlink,
+                MANAGEMENT_MENU_TARGET,
+                sheet_name=ws.title,
+                coordinate=ws.cell(row=2, column=start_column).coordinate,
+            )
+            or str(
+                next(
+                    (
+                        merged
+                        for merged in ws.merged_cells.ranges
+                        if merged.min_row <= 2 <= merged.max_row
+                    ),
+                    "",
+                )
+            )
+            != (
+                f"{get_column_letter(start_column)}2:"
+                f"{get_column_letter(end_column)}2"
+            )
+        ):
+            return False
+    return True
+
+
+def workbook_uses_pre_simplification_layout(wb: Workbook) -> bool:
+    """Identify the manifest-bound analytics layout before legacy-tab culling."""
+
+    if (
+        stamped_workbook_protection_contract(wb)
+        != WORKBOOK_PROTECTION_CONTRACT
+        or "How to Use" not in wb.sheetnames
+        or any(
+            name not in wb.sheetnames
+            for name in PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS
+        )
+        or any(
+            wb[name].sheet_state != "visible"
+            for name in PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS
+        )
+    ):
+        return False
+    guide_text = "\n".join(
+        str(cell.value)
+        for cell in wb["How to Use"]._cells.values()
+        if cell.value not in (None, "")
+    )
+    if (
+        MANAGEMENT_METHODOLOGY_VERSION not in guide_text
+        or PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION in guide_text
+    ):
+        return False
+    for ws in (
+        wb[name] for name in PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS
+    ):
+        start_column, end_column = management_menu_bounds(ws)
+        if (
+            ws.cell(row=2, column=start_column).value != MANAGEMENT_MENU_LABEL
+            or not workbook_hyperlink_matches(
+                ws.cell(row=2, column=start_column).hyperlink,
+                MANAGEMENT_MENU_TARGET,
+                sheet_name=ws.title,
+                coordinate=ws.cell(row=2, column=start_column).coordinate,
+            )
+            or str(
+                next(
+                    (
+                        merged
+                        for merged in ws.merged_cells.ranges
+                        if merged.min_row <= 2 <= merged.max_row
+                    ),
+                    "",
+                )
+            )
+            != (
+                f"{get_column_letter(start_column)}2:"
+                f"{get_column_letter(end_column)}2"
+            )
+        ):
+            return False
+    return True
+
+
 def management_workbook_upgrade_pending(path: Path) -> bool:
     if pre_contract_management_workbook(path):
         return True
@@ -8994,6 +11419,8 @@ def management_workbook_upgrade_pending(path: Path) -> bool:
             workbook_uses_previous_v2_usability(wb)
             or workbook_uses_legacy_multi_link_navigation(wb)
             or workbook_uses_pre_consolidation_layout(wb)
+            or workbook_uses_pre_performance_layout(wb)
+            or workbook_uses_pre_simplification_layout(wb)
         )
     finally:
         wb.close()
@@ -9014,6 +11441,9 @@ def verify_existing_management_workbook_integrity(
     wb = load_workbook(path, data_only=False)
     try:
         is_new_schema = (
+            MANAGEMENT_CENTER_SHEET in wb.sheetnames
+            and OWNER_ROSTER_TABLE_NAME in wb[MANAGEMENT_CENTER_SHEET].tables
+        ) or (
             "Management Setup" in wb.sheetnames
             and OWNER_ROSTER_TABLE_NAME in wb["Management Setup"].tables
         )
@@ -9030,16 +11460,32 @@ def verify_existing_management_workbook_integrity(
         has_pre_consolidation_layout = workbook_uses_pre_consolidation_layout(
             wb
         )
-        action_headers = (
-            {
-                str(cell.value)
-                for cell in wb["Action Board"][4]
-                if cell.value is not None
-            }
-            if "Action Board" in wb.sheetnames
-            else set()
+        has_pre_performance_layout = workbook_uses_pre_performance_layout(wb)
+        has_pre_simplification_layout = workbook_uses_pre_simplification_layout(
+            wb
         )
-        has_v2_action_schema = {
+        if (
+            MANAGEMENT_CENTER_SHEET in wb.sheetnames
+            and "ActionBoardTable" in wb[MANAGEMENT_CENTER_SHEET].tables
+        ):
+            action_min_col, action_min_row, action_max_col, _ = range_boundaries(
+                wb[MANAGEMENT_CENTER_SHEET].tables["ActionBoardTable"].ref
+            )
+            action_headers = {
+                str(wb[MANAGEMENT_CENTER_SHEET].cell(action_min_row, column).value)
+                for column in range(action_min_col, action_max_col + 1)
+            }
+        else:
+            action_headers = (
+                {
+                    str(cell.value)
+                    for cell in wb["Action Board"][4]
+                    if cell.value is not None
+                }
+                if "Action Board" in wb.sheetnames
+                else set()
+            )
+        has_v2_action_schema = MANAGEMENT_CENTER_SHEET in wb.sheetnames or {
             "Context Notes",
             "Review Disposition",
             "Evidence Status",
@@ -9049,6 +11495,49 @@ def verify_existing_management_workbook_integrity(
     if protection_contract == WORKBOOK_PROTECTION_CONTRACT:
         if has_v2_action_schema:
             if has_how_to_use_schema:
+                if has_pre_simplification_layout:
+                    if (
+                        not allow_legacy_protection_upgrade
+                        or expected_digest is None
+                    ):
+                        raise IntegrityError(
+                            "The existing master workbook predates the current simplified "
+                            "operator tab layout. It may be upgraded only when its exact "
+                            "digest is pinned by the verified integrity manifest."
+                        )
+                    return validate_management_workbook(
+                        path,
+                        expected_digest,
+                        expected_digest_scheme=expected_digest_scheme,
+                        legacy_reference_path=legacy_reference_path,
+                        previous_simplification=True,
+                        visible_sheets=(
+                            PRE_SIMPLIFICATION_VISIBLE_MANAGEMENT_SHEETS
+                        ),
+                        navigation_links=(
+                            PRE_SIMPLIFICATION_NAVIGATION_LINKS
+                        ),
+                    )
+                if has_pre_performance_layout:
+                    if (
+                        not allow_legacy_protection_upgrade
+                        or expected_digest is None
+                    ):
+                        raise IntegrityError(
+                            "The existing master workbook predates the current "
+                            "performance, shared-number, and area-trend layout. It may be "
+                            "upgraded only when its exact digest is pinned by the verified "
+                            "integrity manifest."
+                        )
+                    return validate_management_workbook(
+                        path,
+                        expected_digest,
+                        expected_digest_scheme=expected_digest_scheme,
+                        legacy_reference_path=legacy_reference_path,
+                        previous_simplification=True,
+                        visible_sheets=PRE_PERFORMANCE_VISIBLE_MANAGEMENT_SHEETS,
+                        navigation_links=PRE_PERFORMANCE_NAVIGATION_LINKS,
+                    )
                 if has_pre_consolidation_layout:
                     if (
                         not allow_legacy_protection_upgrade
@@ -9065,6 +11554,7 @@ def verify_existing_management_workbook_integrity(
                         expected_digest,
                         expected_digest_scheme=expected_digest_scheme,
                         legacy_reference_path=legacy_reference_path,
+                        previous_simplification=True,
                         visible_sheets=(
                             PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
                         ),
@@ -9088,6 +11578,7 @@ def verify_existing_management_workbook_integrity(
                         expected_digest_scheme=expected_digest_scheme,
                         legacy_reference_path=legacy_reference_path,
                         previous_v2_usability=True,
+                        previous_simplification=True,
                         visible_sheets=(
                             PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
                         ),
@@ -9111,6 +11602,7 @@ def verify_existing_management_workbook_integrity(
                         expected_digest_scheme=expected_digest_scheme,
                         legacy_reference_path=legacy_reference_path,
                         previous_tab_navigation=True,
+                        previous_simplification=True,
                         visible_sheets=(
                             PRE_CONSOLIDATION_VISIBLE_MANAGEMENT_SHEETS
                         ),
@@ -9241,6 +11733,20 @@ def stable_reason_code(signal: dict[str, Any]) -> str:
     return stable_action_code(signal.get("Signal"))
 
 
+def default_management_comparator_type(signal: dict[str, Any]) -> str:
+    """Return a truthful comparator when older evidence omitted the field."""
+
+    entity_key = str(signal.get("Entity Key") or "").strip().casefold()
+    action = str(signal.get("Action") or "").strip().casefold()
+    if entity_key.startswith("server|"):
+        return "Same-store prior-four-week median"
+    if entity_key.startswith(("store|", "group|")):
+        return "Store/group rolling baseline"
+    if entity_key.startswith("data-quality|") or action == "data quality":
+        return "Not applicable"
+    return "Not applicable"
+
+
 def enrich_management_signal(signal: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(signal)
     week_ends = sorted(
@@ -9283,9 +11789,8 @@ def enrich_management_signal(signal: dict[str, Any]) -> dict[str, Any]:
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            "Comparator Type": enriched.get(
-                "Comparator Type", "Same-store prior-four-week median"
-            ),
+            "Comparator Type": enriched.get("Comparator Type")
+            or default_management_comparator_type(enriched),
             "Peer Cohort Size": enriched.get("Peer Cohort Size", 0),
             "Peer Cohort Weeks": enriched.get("Peer Cohort Weeks", 0),
             "Threshold Version": enriched.get(
@@ -9308,6 +11813,7 @@ CONTEXT_ONLY_EVIDENCE_KEYS = frozenset(
         *SERVER_CONTEXT_FIELDS,
         "check_count",
         "check_count_available",
+        "per_check_available",
         "sales_per_check",
         "guests_per_check",
         "rate_available",
@@ -9348,6 +11854,22 @@ def review_reset_fingerprint(action: dict[str, Any]) -> str:
         metric_evidence = raw_metric_evidence
     else:
         metric_evidence = {}
+    raw_sources = action.get("Evidence Sources", action.get("_source_evidence", []))
+    if isinstance(raw_sources, str):
+        try:
+            parsed_sources = json.loads(raw_sources)
+        except json.JSONDecodeError:
+            parsed_sources = [{"unparsed_evidence_sources": raw_sources}]
+    else:
+        parsed_sources = raw_sources
+    if not isinstance(parsed_sources, list):
+        parsed_sources = [{"invalid_evidence_sources": parsed_sources}]
+    evidence_sources = sorted(
+        parsed_sources,
+        key=lambda item: json.dumps(
+            item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ),
+    )
     last_seen = action.get("Last Seen")
     if isinstance(last_seen, (date, datetime)):
         last_seen = last_seen.isoformat()
@@ -9359,6 +11881,7 @@ def review_reset_fingerprint(action: dict[str, Any]) -> str:
         "reason_code": action.get("Reason Code") or stable_reason_code(action),
         "evidence_week_ends": action.get("Evidence Week Ends")
         or action.get("_evidence_week_ends", []),
+        "evidence_sources": evidence_sources,
         "metric_evidence": decision_only_evidence(metric_evidence),
         "comparator_type": action.get("Comparator Type"),
         "peer_cohort_size": action.get("Peer Cohort Size"),
@@ -9585,6 +12108,7 @@ def build_management_action_signals(
                             for field in (
                                 "check_count",
                                 "check_count_available",
+                                "per_check_available",
                                 "sales_per_check",
                                 "guests_per_check",
                                 *SERVER_CONTEXT_FIELDS,
@@ -9985,6 +12509,19 @@ def remove_sheet_if_present(wb: Workbook, name: str) -> None:
         wb.remove(wb[name])
 
 
+def worksheet_column_is_hidden(ws: Any, column: int) -> bool:
+    """Return effective hidden state without materializing split column records."""
+
+    hidden = False
+    for index, dimension in ws.column_dimensions.items():
+        default_index = column_index_from_string(str(index))
+        start = dimension.min or default_index
+        end = dimension.max or start
+        if start <= column <= end:
+            hidden = dimension.hidden is True
+    return hidden
+
+
 def management_navigation_columns(
     ws,
     navigation_links: tuple[tuple[str, str], ...] | None = None,
@@ -9999,8 +12536,7 @@ def management_navigation_columns(
     columns: list[int] = []
     column = 1
     while len(columns) < len(links):
-        letter = get_column_letter(column)
-        if ws.column_dimensions[letter].hidden is not True:
+        if not worksheet_column_is_hidden(ws, column):
             columns.append(column)
         column += 1
         if column > 256:
@@ -10016,8 +12552,7 @@ def management_menu_bounds(ws) -> tuple[int, int]:
     columns: list[int] = []
     column = 1
     while len(columns) < MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT:
-        letter = get_column_letter(column)
-        if ws.column_dimensions[letter].hidden is not True:
+        if not worksheet_column_is_hidden(ws, column):
             columns.append(column)
         column += 1
         if column > 256:
@@ -10082,7 +12617,7 @@ def require_legacy_tab_navigation_contract(
                 "navigation labels."
             )
         if any(
-            ws.column_dimensions[get_column_letter(column)].hidden is True
+            worksheet_column_is_hidden(ws, column)
             for column in navigation_columns
         ):
             raise IntegrityError(
@@ -10219,8 +12754,8 @@ def require_management_menu_contract(
                 f"Worksheet {ws.title!r} does not use the approved workbook-menu merge."
             )
         if (
-            ws.column_dimensions[get_column_letter(start_column)].hidden is True
-            or ws.column_dimensions[get_column_letter(end_column)].hidden is True
+            worksheet_column_is_hidden(ws, start_column)
+            or worksheet_column_is_hidden(ws, end_column)
         ):
             raise IntegrityError(
                 f"Worksheet {ws.title!r} workbook menu must start and end visibly."
@@ -10313,7 +12848,7 @@ def add_management_navigation(ws) -> None:
 def configure_management_print_layout(ws) -> None:
     """Use a readable, sheet-specific printable width."""
 
-    last_column = max(ws.max_column, len(MANAGEMENT_NAVIGATION_LINKS))
+    last_column = max(ws.max_column, MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT)
     last_row = max(ws.max_row, 2)
     if not ws.print_area:
         ws.print_area = (
@@ -10324,10 +12859,14 @@ def configure_management_print_layout(ws) -> None:
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = MANAGEMENT_PRINT_WIDTHS.get(ws.title, 1)
-    if ws.title == "Data Quality":
-        # The compact quality summary retains wide source-provenance columns
-        # below its print area. Tabloid landscape keeps the complete navigation
-        # and summary legible without splitting them across horizontal pages.
+    if ws.title in {
+        "Data Quality",
+        "Server Scorecards",
+        "Weekly Performance",
+        "Shared & Area Trends",
+    }:
+        # Wide analytical tables are more useful when each row stays intact.
+        # Tabloid landscape keeps the complete view legible on one page wide.
         ws.page_setup.paperSize = ws.PAPERSIZE_TABLOID
     if ws.page_setup.fitToHeight is None:
         ws.page_setup.fitToHeight = 0
@@ -10336,7 +12875,7 @@ def configure_management_print_layout(ws) -> None:
 
 def style_management_title(ws, title: str, end_col: int) -> None:
     ws.sheet_view.showGridLines = False
-    end_col = max(end_col, 12, len(MANAGEMENT_NAVIGATION_LINKS))
+    end_col = max(end_col, MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
     cell = ws.cell(
         row=1,
@@ -10347,6 +12886,1222 @@ def style_management_title(ws, title: str, end_col: int) -> None:
     cell.font = Font(color="FFFFFF", bold=True, size=16)
     cell.alignment = Alignment(vertical="center")
     ws.row_dimensions[1].height = 32
+
+
+def style_performance_consistency_value(cell: Any, label: str) -> None:
+    fill_color, font_color = PERFORMANCE_CONSISTENCY_COLORS.get(
+        label, ("FFFFFF", "262626")
+    )
+    cell.fill = PatternFill("solid", fgColor=fill_color)
+    cell.font = Font(color=font_color, bold=True)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def write_performance_consistency_calc_sheet(
+    wb: Workbook, model: dict[str, Any]
+) -> None:
+    remove_sheet_if_present(wb, "_Consistency Calc")
+    ws = wb.create_sheet("_Consistency Calc")
+    style_management_title(ws, "Performance & Consistency Calculation Layer", 21)
+    headers = [
+        "Week End",
+        "Location",
+        "Server",
+        "Gross Sales",
+        "Guests",
+        "Sales / Guest",
+        "Wine Sales",
+        "Wine %",
+        "Active Days",
+        "Base Sample",
+        "Qualified Peers",
+        "Peer Sales / Guest",
+        "Peer Wine %",
+        "Sales / Guest Gap",
+        "Wine % Gap",
+        "Guest Weight",
+        "Qualified Gross Sales",
+        "Qualified Guests",
+        "Qualified Wine Sales",
+        "Period",
+        "Weekly Band",
+    ]
+    for column, header in enumerate(headers, start=1):
+        cell = ws.cell(row=3, column=column, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_index, item in enumerate(model["detail_rows"], start=4):
+        values = [
+            item["week_end"],
+            excel_safe_text(item["location"]),
+            excel_safe_text(item["display_name"]),
+            item["gross_sales"],
+            item["guest_count"],
+            item["check_average"],
+            item["wine_sales"],
+            item["wine_pct"],
+            item["active_days"],
+            "Qualified" if item["base_sample"] else "Limited",
+            item["distinct_peer_count"],
+            item["peer_spg"],
+            item["peer_wine_pct"],
+            item["spg_gap"],
+            item["wine_gap"],
+            item["guest_weight"] if item["qualified"] else None,
+            item["qualified_gross_sales"],
+            item["qualified_guests"],
+            item["qualified_wine_sales"],
+            item["period"],
+            item["weekly_band"],
+        ]
+        for column, value in enumerate(values, start=1):
+            ws.cell(row=row_index, column=column, value=value)
+        ws.cell(row=row_index, column=1).number_format = "mm/dd/yyyy"
+        for column in (4, 6, 7, 12, 14, 17, 19):
+            ws.cell(row=row_index, column=column).number_format = "$#,##0.00"
+        for column in (8, 13, 15):
+            ws.cell(row=row_index, column=column).number_format = "0.0%"
+        for column in range(1, len(headers) + 1):
+            ws.cell(row=row_index, column=column).alignment = Alignment(
+                vertical="center", wrap_text=column in {2, 3, 9, 20, 21}
+            )
+
+    store_rows = model["store_consistency"]
+    for column, header in enumerate(
+        ("Location", "High", "Moderate", "Low", "Insufficient"), start=23
+    ):
+        cell = ws.cell(row=1, column=column, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+    for row_index, item in enumerate(store_rows, start=2):
+        ws.cell(row=row_index, column=23, value=excel_safe_text(item["location"]))
+        for column, label in enumerate(
+            ("High", "Moderate", "Low", "Insufficient"), start=24
+        ):
+            ws.cell(row=row_index, column=column, value=item[label])
+    widths = {
+        "A": 15,
+        "B": 24,
+        "C": 24,
+        "D": 15,
+        "E": 11,
+        "F": 15,
+        "G": 15,
+        "H": 12,
+        "I": 12,
+        "J": 15,
+        "K": 15,
+        "L": 17,
+        "M": 14,
+        "N": 18,
+        "O": 14,
+        "P": 13,
+        "Q": 20,
+        "R": 16,
+        "S": 19,
+        "T": 12,
+        "U": 15,
+        "W": 24,
+        "X": 12,
+        "Y": 12,
+        "Z": 12,
+        "AA": 14,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = "A4"
+    ws.sheet_view.topLeftCell = "A1"
+
+
+def write_server_scorecards_sheet(
+    wb: Workbook, model: dict[str, Any], config: dict[str, Any]
+) -> None:
+    remove_sheet_if_present(wb, "Server Scorecards")
+    ws = wb.create_sheet("Server Scorecards")
+    style_management_title(ws, "Server Performance & Consistency Scorecards", 16)
+    latest = model["latest_complete_week_end"]
+    subtitle = (
+        f"Validated snapshot of up to eight complete weeks through {latest:%m/%d/%Y} | "
+        "performance and consistency are deliberately shown as separate dimensions"
+        if latest
+        else "No complete shared week is available for performance and consistency review."
+    )
+    ws.merge_cells("A3:P3")
+    ws["A3"] = subtitle
+    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
+    ws["A3"].font = Font(color="5C5C5C", size=11)
+    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.merge_cells("A4:P4")
+    ws["A4"] = (
+        "SPG means Sales / Guest. Performance uses capped guest-weighted average peer gaps; "
+        "higher positive gaps are stronger. Consistency uses sample SD of weekly peer gaps; "
+        "lower SD is steadier. These are selling-outcome review aids, not total job performance."
+    )
+    ws["A4"].fill = PatternFill("solid", fgColor="E8F0FA")
+    ws["A4"].font = Font(color="3E6FA8", size=11)
+    ws["A4"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[3].height = 28
+    ws.row_dimensions[4].height = 42
+
+    for start_col, end_col, label, fill, font in (
+        (1, 6, "IDENTITY, CLASSIFICATION & CONFIDENCE", "E9E9E9", "641318"),
+        (7, 10, "PERFORMANCE | average peer gap up | higher = stronger", "E8F3E8", "1F5B23"),
+        (11, 12, "CONSISTENCY | sample SD down | steadier", "E8F0FA", "3E6FA8"),
+        (13, 16, "SAMPLE & RECENT FOUR-WEEK MOVEMENT", "E9E9E9", "5C5C5C"),
+    ):
+        ws.merge_cells(start_row=5, start_column=start_col, end_row=5, end_column=end_col)
+        cell = ws.cell(row=5, column=start_col, value=label)
+        cell.fill = PatternFill("solid", fgColor=fill)
+        cell.font = Font(color=font, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    headers = [
+        "Location",
+        "Server",
+        "Overall Read",
+        "Performance Level",
+        "Consistency",
+        "Confidence",
+        "8W Sales / Guest",
+        "Avg SPG Gap vs Peer",
+        "8W Wine %",
+        "Avg Wine Gap vs Peer",
+        "Weekly SPG Gap SD",
+        "Weekly Wine Gap SD",
+        "Qualified Weeks",
+        "Qualified Guests",
+        "Recent SPG Delta",
+        "Recent Wine Delta",
+    ]
+    for column, header in enumerate(headers, start=1):
+        cell = ws.cell(row=6, column=column, value=header)
+        cell.fill = PatternFill("solid", fgColor="8B1E23")
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[5].height = 28
+    ws.row_dimensions[6].height = 42
+
+    rows = model["summary_rows"]
+    for row_index, item in enumerate(rows, start=7):
+        values = [
+            excel_safe_text(item["location"]),
+            excel_safe_text(item["display_name"]),
+            item["overall_read"],
+            item["performance_level"],
+            item["consistency"],
+            item["confidence"],
+            item["eight_week_spg"],
+            item["average_spg_gap"],
+            item["eight_week_wine_pct"],
+            item["average_wine_gap"],
+            item["weekly_spg_gap_sd"],
+            item["weekly_wine_gap_sd"],
+            item["qualified_weeks"],
+            item["qualified_guests"],
+            item["recent_spg_delta"],
+            item["recent_wine_delta"],
+        ]
+        for column, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_index, column=column, value=value)
+            cell.alignment = Alignment(vertical="center", wrap_text=column <= 6)
+        style_performance_consistency_value(
+            ws.cell(row=row_index, column=3), str(item["overall_read"])
+        )
+        style_performance_consistency_value(
+            ws.cell(row=row_index, column=5), str(item["consistency"])
+        )
+        style_performance_consistency_value(
+            ws.cell(row=row_index, column=6), str(item["confidence"])
+        )
+        for column in (8, 10):
+            value = ws.cell(row=row_index, column=column).value
+            if value is not None:
+                ws.cell(row=row_index, column=column).font = Font(
+                    color="1F5B23" if float(value) >= 0 else "8B1E23"
+                )
+        for column, threshold in (
+            (15, PERFORMANCE_CONSISTENCY_RECENT_SPG_THRESHOLD),
+            (16, PERFORMANCE_CONSISTENCY_RECENT_WINE_THRESHOLD),
+        ):
+            value = ws.cell(row=row_index, column=column).value
+            if value is not None and abs(float(value)) >= threshold:
+                fill, font = (
+                    ("E8F3E8", "1F5B23")
+                    if float(value) > 0
+                    else ("F8E8E9", "8B1E23")
+                )
+                ws.cell(row=row_index, column=column).fill = PatternFill(
+                    "solid", fgColor=fill
+                )
+                ws.cell(row=row_index, column=column).font = Font(
+                    color=font, bold=True
+                )
+        ws.cell(row=row_index, column=7).number_format = "$0.00"
+        ws.cell(row=row_index, column=8).number_format = "+$0.00;-$0.00;$0.00"
+        ws.cell(row=row_index, column=9).number_format = "0.0%"
+        ws.cell(row=row_index, column=10).number_format = "+0.0%;-0.0%;0.0%"
+        ws.cell(row=row_index, column=11).number_format = "$0.00"
+        ws.cell(row=row_index, column=12).number_format = "0.0%"
+        ws.cell(row=row_index, column=13).number_format = "0"
+        ws.cell(row=row_index, column=14).number_format = "#,##0"
+        ws.cell(row=row_index, column=15).number_format = "+$0.00;-$0.00;$0.00"
+        ws.cell(row=row_index, column=16).number_format = "+0.0%;-0.0%;0.0%"
+
+    if rows:
+        table = Table(displayName="ServerScorecardsTable", ref=f"A6:P{6 + len(rows)}")
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+    widths = {
+        "A": 22,
+        "B": 24,
+        "C": 25,
+        "D": 19,
+        "E": 15,
+        "F": 14,
+        "G": 17,
+        "H": 18,
+        "I": 13,
+        "J": 18,
+        "K": 18,
+        "L": 18,
+        "M": 15,
+        "N": 16,
+        "O": 16,
+        "P": 16,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = "G7"
+    ws.print_title_cols = "A:B"
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_view.topLeftCell = "A1"
+    ws.sheet_view.zoomScale = 75
+
+
+def write_weekly_performance_sheet(wb: Workbook, model: dict[str, Any]) -> None:
+    remove_sheet_if_present(wb, "Weekly Performance")
+    week_ends = list(model["week_ends"])
+    end_column = 5 + len(week_ends) + 2
+    end_letter = get_column_letter(max(end_column, MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT))
+    ws = wb.create_sheet("Weekly Performance")
+    style_management_title(ws, "Weekly Performance Pattern", end_column)
+    ws.merge_cells(f"A3:{end_letter}3")
+    ws["A3"] = (
+        "Repeated colors show consistency; alternating colors show variability. Gray weeks "
+        "did not meet the person sample or same-store peer gate. A dash means no row exists."
+    )
+    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
+    ws["A3"].font = Font(color="5C5C5C", size=11)
+    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
+    for column, label in enumerate(
+        ("Strong", "Near Peer", "Mixed", "Below", "Not Qualified"), start=1
+    ):
+        cell = ws.cell(row=4, column=column, value=label)
+        style_performance_consistency_value(cell, label)
+    if max(end_column, MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT) >= 6:
+        ws.merge_cells(start_row=4, start_column=6, end_row=4, end_column=max(end_column, 12))
+        ws.cell(row=4, column=6, value="Read dated weeks left to right: oldest to newest")
+        ws.cell(row=4, column=6).fill = PatternFill("solid", fgColor="F5F5F5")
+        ws.cell(row=4, column=6).font = Font(color="5C5C5C")
+        ws.cell(row=4, column=6).alignment = Alignment(vertical="center")
+    headers = [
+        "Location",
+        "Server",
+        "Overall Read",
+        "Consistency",
+        "Confidence",
+        *[week_end.strftime("%m/%d/%Y") for week_end in week_ends],
+        "Qualified Weeks",
+        "Guests",
+    ]
+    for column, header in enumerate(headers, start=1):
+        cell = ws.cell(row=6, column=column, value=header)
+        cell.fill = PatternFill("solid", fgColor="8B1E23")
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[3].height = 34
+    ws.row_dimensions[4].height = 26
+    ws.row_dimensions[6].height = 38
+    rows = model["summary_rows"]
+    for row_index, item in enumerate(rows, start=7):
+        values = [
+            excel_safe_text(item["location"]),
+            excel_safe_text(item["display_name"]),
+            item["overall_read"],
+            item["consistency"],
+            item["confidence"],
+            *[item["weekly_bands"].get(week_end, "—") for week_end in week_ends],
+            item["qualified_weeks"],
+            item["qualified_guests"],
+        ]
+        for column, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_index, column=column, value=value)
+            cell.alignment = Alignment(
+                horizontal="center" if column >= 3 else None,
+                vertical="center",
+                wrap_text=column <= 5,
+            )
+        for column in range(6, 6 + len(week_ends)):
+            style_performance_consistency_value(
+                ws.cell(row=row_index, column=column),
+                str(ws.cell(row=row_index, column=column).value),
+            )
+        ws.cell(row=row_index, column=end_column).number_format = "#,##0"
+    if rows:
+        table = Table(
+            displayName="WeeklyPerformanceTable",
+            ref=f"A6:{get_column_letter(end_column)}{6 + len(rows)}",
+        )
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+    widths = {"A": 22, "B": 24, "C": 25, "D": 16, "E": 14}
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    for column in range(6, 6 + len(week_ends)):
+        ws.column_dimensions[get_column_letter(column)].width = 14
+    ws.column_dimensions[get_column_letter(end_column - 1)].width = 16
+    ws.column_dimensions[get_column_letter(end_column)].width = 12
+    ws.freeze_panes = "F7"
+    ws.print_title_cols = "A:B"
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_view.topLeftCell = "A1"
+    ws.sheet_view.zoomScale = 75
+
+
+def write_performance_methodology_sheet(
+    wb: Workbook, model: dict[str, Any], config: dict[str, Any]
+) -> None:
+    remove_sheet_if_present(wb, "Methodology")
+    ws = wb.create_sheet("Methodology")
+    style_management_title(ws, "How Performance & Consistency Are Measured", 12)
+    latest = model["latest_complete_week_end"]
+    ws.merge_cells("A3:L3")
+    ws["A3"] = (
+        f"Methodology {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION} | up to eight complete "
+        f"weeks through {latest:%m/%d/%Y}: same-store peer comparison and week-to-week variation."
+        if latest
+        else f"Methodology {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION} | no complete shared week is available."
+    )
+    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
+    ws["A3"].font = Font(color="5C5C5C", size=11)
+    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
+
+    for column, label in enumerate(("Overall Read", "Meaning", "Management Use"), start=1):
+        cell = ws.cell(row=5, column=column, value=label)
+        cell.fill = PatternFill("solid", fgColor="8B1E23")
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.merge_cells("E5:H5")
+    ws["E5"] = "MODEL NOTES"
+    ws["E5"].fill = PatternFill("solid", fgColor="8B1E23")
+    ws["E5"].font = Font(color="FFFFFF", bold=True)
+    ws["E5"].alignment = Alignment(horizontal="center", vertical="center")
+    interpretation_rows = (
+        ("Consistently Strong", "Above the performance band with low volatility", "Recognize and identify repeatable practices"),
+        ("Consistent / Near Peer", "Near peer norms with low volatility", "Reliable pattern; monitor normal movement"),
+        ("Strong / Variable", "Strong average result with uneven weeks", "Diagnose what changes by shift or assignment"),
+        ("Mixed / Monitor", "Near peer norms with moderate volatility", "Watch for a clearer pattern"),
+        ("Inconsistent", "Low week-to-week consistency", "Review context before coaching the process"),
+        ("Below / Variable or Consistently Below", "Below the peer band; variability is shown separately", "Validate context before any action"),
+        ("Insufficient Data", "Too few qualified weeks or guests", "Do not draw a conclusion"),
+    )
+    for row_index, values in enumerate(interpretation_rows, start=6):
+        for column, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_index, column=column, value=value)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.cell(row=row_index, column=1).font = Font(bold=True, color="641318")
+        # The Meaning column wraps to three lines for several classifications.
+        # Keep enough vertical room in both Excel and the two-page print layout.
+        ws.row_dimensions[row_index].height = 50
+    ws.merge_cells("E6:H12")
+    ws["E6"] = (
+        "• SPG means Sales / Guest (Gross Sales divided by Guest Count). SPG and Wine % are "
+        "the only person-level outcome metrics in this descriptive layer.\n"
+        "• Each qualified current-roster server-week is compared with other qualified current-roster "
+        "servers in the same store and week.\n"
+        "• Consistency is the sample standard deviation of weekly peer gaps.\n"
+        "• Gross sales, Rate of Sale, Ticket Time, and existing Management Center Current Actions signals do not change "
+        "these labels.\n"
+        "• Schedule, section, party mix, events, tenure, and staffing can explain outcomes. Use this "
+        "as a review aid, never as a standalone employment decision."
+    )
+    ws["E6"].fill = PatternFill("solid", fgColor="E8F0FA")
+    ws["E6"].font = Font(color="262626")
+    ws["E6"].alignment = Alignment(wrap_text=True, vertical="top")
+
+    ws.merge_cells("A14:L14")
+    ws["A14"] = "CALCULATION FLOW"
+    ws["A14"].fill = PatternFill("solid", fgColor="E9E9E9")
+    ws["A14"].font = Font(color="641318", bold=True)
+    flow_rows = (
+        ("1", "Qualify the week", "Minimum guests and active days", "4", "Measure consistency", "Sample SD of weekly peer gaps"),
+        ("2", "Build the peer reference", "Median of other qualified current-roster servers", "5", "Set confidence", "Qualified weeks and guests"),
+        ("3", "Measure performance", "Capped guest-weighted average peer gaps", "6", "Combine the two axes", "Overall Read shown on the dashboard"),
+    )
+    for row_index, values in enumerate(flow_rows, start=15):
+        positions = (1, 2, 3, 5, 6, 7)
+        for column, value in zip(positions, values, strict=True):
+            ws.cell(row=row_index, column=column, value=value)
+            ws.cell(row=row_index, column=column).alignment = Alignment(
+                wrap_text=True, vertical="center"
+            )
+        ws.merge_cells(start_row=row_index, start_column=7, end_row=row_index, end_column=8)
+        for column in (1, 5):
+            ws.cell(row=row_index, column=column).fill = PatternFill(
+                "solid", fgColor="F8E8E9"
+            )
+            ws.cell(row=row_index, column=column).font = Font(
+                color="641318", bold=True
+            )
+            ws.cell(row=row_index, column=column).alignment = Alignment(
+                horizontal="center", vertical="center"
+            )
+        ws.row_dimensions[row_index].height = 34
+
+    ws["A19"] = "Current source"
+    ws["B19"] = "Weekly Server Metrics"
+    ws["C19"] = f"{model['complete_week_count']} complete shared weeks; latest eight used"
+    ws["E19"] = "Model version"
+    ws["F19"] = PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION
+    ws.merge_cells("F19:H19")
+    for column in (1, 5):
+        ws.cell(row=19, column=column).font = Font(bold=True, color="641318")
+    for column in range(1, 9):
+        ws.cell(row=19, column=column).alignment = Alignment(wrap_text=True, vertical="center")
+
+    for column, label in enumerate(("Setting", "Value", "Decision Rule / Purpose"), start=1):
+        cell = ws.cell(row=21, column=column, value=label)
+        cell.fill = PatternFill("solid", fgColor="8B1E23")
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.merge_cells("E21:H21")
+    ws["E21"] = "WHY THE SAME THRESHOLD APPEARS TWICE"
+    ws["E21"].fill = PatternFill("solid", fgColor="8B1E23")
+    ws["E21"].font = Font(color="FFFFFF", bold=True)
+    ws["E21"].alignment = Alignment(horizontal="center", vertical="center")
+
+    spg_threshold = management_threshold(config, "check_average")
+    wine_threshold = management_threshold(config, "wine_pct")
+    min_peers = int(
+        config.get("management_peer_reference", {}).get(
+            "min_distinct_peers_per_week",
+            DEFAULT_CONFIG["management_peer_reference"]["min_distinct_peers_per_week"],
+        )
+    )
+    settings = (
+        ("Latest complete week", latest, "Source-driven end date"),
+        ("Analysis window (weeks)", PERFORMANCE_CONSISTENCY_WINDOW_WEEKS, "Rolling complete-week view"),
+        ("Minimum guests in a week", int(config.get("dashboard_min_guest_count_for_trends", 25)), "Base sample gate"),
+        ("Minimum active days in a week", int(config.get("dashboard_min_active_days_for_trends", 3)), "Base sample gate"),
+        ("Minimum qualified peers", min_peers, "Same store/week, excluding the server"),
+        ("Weekly guest-weight cap", PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP, "Prevents one large week from dominating"),
+        ("High confidence: qualified weeks", PERFORMANCE_CONSISTENCY_HIGH_MIN_WEEKS, "High-confidence gate"),
+        ("High confidence: qualified guests", PERFORMANCE_CONSISTENCY_HIGH_MIN_GUESTS, "High-confidence gate"),
+        ("Provisional: qualified weeks", PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_WEEKS, "Provisional gate"),
+        ("Provisional: qualified guests", PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_GUESTS, "Provisional gate"),
+        ("High consistency maximum: weekly SPG gap SD", float(spg_threshold["neutral"]), "Lower is steadier; both SD gates must pass"),
+        ("High consistency maximum: weekly Wine gap SD", float(wine_threshold["neutral"]), "Lower is steadier; both SD gates must pass"),
+        ("Moderate consistency maximum: weekly SPG gap SD", float(spg_threshold["strong"]), "Applies only after the High gate is missed"),
+        ("Moderate consistency maximum: weekly Wine gap SD", float(wine_threshold["strong"]), "Applies only after the High gate is missed"),
+        ("Performance boundary (+/-): average SPG gap", float(spg_threshold["neutral"]), "Positive can support Strong; negative can support Below"),
+        ("Performance boundary (+/-): average Wine gap", float(wine_threshold["neutral"]), "Positive can support Strong; negative can support Below"),
+        ("Recent movement display threshold: SPG", PERFORMANCE_CONSISTENCY_RECENT_SPG_THRESHOLD, "Highlights material recent-four minus prior-four movement"),
+        ("Recent movement display threshold: Wine", PERFORMANCE_CONSISTENCY_RECENT_WINE_THRESHOLD, "Highlights material recent-four minus prior-four movement"),
+    )
+    for row_index, values in enumerate(settings, start=22):
+        for column, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_index, column=column, value=value)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row_index].height = 30
+    ws["B22"].number_format = "mm/dd/yyyy"
+    for row_index in (32, 34, 36, 38):
+        ws.cell(row=row_index, column=2).number_format = "$0.00"
+    for row_index in (33, 35, 37, 39):
+        ws.cell(row=row_index, column=2).number_format = "0.0%"
+
+    example = next(
+        (
+            row
+            for row in model["summary_rows"]
+            if row["average_spg_gap"] is not None
+            and row["weekly_spg_gap_sd"] is not None
+        ),
+        None,
+    )
+    ws.merge_cells("E22:F22")
+    ws.merge_cells("G22:H22")
+    for coordinate, label, fill, font in (
+        ("E22", "PERFORMANCE", "2E7D32", "FFFFFF"),
+        ("G22", "CONSISTENCY", "3E6FA8", "FFFFFF"),
+    ):
+        ws[coordinate] = label
+        ws[coordinate].fill = PatternFill("solid", fgColor=fill)
+        ws[coordinate].font = Font(color=font, bold=True)
+        ws[coordinate].alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells("E23:F25")
+    ws.merge_cells("G23:H25")
+    if example:
+        ws["E23"] = (
+            "Average SPG gap vs peer\nHigher positive = stronger\n\n"
+            f"{excel_safe_text(example['display_name'])}: {example['average_spg_gap']:+.2f} vs "
+            f"+{float(spg_threshold['neutral']):.2f} minimum\nResult: {example['performance_level']}"
+        )
+        ws["G23"] = (
+            "Weekly SPG gap sample SD\nLower = steadier\n\n"
+            f"{excel_safe_text(example['display_name'])}: {example['weekly_spg_gap_sd']:.2f} vs "
+            f"{float(spg_threshold['neutral']):.2f} maximum\nResult: {example['consistency']} consistency"
+        )
+    else:
+        ws["E23"] = "Average peer gap measures performance; higher positive is stronger."
+        ws["G23"] = "Sample SD of weekly peer gaps measures consistency; lower is steadier."
+    for coordinate, fill, font in (
+        ("E23", "E8F3E8", "1F5B23"),
+        ("G23", "E8F0FA", "3E6FA8"),
+    ):
+        ws[coordinate].fill = PatternFill("solid", fgColor=fill)
+        ws[coordinate].font = Font(color=font)
+        ws[coordinate].alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+    ws.merge_cells("E26:H31")
+    ws["E26"] = (
+        "Same number, opposite decision rule.\n\n"
+        "Performance: a capped guest-weighted average peer gap must meet a positive or "
+        "negative boundary, with the other metric on the same side of zero.\n\n"
+        "Consistency: BOTH weekly-gap sample SDs must be at or below their maximums.\n\n"
+        "Never compare an average peer gap directly with an SD result."
+    )
+    ws["E26"].fill = PatternFill("solid", fgColor="FFF4CC")
+    ws["E26"].alignment = Alignment(wrap_text=True, vertical="center")
+
+    ws.merge_cells("A41:L41")
+    ws["A41"] = (
+        "Protected generated view: values are recomputed from verified weekly source data on "
+        "each successful run. Technical audit sheets remain veryHidden and protected. The "
+        "existing Management Center Current Actions readiness, evidence, persistence, and human-review gates remain separate."
+    )
+    ws["A41"].fill = PatternFill("solid", fgColor="F5F5F5")
+    ws["A41"].font = Font(color="5C5C5C")
+    ws["A41"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[41].height = 42
+    widths = {
+        "A": 38,
+        "B": 18,
+        "C": 42,
+        "D": 3,
+        "E": 19,
+        "F": 26,
+        "G": 37,
+        "H": 3,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+    for column in ("I", "J", "K", "L"):
+        ws.column_dimensions[column].width = 3
+    ws.freeze_panes = "A5"
+    ws.sheet_view.topLeftCell = "A1"
+    ws.sheet_view.zoomScale = 80
+    ws.print_area = "A1:L41"
+
+
+def write_shared_area_trends_sheet(
+    wb: Workbook,
+    model: dict[str, Any],
+) -> None:
+    remove_sheet_if_present(wb, "Shared & Area Trends")
+    ws = wb.create_sheet("Shared & Area Trends")
+    style_management_title(ws, "Shared POS & Area Trends", 17)
+    week_ends = tuple(model.get("week_ends", ()))
+    latest = model.get("latest_complete_week_end")
+    ws.merge_cells("A3:Q3")
+    ws["A3"] = (
+        f"Latest {len(week_ends)} complete shared weeks through {latest:%m/%d/%Y}. "
+        "Check Average is Gross Sales / Guests; shared identities remain outside person-level scoring."
+        if latest
+        else "No complete shared week is available for shared-number or area trends."
+    )
+    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
+    ws["A3"].font = Font(color="5C5C5C", size=11)
+    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[3].height = 32
+
+    def write_trend_table(
+        *,
+        section_row: int,
+        title: str,
+        rows: list[dict[str, Any]],
+        identity_header: str,
+        identity_key: str,
+        context_header: str,
+        context_key: str,
+        table_name: str,
+    ) -> int:
+        last_column = 3 + len(week_ends) + 5
+        ws.merge_cells(
+            start_row=section_row,
+            start_column=1,
+            end_row=section_row,
+            end_column=last_column,
+        )
+        section = ws.cell(row=section_row, column=1, value=title)
+        section.fill = PatternFill("solid", fgColor="8B1E23")
+        section.font = Font(color="FFFFFF", bold=True)
+        section.alignment = Alignment(vertical="center")
+        header_row = section_row + 1
+        headers = [
+            "Location",
+            identity_header,
+            context_header,
+            *(f"{week_end:%m/%d} CA" for week_end in week_ends),
+            "Latest Sales",
+            "Latest Guests",
+            "Latest Check Avg",
+            "Latest Wine %",
+            "WoW Check Avg",
+        ]
+        for column, header in enumerate(headers, start=1):
+            cell = ws.cell(row=header_row, column=column, value=header)
+            cell.fill = PatternFill("solid", fgColor="D9E1F2")
+            cell.font = Font(bold=True, color="1F1F1F")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.row_dimensions[header_row].height = 30
+
+        data_start = header_row + 1
+        for row_index, item in enumerate(rows, start=data_start):
+            values = [
+                excel_safe_text(item["location"]),
+                excel_safe_text(item[identity_key]),
+                excel_safe_text(item[context_key]),
+                *(
+                    item["weekly_metrics"].get(week_end, {}).get("check_average")
+                    for week_end in week_ends
+                ),
+                item["latest_gross_sales"],
+                item["latest_guest_count"],
+                item["latest_check_average"],
+                item["latest_wine_pct"],
+                item["wow_check_average"],
+            ]
+            for column, value in enumerate(values, start=1):
+                cell = ws.cell(row=row_index, column=column, value=value)
+                cell.alignment = Alignment(vertical="center", wrap_text=column <= 3)
+                if row_index % 2:
+                    cell.fill = PatternFill("solid", fgColor="F8F8F8")
+            week_start_column = 4
+            for column in range(week_start_column, week_start_column + len(week_ends)):
+                ws.cell(row=row_index, column=column).number_format = "$#,##0.00"
+            metric_start = week_start_column + len(week_ends)
+            ws.cell(row=row_index, column=metric_start).number_format = "$#,##0"
+            ws.cell(row=row_index, column=metric_start + 1).number_format = "#,##0"
+            ws.cell(row=row_index, column=metric_start + 2).number_format = "$#,##0.00"
+            ws.cell(row=row_index, column=metric_start + 3).number_format = "0.0%"
+            delta_cell = ws.cell(row=row_index, column=metric_start + 4)
+            delta_cell.number_format = "+$0.00;-$0.00;$0.00"
+            if delta_cell.value is not None:
+                delta_cell.font = Font(
+                    color="1F5B23" if float(delta_cell.value) >= 0 else "8B1E23",
+                    bold=True,
+                )
+        if rows:
+            last_row = data_start + len(rows) - 1
+            table = Table(
+                displayName=table_name,
+                ref=(
+                    f"A{header_row}:{get_column_letter(last_column)}{last_row}"
+                ),
+            )
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=True,
+                showColumnStripes=False,
+            )
+            ws.add_table(table)
+            return last_row
+        placeholder_row = data_start
+        ws.merge_cells(
+            start_row=placeholder_row,
+            start_column=1,
+            end_row=placeholder_row,
+            end_column=last_column,
+        )
+        placeholder = ws.cell(
+            row=placeholder_row,
+            column=1,
+            value="No matching activity is available in the selected complete-week window.",
+        )
+        placeholder.fill = PatternFill("solid", fgColor="FFF2CC")
+        placeholder.font = Font(color="7F6000")
+        placeholder.alignment = Alignment(wrap_text=True, vertical="center")
+        return placeholder_row
+
+    shared_end = write_trend_table(
+        section_row=5,
+        title="SHARED POS NUMBERS | weekly operating results, never person-level scoring",
+        rows=list(model.get("shared_rows", [])),
+        identity_header="Shared #",
+        identity_key="shared_number",
+        context_header="Source POS Label",
+        context_key="pos_label",
+        table_name="SharedPosTrendTable",
+    )
+    area_section_row = shared_end + 3
+    area_end = write_trend_table(
+        section_row=area_section_row,
+        title=(
+            "AREA CHECK AVERAGE | Bar, Patio, Dining Room, Banquets, and Wine Dinners"
+        ),
+        rows=list(model.get("area_rows", [])),
+        identity_header="Area",
+        identity_key="area",
+        context_header="Mapping",
+        context_key="mapping_status",
+        table_name="AreaCheckAverageTrendTable",
+    )
+    note_row = area_end + 2
+    ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=17)
+    ws.cell(row=note_row, column=1).value = (
+        "Wine Dinners stays unavailable until a real POS label or shared number is configured. "
+        "A maintainer can update the weekly area mapping. Dining Room is the residual set of "
+        "eligible named servers after shared IDs and explicitly mapped areas are removed."
+    )
+    ws.cell(row=note_row, column=1).fill = PatternFill("solid", fgColor="FFF2CC")
+    ws.cell(row=note_row, column=1).font = Font(color="7F6000")
+    ws.cell(row=note_row, column=1).alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[note_row].height = 42
+    for column, width in SHARED_AREA_TRENDS_COLUMN_WIDTHS.items():
+        # Preserve the operator's Excel AutoFit result as a deterministic fixed
+        # width; the bestFit flag itself is Excel save metadata, not layout.
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = "D7"
+    ws.sheet_view.topLeftCell = "A1"
+    ws.sheet_view.zoomScale = 72
+    ws.page_setup.fitToHeight = 1
+    ws.print_area = f"A1:Q{note_row}"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+
+
+def configure_generated_chart_excel_defaults(
+    chart: Any,
+    *,
+    x_axis_position: str,
+    y_axis_position: str,
+    line_series: bool,
+) -> None:
+    """Write the defaults desktop Excel materializes on its first save."""
+
+    chart.roundedCorners = False
+    if chart.style is None:
+        chart.style = 2
+    chart.varyColors = False
+    if hasattr(chart, "smooth"):
+        chart.smooth = False
+    if chart.title is not None:
+        chart.title.overlay = False
+    if chart.legend is not None:
+        chart.legend.overlay = False
+    for axis, position in (
+        (chart.x_axis, x_axis_position),
+        (chart.y_axis, y_axis_position),
+    ):
+        axis.delete = False
+        axis.axPos = position
+        if axis.title is not None:
+            axis.title.overlay = False
+        if axis.tickLblPos is None:
+            axis.tickLblPos = "nextTo"
+        axis.crosses = "autoZero"
+        if axis.numFmt is None:
+            axis.numFmt = "General"
+            axis.numFmt.sourceLinked = True
+    if hasattr(chart.x_axis, "auto"):
+        chart.x_axis.auto = False
+    if hasattr(chart.x_axis, "lblAlgn"):
+        chart.x_axis.lblAlgn = "ctr"
+    if hasattr(chart.x_axis, "noMultiLvlLbl"):
+        chart.x_axis.noMultiLvlLbl = True
+    if hasattr(chart.y_axis, "crossBetween"):
+        chart.y_axis.crossBetween = "between"
+    for series in chart.series:
+        if line_series:
+            series.smooth = False
+        else:
+            series.invertIfNegative = False
+
+
+def write_performance_dashboard_sheet(
+    wb: Workbook,
+    model: dict[str, Any],
+    config: dict[str, Any],
+    readiness: LatestWeekReadiness,
+) -> None:
+    remove_sheet_if_present(wb, "Performance Dashboard")
+    ws = wb.create_sheet("Performance Dashboard")
+    style_management_title(ws, "Red Onion Performance Dashboard", 15)
+    latest = model["latest_complete_week_end"]
+    rows = model["summary_rows"]
+    ws.merge_cells("A3:O3")
+    ws["A3"] = (
+        f"Generated eight-week snapshot through {latest:%m/%d/%Y} | {len(rows)} current "
+        "servers | current-roster same-store peer comparison"
+        if latest
+        else "No complete shared week is available for the performance snapshot."
+    )
+    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
+    ws["A3"].font = Font(color="5C5C5C", size=11)
+    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
+    evaluated = [row for row in rows if row["confidence"] != "Insufficient"]
+    high_count = sum(row["consistency"] == "High" for row in evaluated)
+    moderate_count = sum(row["consistency"] == "Moderate" for row in evaluated)
+    low_count = sum(row["consistency"] == "Low" for row in evaluated)
+    insufficient_count = len(rows) - len(evaluated)
+    summary_parts = [
+        f"{high_count} of {len(evaluated)} evaluated servers show high consistency"
+        if evaluated
+        else "No servers meet the evaluated-data gate"
+    ]
+    if moderate_count:
+        summary_parts.append(f"{moderate_count} show moderate consistency")
+    if low_count:
+        summary_parts.append(f"{low_count} show low consistency")
+    summary_parts.append(f"{insufficient_count} need more qualified data")
+    ws.merge_cells("A4:O4")
+    ws["A4"] = "; ".join(summary_parts) + "."
+    ws["A4"].fill = PatternFill("solid", fgColor="E8F0FA")
+    ws["A4"].font = Font(color="3E6FA8", bold=True, size=12)
+    ws["A4"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[3].height = 26
+    ws.row_dimensions[4].height = 30
+
+    overall = model.get("overall_store")
+    ws.merge_cells("A6:O6")
+    ws["A6"] = (
+        f"OVERALL STORE PERFORMANCE | latest complete week {latest:%m/%d/%Y}"
+        if latest
+        else "OVERALL STORE PERFORMANCE"
+    )
+    ws["A6"].fill = PatternFill("solid", fgColor="641318")
+    ws["A6"].font = Font(color="FFFFFF", bold=True, size=12)
+    ws["A6"].alignment = Alignment(horizontal="center", vertical="center")
+
+    def overall_delta_text(value: float | None, kind: str, baseline_weeks: int) -> str:
+        if value is None or baseline_weeks == 0:
+            return "No prior complete-week baseline"
+        if kind == "pct":
+            change = f"{value:+.1%}"
+        elif kind == "currency":
+            change = f"{'+' if value >= 0 else '-'}${abs(value):.2f}"
+        else:
+            change = f"{value * 100:+.1f} pts"
+        return f"{change} vs prior {baseline_weeks}-week baseline"
+
+    baseline_week_count = int(overall.get("baseline_week_count", 0)) if overall else 0
+    overall_cards = (
+        (
+            "Gross Sales",
+            overall.get("gross_sales") if overall else None,
+            "$#,##0",
+            overall_delta_text(
+                overall.get("gross_sales_change_pct") if overall else None,
+                "pct",
+                baseline_week_count,
+            ),
+            overall.get("gross_sales_change_pct") if overall else None,
+        ),
+        (
+            "Guests",
+            overall.get("guest_count") if overall else None,
+            "#,##0",
+            overall_delta_text(
+                overall.get("guest_count_change_pct") if overall else None,
+                "pct",
+                baseline_week_count,
+            ),
+            overall.get("guest_count_change_pct") if overall else None,
+        ),
+        (
+            "Check Average",
+            overall.get("check_average") if overall else None,
+            "$#,##0.00",
+            overall_delta_text(
+                overall.get("check_average_change") if overall else None,
+                "currency",
+                baseline_week_count,
+            ),
+            overall.get("check_average_change") if overall else None,
+        ),
+        (
+            "Wine Mix",
+            overall.get("wine_pct") if overall else None,
+            "0.0%",
+            overall_delta_text(
+                overall.get("wine_pct_change") if overall else None,
+                "points",
+                baseline_week_count,
+            ),
+            overall.get("wine_pct_change") if overall else None,
+        ),
+        (
+            "Complete Stores",
+            f"{int(overall.get('complete_location_count', 0))} of {len(config.get('locations', {}))}"
+            if overall
+            else "—",
+            "General",
+            "Source location totals; not server-row sums",
+            None,
+        ),
+    )
+    for start_column, (label, value, number_format, note, delta) in zip(
+        (1, 4, 7, 10, 13), overall_cards, strict=True
+    ):
+        end_column = start_column + 2
+        ws.merge_cells(
+            start_row=7,
+            start_column=start_column,
+            end_row=7,
+            end_column=end_column,
+        )
+        ws.merge_cells(
+            start_row=8,
+            start_column=start_column,
+            end_row=9,
+            end_column=end_column,
+        )
+        ws.merge_cells(
+            start_row=10,
+            start_column=start_column,
+            end_row=10,
+            end_column=end_column,
+        )
+        header = ws.cell(row=7, column=start_column, value=label)
+        header.fill = PatternFill("solid", fgColor="3E6FA8")
+        header.font = Font(color="FFFFFF", bold=True)
+        header.alignment = Alignment(horizontal="center", vertical="center")
+        value_cell = ws.cell(row=8, column=start_column, value=value)
+        value_cell.fill = PatternFill("solid", fgColor="E8F0FA")
+        value_cell.font = Font(color="1F4E78", bold=True, size=21)
+        value_cell.alignment = Alignment(horizontal="center", vertical="center")
+        value_cell.number_format = number_format
+        note_cell = ws.cell(row=10, column=start_column, value=note)
+        note_cell.fill = PatternFill("solid", fgColor="E8F0FA")
+        note_cell.font = Font(
+            color=("1F5B23" if float(delta) >= 0 else "8B1E23")
+            if delta is not None
+            else "5C5C5C",
+            bold=delta is not None,
+            size=9,
+        )
+        note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[6].height = 24
+    ws.row_dimensions[7].height = 22
+    ws.row_dimensions[8].height = 28
+    ws.row_dimensions[9].height = 28
+    ws.row_dimensions[10].height = 34
+
+    card_data = (
+        ("Consistently Strong", "Strong results + low volatility", "2E7D32", "E8F3E8"),
+        ("Consistent / Near Peer", "Near peer norms + low volatility", "2F6F6D", "E3F0EF"),
+        ("Variable / Inconsistent", "Results change materially week to week", "B77900", "FFF4CC"),
+        ("Below / Review", "Below peer band after sample gates", "8B1E23", "F8E8E9"),
+        ("Insufficient Data", "No conclusion until volume improves", "5C5C5C", "E9E9E9"),
+    )
+    counts = model["category_counts"]
+    for start_column, (label, note, accent, body) in zip(
+        (1, 4, 7, 10, 13), card_data, strict=True
+    ):
+        end_column = start_column + 2
+        ws.merge_cells(start_row=12, start_column=start_column, end_row=12, end_column=end_column)
+        ws.merge_cells(start_row=13, start_column=start_column, end_row=14, end_column=end_column)
+        ws.merge_cells(start_row=15, start_column=start_column, end_row=15, end_column=end_column)
+        header = ws.cell(row=12, column=start_column, value=label)
+        header.fill = PatternFill("solid", fgColor=accent)
+        header.font = Font(color="FFFFFF", bold=True)
+        header.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        value = ws.cell(row=13, column=start_column, value=counts[label])
+        value.fill = PatternFill("solid", fgColor=body)
+        value.font = Font(color=accent, bold=True, size=24)
+        value.alignment = Alignment(horizontal="center", vertical="center")
+        note_cell = ws.cell(row=15, column=start_column, value=note)
+        note_cell.fill = PatternFill("solid", fgColor=body)
+        note_cell.font = Font(color=accent, size=9)
+        note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[12].height = 24
+    ws.row_dimensions[13].height = 28
+    ws.row_dimensions[14].height = 28
+    ws.row_dimensions[15].height = 34
+
+    consistent_rows = [
+        row
+        for row in rows
+        if row["overall_read"] in {"Consistently Strong", "Consistent / Near Peer"}
+    ][:6]
+    review_rows = [
+        row
+        for row in rows
+        if row["overall_read"]
+        in {
+            "Strong / Variable",
+            "Mixed / Monitor",
+            "Inconsistent",
+            "Consistently Below",
+            "Below / Variable",
+        }
+    ][:6]
+    ws.merge_cells("A17:G17")
+    ws["A17"] = "CONSISTENT PERFORMANCE | strongest current peer-adjusted results"
+    ws["A17"].fill = PatternFill("solid", fgColor="E8F3E8")
+    ws["A17"].font = Font(color="1F5B23", bold=True)
+    ws.merge_cells("I17:O17")
+    ws["I17"] = "VARIABILITY / REVIEW | context check before coaching"
+    ws["I17"].fill = PatternFill("solid", fgColor="FFF4CC")
+    ws["I17"].font = Font(color="B77900", bold=True)
+    list_headers = [
+        "Server",
+        "Location",
+        "Overall Read",
+        "Confidence",
+        "Avg SPG Gap",
+        "Avg Wine Gap",
+        "Weeks",
+    ]
+    for start_column in (1, 9):
+        for offset, header in enumerate(list_headers):
+            cell = ws.cell(row=18, column=start_column + offset, value=header)
+            cell.fill = PatternFill("solid", fgColor="8B1E23")
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    def write_dashboard_list(start_column: int, selected: list[dict[str, Any]]) -> None:
+        for offset in range(6):
+            row_index = 19 + offset
+            if offset < len(selected):
+                item = selected[offset]
+                values = (
+                    excel_safe_text(item["display_name"]),
+                    excel_safe_text(item["location"]),
+                    item["overall_read"],
+                    item["confidence"],
+                    item["average_spg_gap"],
+                    item["average_wine_gap"],
+                    item["qualified_weeks"],
+                )
+            else:
+                values = ("—", "No additional", None, None, None, None, None)
+            for column_offset, value in enumerate(values):
+                cell = ws.cell(
+                    row=row_index, column=start_column + column_offset, value=value
+                )
+                cell.alignment = Alignment(vertical="center", wrap_text=column_offset < 4)
+            ws.cell(row=row_index, column=start_column + 4).number_format = "+$0.00;-$0.00;$0.00"
+            ws.cell(row=row_index, column=start_column + 5).number_format = "+0.0%;-0.0%;0.0%"
+
+    write_dashboard_list(1, consistent_rows)
+    write_dashboard_list(9, review_rows)
+
+    calc_ws = wb["_Consistency Calc"]
+    if model["store_consistency"]:
+        chart = BarChart()
+        chart.type = "bar"
+        chart.grouping = "stacked"
+        chart.overlap = 100
+        chart.style = 10
+        chart.title = "Consistency by Store"
+        chart.height = 7.0
+        chart.width = 13.0
+        max_row = 1 + len(model["store_consistency"])
+        data = Reference(calc_ws, min_col=24, max_col=27, min_row=1, max_row=max_row)
+        cats = Reference(calc_ws, min_col=23, min_row=2, max_row=max_row)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        category_formula = f"'_Consistency Calc'!$W$2:$W${max_row}"
+        for series in chart.series:
+            series.cat = AxDataSource(strRef=StrRef(f=category_formula))
+        for series, color in zip(
+            chart.series, ("2E7D32", "B77900", "8B1E23", "7F7F7F"), strict=True
+        ):
+            series.graphicalProperties.solidFill = color
+            series.graphicalProperties.line.solidFill = color
+        chart.legend.position = "b"
+        configure_generated_chart_excel_defaults(
+            chart,
+            x_axis_position="l",
+            y_axis_position="b",
+            line_series=False,
+        )
+        ws.add_chart(chart, "A27")
+
+    ws.merge_cells("I27:O27")
+    ws["I27"] = "READ THE WORKBOOK IN THIS ORDER"
+    ws["I27"].fill = PatternFill("solid", fgColor="8B1E23")
+    ws["I27"].font = Font(color="FFFFFF", bold=True)
+    ws.merge_cells("I28:O41")
+    ws["I28"] = (
+        "1. Confidence: Is there enough qualified data?\n\n"
+        "2. Performance Level: Average SPG and Wine peer gaps. Higher positive is stronger.\n\n"
+        "3. Consistency: Sample SD of weekly peer gaps. Lower is steadier.\n\n"
+        "4. Weekly Performance: Inspect the dated pattern, then verify shift and assignment context.\n\n"
+        "5. Management Center Current Actions: Treat its readiness, evidence, persistence, and human-review gates as separate.\n\n"
+        "Important: this measures selling outcomes, not total job performance."
+    )
+    ws["I28"].fill = PatternFill("solid", fgColor="E8F0FA")
+    ws["I28"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws.merge_cells("A44:O44")
+    latest_status = (
+        f"latest source week complete ({len(readiness.received_dates)} of {len(readiness.expected_dates)} daily reports)"
+        if readiness.ready
+        else f"latest source week preliminary ({readiness.missing_text or 'coverage incomplete'})"
+    )
+    ws["A44"] = (
+        f"Data quality: {latest_status}. This view uses only complete shared weeks through "
+        f"{latest:%m/%d/%Y}. See Management Center readiness before review; detailed source "
+        "reconciliation remains in the protected Data Quality audit layer."
+        if latest
+        else f"Data quality: {latest_status}. See Management Center readiness before review."
+    )
+    ws["A44"].fill = PatternFill("solid", fgColor="F5F5F5")
+    ws["A44"].font = Font(color="5C5C5C")
+    ws["A44"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[44].height = 42
+    for column in range(1, 16):
+        ws.column_dimensions[get_column_letter(column)].width = 14
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["I"].width = 22
+    ws.column_dimensions["J"].width = 22
+    ws.column_dimensions["K"].width = 22
+    ws.freeze_panes = "A18"
+    ws.sheet_view.topLeftCell = "A1"
+    ws.sheet_view.zoomScale = 80
+    ws.print_area = "A1:O44"
+
+
+def write_performance_consistency_sheets(
+    wb: Workbook,
+    model: dict[str, Any],
+    config: dict[str, Any],
+    readiness: LatestWeekReadiness,
+) -> None:
+    write_performance_consistency_calc_sheet(wb, model)
+    write_server_scorecards_sheet(wb, model, config)
+    write_weekly_performance_sheet(wb, model)
+    write_performance_methodology_sheet(wb, model, config)
+    write_performance_dashboard_sheet(wb, model, config, readiness)
 
 
 def write_guide_text_row(
@@ -10425,31 +14180,37 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             "assurance; independent recovery still requires a separate check."
         ),
         (
-            "2. Open Data Quality and confirm the latest Tuesday–Sunday week is complete, "
-            "reconciled, and free of unresolved source or identity problems."
+            "2. Open Management Center and confirm the latest Tuesday–Sunday week is complete, "
+            "reconciled, and free of unresolved source, identity, or owner problems."
         ),
         (
-            "3. Use Dashboard and Store & Group Scorecards for the operations layer: "
-            "sales, guests, checks, Sales / Guest, Sales / Check, Guests / Check, Rate "
-            "of Sale, and Ticket Time. Do not make a person-level decision from a card."
+            "3. Read Performance Dashboard, Server Scorecards, and Weekly Performance in "
+            "that order: confidence first, then peer-adjusted performance, then consistency "
+            "and the dated weekly pattern. Methodology defines every gate. These views are "
+            "descriptive selling-outcome review aids, not total job performance."
         ),
         (
-            "4. Use Action Board as the single current queue. Review the generated "
-            "evidence, then complete only the blue management fields."
+            "4. Use the overall store card on Performance Dashboard and Shared & Area "
+            "Trends for the operations layer: sales, guests, Check Average, Wine Mix, shared "
+            "POS results, and guest-weighted area Check Average. Use Methodology for the "
+            "definitions and limits. Do not make a person-level decision from a card."
         ),
         (
-            "5. Use Team Trends to see every current server's exact WoW movement, "
-            "4-week descriptive direction, and 8-week trend. WoW visibility is not an "
-            "action signal. For people review, use only Sales / Guest and Wine % as "
-            "inputs and verify Evidence Detail plus operating context."
+            "5. Use Management Center as the single current queue. Its readiness, peer-reference, "
+            "persistence, stability, evidence, and human-review gates remain separate from the "
+            "descriptive performance/consistency labels. Review the evidence fields, then "
+            "complete only the blue targets, owner-roster, and action fields."
         ),
         (
-            "6. Complete the blue Action Board fields. Track follow-up; completed or "
-            "dismissed items move to Action History on the next successful run."
+            "6. Track follow-up in Management Center. Completed or dismissed items move from "
+            "Current Actions to Action History on the next successful run."
         ),
     )
-    for row, step in enumerate(workflow_steps, start=7):
-        write_guide_text_row(ws, row, step, height=42 if row in {7, 8, 11, 12} else 36)
+    workflow_step_heights = (48, 36, 42, 42, 48, 36)
+    for row, (step, height) in enumerate(
+        zip(workflow_steps, workflow_step_heights, strict=True), start=7
+    ):
+        write_guide_text_row(ws, row, step, height=height)
 
     write_guide_section_header(ws, 13, HOW_TO_USE_SECTION_HEADINGS[2])
     required_review_rows = (
@@ -10501,10 +14262,15 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ws,
         28,
         (
-            "Blue cells are the only editable cells. Do not alter generated fields, "
-            "formulas, technical sheets, or raw evidence."
+            "The normal tab strip keeps How to Use, five analytical tabs, and one Management Center. "
+            "It consolidates data readiness, targets, owners, current actions, and action history. "
+            "Superseded summaries and audit-only sheets remain preserved but hidden. Blue cells "
+            "are the only fields carried forward. "
+            f"Review > Unprotect Sheet uses the lowercase password '{WORKBOOK_OPERATOR_PASSWORD}'. "
+            "Work on a copy: saved generated or structural changes are detected and can stop the "
+            "next protected run."
         ),
-        height=30,
+        height=66,
         fill_color="D9EAF7",
         bold=True,
         font_color="1F4E78",
@@ -10597,55 +14363,44 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             "start-here workflow, interpretation, controls, and limitations",
             "No — locked",
         ),
-        ("Dashboard", "aggregate weekly brief", "No — locked"),
         (
-            "Action Board",
-            "single current review and task-tracking queue",
-            "Yes — seven blue fields only",
+            "Performance Dashboard",
+            "eight-week confidence, peer-adjusted performance, and consistency overview",
+            "No — locked",
         ),
         (
-            "Team Trends",
+            "Server Scorecards",
+            "separate performance, consistency, confidence, sample, and recent movement fields",
+            "No — locked",
+        ),
+        (
+            "Weekly Performance",
+            "dated Strong, Near Peer, Mixed, Below, Not Qualified, and missing-row pattern",
+            "No — locked",
+        ),
+        (
+            "Shared & Area Trends",
+            "eight-week shared POS results and guest-weighted Check Average by operating area",
+            "No — locked by default",
+        ),
+        (
+            "Methodology",
+            "definitions, calculation flow, gates, thresholds, and limitations",
+            "No — locked",
+        ),
+        (
+            "Management Center",
             (
-                "all current servers with exact WoW deltas, descriptive 4-week "
-                "movement, 8-week direction, evidence status, and action gate"
+                "data readiness, editable targets and owners, current action queue, and "
+                "preserved action history"
             ),
-            "No — locked",
-        ),
-        (
-            "Store & Group Scorecards",
-            "operational context only",
-            "No — locked",
-        ),
-        (
-            "Evidence Detail",
-            (
-                "evidence weeks, cohort, threshold, stability, and methodology; exact "
-                "raw lineage stays hidden and protected for export and audit"
-            ),
-            "No — locked",
-        ),
-        (
-            "Action History",
-            "preserved closed and dismissed items",
-            "No — locked",
-        ),
-        (
-            "Data Quality",
-            "completeness, reconciliation, source provenance, and owner warnings",
-            "No — locked",
-        ),
-        (
-            "Management Setup",
-            "custodian-maintained store targets and owner roster",
             "Yes — blue cells only",
         ),
-        (
-            "Run Notes",
-            "release, integrity, methodology, and source-assumption audit trail",
-            "No — locked",
-        ),
     )
-    for row, (sheet_name, purpose, editable) in enumerate(workbook_map, start=46):
+    workbook_map_start_row = 46
+    for row, (sheet_name, purpose, editable) in enumerate(
+        workbook_map, start=workbook_map_start_row
+    ):
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
         ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=10)
         ws.merge_cells(start_row=row, start_column=11, end_row=row, end_column=12)
@@ -10664,16 +14419,18 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ws.row_dimensions[row].height = (
             42 if sheet_name in {
                 "How to Use",
-                "Team Trends",
-                "Evidence Detail",
-                "Data Quality",
-                "Management Setup",
-                "Run Notes",
+                "Performance Dashboard",
+                "Server Scorecards",
+                "Weekly Performance",
+                "Shared & Area Trends",
+                "Methodology",
+                "Management Center",
             }
             else 36
         )
 
-    write_guide_section_header(ws, 58, HOW_TO_USE_SECTION_HEADINGS[7])
+    limits_header_row = workbook_map_start_row + len(workbook_map)
+    write_guide_section_header(ws, limits_header_row, HOW_TO_USE_SECTION_HEADINGS[7])
     limit_rows = (
         (
             "Rate of Sale is opportunities divided by qualifying sales, so lower is "
@@ -10699,16 +14456,17 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             "users."
         ),
     )
-    for row, text in enumerate(limit_rows, start=59):
+    limits_start_row = limits_header_row + 1
+    for row, text in enumerate(limit_rows, start=limits_start_row):
         write_guide_text_row(
             ws,
             row,
             text,
-            height=72 if row == 59 else 42 if row == 60 else 36,
-            fill_color="FFF2CC" if row == 59 else "FFFFFF",
+            height=72 if row == limits_start_row else 42 if row == limits_start_row + 1 else 36,
+            fill_color="FFF2CC" if row == limits_start_row else "FFFFFF",
         )
 
-    ws.print_area = "A1:L63"
+    ws.print_area = f"A1:L{limits_start_row + len(limit_rows) - 1}"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
@@ -10896,25 +14654,35 @@ def write_owner_validation_sheet(
     roster_capacity: int | None = None,
 ) -> None:
     roster = normalize_owner_roster(owners)
-    capacity = min(
-        OWNER_ROSTER_MAX_ROWS,
-        max(
-            OWNER_ROSTER_MIN_EDIT_ROWS,
-            len(roster) + OWNER_ROSTER_SPARE_ROWS,
-            int(roster_capacity or 0),
-        ),
+    setup = (
+        wb[MANAGEMENT_CENTER_SHEET]
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames
+        and OWNER_ROSTER_TABLE_NAME in wb[MANAGEMENT_CENTER_SHEET].tables
+        else wb["Management Setup"]
     )
+    min_col, min_row, max_col, max_row = range_boundaries(
+        setup.tables[OWNER_ROSTER_TABLE_NAME].ref
+    )
+    headers = {
+        setup.cell(row=min_row, column=column).value: column
+        for column in range(min_col, max_col + 1)
+    }
+    if tuple(headers) != OWNER_ROSTER_HEADERS:
+        raise ValueError("Owner Roster headers are not supported.")
+    capacity = max_row - min_row
+    name_column = get_column_letter(headers["Owner Name"])
+    active_column = get_column_letter(headers["Active"])
     remove_sheet_if_present(wb, OWNER_VALIDATION_SHEET)
     ws = wb.create_sheet(OWNER_VALIDATION_SHEET)
     ws["A1"] = "Active Owners"
     for offset in range(capacity):
-        setup_row = 21 + offset
+        setup_row = min_row + 1 + offset
         ws.cell(
             row=2 + offset,
             column=1,
             value=(
-                f'=IF(\'Management Setup\'!$B${setup_row}="Yes",'
-                f'\'Management Setup\'!$A${setup_row},"")'
+                f'=IF(\'{setup.title}\'!${active_column}${setup_row}="Yes",'
+                f'\'{setup.title}\'!${name_column}${setup_row},"")'
             ),
         )
     end_row = capacity + 1
@@ -10932,36 +14700,49 @@ def action_row_values(row: dict[str, Any]) -> list[Any]:
     return [excel_safe_text(row.get(header)) for header in ACTION_HEADERS]
 
 
-def write_action_tracking_sheet(
-    wb: Workbook,
-    name: str,
+def compact_action_row_height(values: list[Any]) -> int:
+    """Estimate a safe Excel height for the visible wrapped action fields."""
+
+    visible_wrapped_capacity = {
+        11: 39,  # Why It Matters, width 46
+        12: 41,  # Recommended Next Step, width 48
+        14: 29,  # Context Notes, width 34
+        19: 15,  # Evidence Status, width 18
+        21: 19,  # Review Disposition, width 22
+    }
+    estimated_lines = 1
+    for column, line_capacity in visible_wrapped_capacity.items():
+        text = str(values[column - 1] or "")
+        cell_lines = sum(
+            max(1, math.ceil(len(line) / line_capacity))
+            for line in (text.splitlines() or [""])
+        )
+        estimated_lines = max(estimated_lines, cell_lines)
+    return min(300, max(30, estimated_lines * 15))
+
+
+def write_action_tracking_region(
+    ws,
     rows: list[dict[str, Any]],
     *,
+    header_row: int,
     editable: bool,
-) -> None:
-    remove_sheet_if_present(wb, name)
-    ws = wb.create_sheet(name)
-    style_management_title(ws, name, len(ACTION_HEADERS))
-    if editable:
-        ws.merge_cells("C3:W3")
-        note = ws["C3"]
-        note.value = (
-            "Single action queue: start with the highest-priority row, review the "
-            "generated evidence, and complete only the blue management fields."
-        )
-        note.fill = PatternFill("solid", fgColor="FFF2CC")
-        note.font = Font(bold=True, color="7F6000")
-        note.alignment = Alignment(wrap_text=True, vertical="center")
-        ws.row_dimensions[3].height = 36
-    header_row = 4
+    table_name: str,
+    compact_rows: bool = False,
+) -> int:
+    """Write one action table at an explicit row on a standalone or combined sheet."""
+
     for col, header in enumerate(ACTION_HEADERS, start=1):
         cell = ws.cell(row=header_row, column=col, value=header)
         cell.fill = PatternFill("solid", fgColor="D9E1F2")
         cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
     ws.row_dimensions[header_row].height = 30
     for row_index, row in enumerate(rows, start=header_row + 1):
-        for col, value in enumerate(action_row_values(row), start=1):
+        values = action_row_values(row)
+        for col, value in enumerate(values, start=1):
             cell = ws.cell(row=row_index, column=col, value=value)
             cell.alignment = Alignment(
                 vertical="top", wrap_text=col in {10, 11, 12, 14, 15, 16, 19, 21}
@@ -10969,55 +14750,62 @@ def write_action_tracking_sheet(
         priority_style = priority_fill(row.get("Priority"))
         if priority_style:
             ws.cell(row=row_index, column=3).fill = priority_style
-        ws.cell(row=row_index, column=6).number_format = "m/d/yyyy"
-        ws.cell(row=row_index, column=13).number_format = "m/d/yyyy"
-        ws.cell(row=row_index, column=17).number_format = "m/d/yyyy"
-        ws.cell(row=row_index, column=23).number_format = "m/d/yyyy"
-        ws.row_dimensions[row_index].height = 60
+        ws.cell(row=row_index, column=6).number_format = EXCEL_DATE_NUMBER_FORMAT
+        ws.cell(row=row_index, column=13).number_format = EXCEL_DATE_NUMBER_FORMAT
+        ws.cell(row=row_index, column=17).number_format = EXCEL_DATE_NUMBER_FORMAT
+        ws.cell(row=row_index, column=23).number_format = EXCEL_DATE_NUMBER_FORMAT
+        if compact_rows:
+            ws.row_dimensions[row_index].height = compact_action_row_height(values)
+        else:
+            ws.row_dimensions[row_index].height = 60
     if rows:
         table = Table(
-            displayName="ActionBoardTable" if editable else "ActionHistoryTable",
+            displayName=table_name,
             ref=(
                 f"A{header_row}:{get_column_letter(len(ACTION_HEADERS))}"
                 f"{header_row + len(rows)}"
             ),
         )
         table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleLight1", showFirstColumn=False, showLastColumn=False,
-            showRowStripes=True, showColumnStripes=False
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
         )
         ws.add_table(table)
-    ws.column_dimensions["A"].hidden = True
-    ws.column_dimensions["B"].hidden = True
-    if editable:
-        for column in ("J", "M", "O", "P", "Q", "R"):
-            ws.column_dimensions[column].hidden = True
-    ws.column_dimensions["T"].hidden = True
-    widths = {
-        "C": 12, "D": 14, "E": 18, "F": 13, "G": 20, "H": 24, "I": 22,
-        "J": 22, "K": 46, "L": 48, "M": 14, "N": 34, "O": 20, "P": 14,
-        "Q": 13, "R": 12, "S": 18, "T": 14, "U": 22, "V": 18, "W": 13,
-    }
-    for column, width in widths.items():
-        ws.column_dimensions[column].width = width
-    ws.freeze_panes = "G5"
-    ws.sheet_view.zoomScale = 80
-    ws.print_title_rows = "1:4"
-    if rows:
         first, last = header_row + 1, header_row + len(rows)
         red_fill = PatternFill("solid", fgColor="F4CCCC")
         amber_fill = PatternFill("solid", fgColor="FFF2CC")
         green_fill = PatternFill("solid", fgColor="D9EAD3")
         blue_fill = PatternFill("solid", fgColor="D9EAF7")
-        ws.conditional_formatting.add(f"C{first}:C{last}", FormulaRule(formula=[f'$C{first}="High"'], fill=red_fill))
-        ws.conditional_formatting.add(f"C{first}:C{last}", FormulaRule(formula=[f'$C{first}="Medium"'], fill=amber_fill))
-        ws.conditional_formatting.add(f"C{first}:C{last}", FormulaRule(formula=[f'$C{first}="Recognize"'], fill=green_fill))
-        ws.conditional_formatting.add(f"D{first}:D{last}", FormulaRule(formula=[f'$D{first}="Complete"'], fill=green_fill))
-        ws.conditional_formatting.add(f"D{first}:D{last}", FormulaRule(formula=[f'$D{first}="Blocked"'], fill=red_fill))
+        ws.conditional_formatting.add(
+            f"C{first}:C{last}",
+            FormulaRule(formula=[f'$C{first}="High"'], fill=red_fill),
+        )
+        ws.conditional_formatting.add(
+            f"C{first}:C{last}",
+            FormulaRule(formula=[f'$C{first}="Medium"'], fill=amber_fill),
+        )
+        ws.conditional_formatting.add(
+            f"C{first}:C{last}",
+            FormulaRule(formula=[f'$C{first}="Recognize"'], fill=green_fill),
+        )
+        ws.conditional_formatting.add(
+            f"D{first}:D{last}",
+            FormulaRule(formula=[f'$D{first}="Complete"'], fill=green_fill),
+        )
+        ws.conditional_formatting.add(
+            f"D{first}:D{last}",
+            FormulaRule(formula=[f'$D{first}="Blocked"'], fill=red_fill),
+        )
         ws.conditional_formatting.add(
             f"F{first}:F{last}",
             FormulaRule(
-                formula=[f'AND($F{first}<TODAY(),$F{first}<>"",$D{first}<>"Complete",$D{first}<>"Dismissed")'],
+                formula=[
+                    f'AND($F{first}<TODAY(),$F{first}<>"",'
+                    f'$D{first}<>"Complete",$D{first}<>"Dismissed")'
+                ],
                 fill=red_fill,
             ),
         )
@@ -11034,7 +14822,7 @@ def write_action_tracking_sheet(
                 showErrorMessage=True,
                 errorStyle="stop",
                 errorTitle="Choose a valid status",
-                error="Select a status from the Action Board list.",
+                error="Select a status from the action list.",
             )
             owner_validation = DataValidation(
                 type="list",
@@ -11065,8 +14853,8 @@ def write_action_tracking_sheet(
                 f"E{first}:E{last}",
                 FormulaRule(
                     formula=[
-                        f'AND($E{first}<>"",COUNTIF({OWNER_ROSTER_DEFINED_NAME},$E{first})=0,'
-                        f'$D{first}<>"Complete",$D{first}<>"Dismissed")'
+                        f'AND($E{first}<>"",COUNTIF({OWNER_ROSTER_DEFINED_NAME},'
+                        f'$E{first})=0,$D{first}<>"Complete",$D{first}<>"Dismissed")'
                     ],
                     fill=amber_fill,
                 ),
@@ -11082,6 +14870,380 @@ def write_action_tracking_sheet(
                     fill=red_fill,
                 ),
             )
+    return header_row + max(1, len(rows))
+
+
+def configure_action_tracking_columns(ws, *, hide_internal: bool) -> None:
+    ws.column_dimensions["A"].hidden = True
+    ws.column_dimensions["B"].hidden = True
+    if hide_internal:
+        for column in ("J", "M", "O", "P", "Q", "R"):
+            ws.column_dimensions[column].hidden = True
+    ws.column_dimensions["T"].hidden = True
+    widths = {
+        "C": 12,
+        "D": 14,
+        "E": 18,
+        "F": 13,
+        "G": 20,
+        "H": 24,
+        "I": 22,
+        "J": 22,
+        "K": 46,
+        "L": 48,
+        "M": 14,
+        "N": 34,
+        "O": 20,
+        "P": 14,
+        "Q": 13,
+        "R": 12,
+        "S": 18,
+        "T": 14,
+        "U": 22,
+        "V": 18,
+        "W": 13,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[column].width = width
+
+
+def write_action_tracking_sheet(
+    wb: Workbook,
+    name: str,
+    rows: list[dict[str, Any]],
+    *,
+    editable: bool,
+) -> None:
+    remove_sheet_if_present(wb, name)
+    ws = wb.create_sheet(name)
+    style_management_title(ws, name, len(ACTION_HEADERS))
+    if editable:
+        ws.merge_cells("C3:W3")
+        note = ws["C3"]
+        note.value = (
+            "Single action queue: start with the highest-priority row, review the "
+            "generated evidence, and complete only the blue management fields."
+        )
+        note.fill = PatternFill("solid", fgColor="FFF2CC")
+        note.font = Font(bold=True, color="7F6000")
+        note.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[3].height = 36
+    header_row = 4
+    write_action_tracking_region(
+        ws,
+        rows,
+        header_row=header_row,
+        editable=editable,
+        table_name="ActionBoardTable" if editable else "ActionHistoryTable",
+    )
+    configure_action_tracking_columns(ws, hide_internal=editable)
+    ws.freeze_panes = "G5"
+    ws.sheet_view.zoomScale = 80
+    ws.print_title_rows = "1:4"
+
+
+def write_management_center_sheet(
+    wb: Workbook,
+    targets: dict[str, dict[str, float | None]],
+    owners: list[Any],
+    current_actions: list[dict[str, Any]],
+    action_history: list[dict[str, Any]],
+    config: dict[str, Any],
+    readiness: LatestWeekReadiness,
+    owner_warnings: list[dict[str, Any]],
+    roster_capacity: int | None = None,
+) -> None:
+    """Consolidate readiness, setup, current actions, and history in one operator tab."""
+
+    roster = normalize_owner_roster(owners)
+    active_names = active_owner_names(roster)
+    remove_sheet_if_present(wb, MANAGEMENT_CENTER_SHEET)
+    ws = wb.create_sheet(MANAGEMENT_CENTER_SHEET)
+    style_management_title(ws, "Management Center", len(ACTION_HEADERS))
+    ws.merge_cells("C3:W3")
+    ws["C3"] = (
+        "Weekly control center: confirm data readiness, maintain targets and owners, then "
+        "update only the blue cells in Current Actions. Completed and dismissed items move "
+        "to the read-only history below. The default printout covers the current management "
+        "snapshot; history remains available below for on-screen lookup."
+    )
+    ws["C3"].fill = PatternFill("solid", fgColor="FFF2CC")
+    ws["C3"].font = Font(bold=True, color="7F6000")
+    ws["C3"].alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[3].height = 42
+
+    style_section_header(ws, 5, 3, 9, "DATA READINESS")
+    ws.merge_cells(start_row=5, start_column=3, end_row=5, end_column=9)
+    ws.row_dimensions[5].height = 24
+    coverage_text = (
+        f"{len(readiness.received_dates)} of {len(readiness.expected_dates)} expected "
+        f"{OPERATING_WEEK_LABEL} business dates received"
+        if readiness.expected_dates
+        else "No complete reporting window is available"
+    )
+    readiness_rows = [
+        (
+            "Weekly status",
+            "Ready for management review"
+            if readiness.ready
+            else "Attention required; person-level actions are suppressed",
+        ),
+        (
+            "Latest week",
+            readiness.latest_week_end.strftime("%m/%d/%Y")
+            if readiness.latest_week_end
+            else "Unavailable",
+        ),
+        ("Source coverage", coverage_text),
+        ("Missing inputs", readiness.missing_text or "None"),
+        (
+            "Owner review",
+            (
+                f"{len(owner_warnings)} open action assignment(s) need owner review"
+                if owner_warnings
+                else "No open actions are assigned to inactive or unlisted owners"
+            ),
+        ),
+    ]
+    for row_index, (label, value) in enumerate(readiness_rows, start=6):
+        ws.merge_cells(
+            start_row=row_index, start_column=3, end_row=row_index, end_column=5
+        )
+        ws.merge_cells(
+            start_row=row_index, start_column=6, end_row=row_index, end_column=9
+        )
+        label_cell = ws.cell(row=row_index, column=3, value=label)
+        value_cell = ws.cell(row=row_index, column=6, value=value)
+        label_cell.fill = PatternFill("solid", fgColor="F3F4F6")
+        label_cell.font = Font(bold=True)
+        value_cell.fill = PatternFill(
+            "solid",
+            fgColor=(
+                "D9EAD3"
+                if row_index == 6 and readiness.ready
+                else "F4CCCC"
+                if row_index == 6
+                else "FFF2CC"
+                if row_index == 10 and owner_warnings
+                else "FFFFFF"
+            ),
+        )
+        value_cell.font = Font(
+            bold=row_index in {6, 10},
+            color=(
+                "274E13"
+                if row_index == 6 and readiness.ready
+                else "9C0006"
+                if row_index == 6
+                else "7F6000"
+                if row_index == 10 and owner_warnings
+                else "262626"
+            ),
+        )
+        for cell in (label_cell, value_cell):
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row_index].height = 30 if row_index != 9 else 42
+
+    target_header_row = 12
+    style_section_header(ws, 11, 3, 9, "MANAGEMENT TARGETS | blue cells are editable")
+    ws.merge_cells(start_row=11, start_column=3, end_row=11, end_column=9)
+    target_headers = ["Entity", *[label for _, label in TARGET_FIELDS]]
+    for col, header in enumerate(target_headers, start=3):
+        cell = ws.cell(row=target_header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[target_header_row].height = 45
+    entities = ["All Stores", *config.get("locations", {}).keys()]
+    for row_index, entity in enumerate(entities, start=target_header_row + 1):
+        ws.cell(row=row_index, column=3, value=entity).font = Font(bold=True)
+        for col, (field, _) in enumerate(TARGET_FIELDS, start=4):
+            value = targets.get(entity, {}).get(field)
+            if field == "average_ticket_time_seconds" and value is not None:
+                value = value / 60
+            cell = ws.cell(row=row_index, column=col, value=value)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.alignment = Alignment(horizontal="right")
+            cell.protection = Protection(locked=False)
+        ws.cell(row=row_index, column=4).number_format = "$#,##0"
+        ws.cell(row=row_index, column=5).number_format = "#,##0"
+        ws.cell(row=row_index, column=6).number_format = "$0.00"
+        ws.cell(row=row_index, column=7).number_format = "0.0%"
+        ws.cell(row=row_index, column=8).number_format = "0.000"
+        ws.cell(row=row_index, column=9).number_format = "0.0"
+        ws.row_dimensions[row_index].height = 24
+    targets_last_row = target_header_row + len(entities)
+    target_table = Table(
+        displayName="ManagementTargets",
+        ref=f"C{target_header_row}:I{targets_last_row}",
+    )
+    target_table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(target_table)
+
+    roster_header_row = 12
+    style_section_header(
+        ws,
+        11,
+        11,
+        12,
+        (
+            f"OWNER ROSTER | {len(active_names)} active"
+            if active_names
+            else "OWNER ROSTER | add an active owner"
+        ),
+    )
+    ws.merge_cells(start_row=11, start_column=11, end_row=11, end_column=12)
+    ws.row_dimensions[11].height = 30
+    for col, header in enumerate(OWNER_ROSTER_HEADERS, start=11):
+        cell = ws.cell(row=roster_header_row, column=col, value=header)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    roster_data_rows = min(
+        OWNER_ROSTER_MAX_ROWS,
+        max(
+            OWNER_ROSTER_MIN_EDIT_ROWS,
+            len(roster) + OWNER_ROSTER_SPARE_ROWS,
+            int(roster_capacity or 0),
+        ),
+    )
+    roster_last_row = roster_header_row + roster_data_rows
+    visible_roster_rows = min(
+        roster_data_rows,
+        max(OWNER_ROSTER_VISIBLE_EDIT_ROWS, len(roster) + OWNER_ROSTER_SPARE_ROWS),
+    )
+    for offset in range(roster_data_rows):
+        row_index = roster_header_row + 1 + offset
+        entry = roster[offset] if offset < len(roster) else None
+        name_cell = ws.cell(
+            row=row_index,
+            column=11,
+            value=excel_safe_text(entry["Owner Name"]) if entry else None,
+        )
+        active_cell = ws.cell(
+            row=row_index,
+            column=12,
+            value=entry["Active"] if entry else None,
+        )
+        for cell in (name_cell, active_cell):
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.protection = Protection(locked=False)
+        active_cell.alignment = Alignment(horizontal="center")
+        ws.row_dimensions[row_index].height = max(
+            ws.row_dimensions[row_index].height or 15, 21
+        )
+        ws.row_dimensions[row_index].hidden = (
+            offset >= visible_roster_rows and row_index > targets_last_row
+        )
+    roster_table = Table(
+        displayName=OWNER_ROSTER_TABLE_NAME,
+        ref=f"K{roster_header_row}:L{roster_last_row}",
+    )
+    roster_table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(roster_table)
+    active_validation = DataValidation(
+        type="list",
+        formula1='"Yes,No"',
+        allow_blank=True,
+        showErrorMessage=True,
+        errorStyle="stop",
+        errorTitle="Choose Yes or No",
+        error="Select Yes or No from the Owner Roster Active list.",
+    )
+    ws.add_data_validation(active_validation)
+    active_validation.add(f"L{roster_header_row + 1}:L{roster_last_row}")
+
+    current_title_row = max(roster_last_row, targets_last_row) + 2
+    style_section_header(
+        ws,
+        current_title_row,
+        3,
+        len(ACTION_HEADERS),
+        f"CURRENT ACTIONS | {len(current_actions)} open review item(s)",
+    )
+    ws.merge_cells(
+        start_row=current_title_row,
+        start_column=3,
+        end_row=current_title_row,
+        end_column=len(ACTION_HEADERS),
+    )
+    ws.merge_cells(
+        start_row=current_title_row + 1,
+        start_column=3,
+        end_row=current_title_row + 1,
+        end_column=len(ACTION_HEADERS),
+    )
+    ws.cell(
+        row=current_title_row + 1,
+        column=3,
+        value=(
+            "Review the evidence and operational context, then update Status, Owner, Due "
+            "Date, Context Notes, Review Disposition, Reviewed By, and Review Date in blue."
+        ),
+    )
+    ws.cell(row=current_title_row + 1, column=3).fill = PatternFill(
+        "solid", fgColor="D9EAF7"
+    )
+    ws.cell(row=current_title_row + 1, column=3).alignment = Alignment(
+        wrap_text=True, vertical="center"
+    )
+    ws.row_dimensions[current_title_row + 1].height = 36
+    current_end_row = write_action_tracking_region(
+        ws,
+        current_actions,
+        header_row=current_title_row + 2,
+        editable=True,
+        table_name="ActionBoardTable",
+        compact_rows=True,
+    )
+
+    history_title_row = current_end_row + 2
+    style_section_header(
+        ws,
+        history_title_row,
+        3,
+        len(ACTION_HEADERS),
+        f"ACTION HISTORY | {len(action_history)} completed or dismissed item(s)",
+    )
+    ws.merge_cells(
+        start_row=history_title_row,
+        start_column=3,
+        end_row=history_title_row,
+        end_column=len(ACTION_HEADERS),
+    )
+    history_end_row = write_action_tracking_region(
+        ws,
+        action_history,
+        header_row=history_title_row + 1,
+        editable=False,
+        table_name="ActionHistoryTable",
+        compact_rows=True,
+    )
+
+    configure_action_tracking_columns(ws, hide_internal=True)
+    ws.freeze_panes = "C6"
+    ws.sheet_view.topLeftCell = "C1"
+    ws.sheet_view.zoomScale = 75
+    ws.print_title_rows = "1:5"
+    ws.print_area = f"A1:W{current_end_row}"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.page_setup.pageOrder = "overThenDown"
+    ws.print_options.horizontalCentered = True
 
 
 def write_action_focus_sheet(
@@ -11159,7 +15321,7 @@ def write_action_focus_sheet(
             cell.alignment = Alignment(
                 vertical="top", wrap_text=col in {6, 7, 8, 9, 10, 11}
             )
-        ws.cell(row=row_index, column=4).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=4).number_format = EXCEL_DATE_NUMBER_FORMAT
         target_row = board_rows.get(action_id)
         if target_row:
             link = ws.cell(row=row_index, column=13)
@@ -11264,10 +15426,39 @@ def write_evidence_detail_sheet(
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
     ws.row_dimensions[header_row].height = 42
-    board_rows = {
-        str(row.get("Action ID")): index
-        for index, row in enumerate(current_actions, start=5)
-    }
+    action_sheet_name = (
+        MANAGEMENT_CENTER_SHEET
+        if (
+            MANAGEMENT_CENTER_SHEET in wb.sheetnames
+            and "ActionBoardTable" in wb[MANAGEMENT_CENTER_SHEET].tables
+        )
+        else "Action Board"
+        if (
+            "Action Board" in wb.sheetnames
+            and "ActionBoardTable" in wb["Action Board"].tables
+        )
+        else None
+    )
+    action_table_rows: dict[str, int] = {}
+    if action_sheet_name is not None:
+        action_sheet = wb[action_sheet_name]
+        min_col, action_header_row, max_col, action_last_row = range_boundaries(
+            action_sheet.tables["ActionBoardTable"].ref
+        )
+        action_id_column = next(
+            (
+                column
+                for column in range(min_col, max_col + 1)
+                if action_sheet.cell(action_header_row, column).value == "Action ID"
+            ),
+            None,
+        )
+        if action_id_column is not None:
+            action_table_rows = {
+                str(action_sheet.cell(row, action_id_column).value): row
+                for row in range(action_header_row + 1, action_last_row + 1)
+                if action_sheet.cell(row, action_id_column).value not in (None, "")
+            }
     for row_index, action in enumerate(rows, start=header_row + 1):
         for col, header in enumerate(EVIDENCE_DETAIL_HEADERS, start=1):
             value = action.get(header)
@@ -11285,12 +15476,12 @@ def write_evidence_detail_sheet(
                 },
             )
             if header in {"Due Date", "Last Seen", "Review Date"}:
-                cell.number_format = "m/d/yyyy"
+                cell.number_format = EXCEL_DATE_NUMBER_FORMAT
         action_id = str(action.get("Action ID") or "")
-        target_row = board_rows.get(action_id)
-        if target_row:
+        target_row = action_table_rows.get(action_id)
+        if action_sheet_name is not None and target_row:
             evidence_cell = ws.cell(row=row_index, column=1)
-            evidence_cell.hyperlink = f"#'Action Board'!C{target_row}"
+            evidence_cell.hyperlink = f"#'{action_sheet_name}'!C{target_row}"
             evidence_cell.style = "Hyperlink"
         visible_lengths = [
             len(str(action.get(header) or ""))
@@ -11459,8 +15650,8 @@ def write_team_trends_sheet(wb: Workbook, rows: list[dict[str, Any]]) -> None:
     ws.print_title_rows = "1:3"
     ws.row_dimensions[3].height = 30
     for row in range(4, 4 + len(data)):
-        ws.cell(row=row, column=3).number_format = "m/d/yyyy"
-        ws.cell(row=row, column=4).number_format = "m/d/yyyy"
+        ws.cell(row=row, column=3).number_format = EXCEL_DATE_NUMBER_FORMAT
+        ws.cell(row=row, column=4).number_format = EXCEL_DATE_NUMBER_FORMAT
         ws.cell(row=row, column=6).number_format = "$0.00"
         ws.cell(row=row, column=7).number_format = "+$0.00;[Red]-$0.00;$0.00"
         ws.cell(row=row, column=8).number_format = "0.0%"
@@ -11666,11 +15857,7 @@ def write_store_group_scorecards_sheet(
                 "sales_per_check",
                 "guests_per_check",
             }
-            context_available = (
-                bool(item["latest"].get("check_count_available", False))
-                if is_workload_context
-                else management_metric_available(item["latest"], field)
-            )
+            context_available = management_metric_available(item["latest"], field)
             current_raw = item["latest"].get(field) if context_available else None
             current_value, number_format = format_management_value(
                 field, current_raw
@@ -11678,7 +15865,7 @@ def write_store_group_scorecards_sheet(
             if is_workload_context:
                 prior_context_available = bool(
                     item.get("prior")
-                    and item["prior"].get("check_count_available", False)
+                    and management_metric_available(item["prior"], field)
                 )
                 prior_change = (
                     float(item["latest"].get(field, 0) or 0)
@@ -11956,7 +16143,7 @@ def write_data_quality_completeness_heatmap(
     )
     for row_index, week_end in enumerate(week_ends, start=data_start_row):
         date_cell = ws.cell(row=row_index, column=1, value=week_end)
-        date_cell.number_format = "m/d/yyyy"
+        date_cell.number_format = EXCEL_DATE_NUMBER_FORMAT
         date_cell.fill = PatternFill("solid", fgColor="F3F4F6")
         date_cell.alignment = Alignment(horizontal="center", vertical="center")
         date_cell.border = matrix_border
@@ -12088,7 +16275,7 @@ def write_management_data_quality_sheet(
             ws.cell(row=row_index, column=col).alignment = Alignment(
                 wrap_text=True, vertical="center"
             )
-        ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=1).number_format = EXCEL_DATE_NUMBER_FORMAT
         if row and row.get("check_count_available"):
             ws.cell(row=row_index, column=5).number_format = "#,##0"
         fill = priority_fill("Recognize" if status == "Complete" else "High")
@@ -12125,7 +16312,7 @@ def write_management_data_quality_sheet(
         values = [row["week_end"], row["location"], row["active_days"], row["source_days"], "Short Week", "Excluded"]
         for col, value in enumerate(values, start=1):
             ws.cell(row=row_index, column=col, value=value)
-        ws.cell(row=row_index, column=1).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=1).number_format = EXCEL_DATE_NUMBER_FORMAT
     warning_start = max(
         historical_title_row + 4,
         historical_title_row + 3 + len(historical),
@@ -12287,7 +16474,7 @@ def write_management_data_quality_sheet(
                 wrap_text=col in {1, 3, 5, 7, 8},
                 vertical="center",
             )
-        ws.cell(row=row_index, column=2).number_format = "m/d/yyyy"
+        ws.cell(row=row_index, column=2).number_format = EXCEL_DATE_NUMBER_FORMAT
         if status != "Verified":
             ws.cell(row=row_index, column=8).fill = PatternFill(
                 "solid", fgColor="FFF2CC"
@@ -12389,6 +16576,12 @@ def add_management_scorecard_charts(
         # Bottom placement keeps both store names inside the chart frame when
         # the scorecard is exported or printed at one page wide.
         chart.legend.position = "b"
+        configure_generated_chart_excel_defaults(
+            chart,
+            x_axis_position="b",
+            y_axis_position="l",
+            line_series=True,
+        )
         ws.add_chart(chart, sales_anchor)
     if group_points:
         chart = LineChart()
@@ -12409,6 +16602,12 @@ def add_management_scorecard_charts(
             chart.series[0].graphicalProperties.line.solidFill = "7A1E1E"
             chart.series[0].graphicalProperties.line.width = 28575
         chart.legend = None
+        configure_generated_chart_excel_defaults(
+            chart,
+            x_axis_position="b",
+            y_axis_position="l",
+            line_series=True,
+        )
         ws.add_chart(chart, guest_anchor)
 
 
@@ -12493,7 +16692,6 @@ def deduplicated_dashboard_actions(
     )
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    seen_operational_topics: set[str] = set()
     for row in candidates:
         identity = str(row.get("Entity Key") or "").strip().casefold()
         if not identity:
@@ -12503,14 +16701,6 @@ def deduplicated_dashboard_actions(
             )
         if identity in seen:
             continue
-        if not identity.startswith("server|"):
-            topic = "|".join(
-                str(row.get(field) or "").strip().casefold()
-                for field in ("Action", "Signal")
-            )
-            if topic in seen_operational_topics:
-                continue
-            seen_operational_topics.add(topic)
         seen.add(identity)
         selected.append(row)
         if limit is not None and len(selected) >= limit:
@@ -12727,7 +16917,9 @@ def write_management_dashboard_sheet(
                 )
                 ws.cell(row=row_index, column=11, value=excel_safe_text(owner))
                 if due_date:
-                    ws.cell(row=row_index, column=12, value=due_date).number_format = "m/d/yyyy"
+                    ws.cell(
+                        row=row_index, column=12, value=due_date
+                    ).number_format = EXCEL_DATE_NUMBER_FORMAT
                 else:
                     ws.cell(row=row_index, column=12, value="Not set")
                 fill = priority_fill(priority)
@@ -12795,6 +16987,9 @@ def write_management_dashboard_sheet(
                 ws.cell(
                     row=row_index, column=7, value=latest.get("check_count", 0)
                 ).number_format = "#,##0"
+            else:
+                ws.cell(row=row_index, column=7, value="n/a")
+            if management_metric_available(latest, "sales_per_check"):
                 ws.cell(
                     row=row_index, column=9, value=latest.get("sales_per_check", 0)
                 ).number_format = "$0.00"
@@ -12804,7 +16999,7 @@ def write_management_dashboard_sheet(
                     value=latest.get("guests_per_check", 0),
                 ).number_format = "0.00"
             else:
-                for col in (7, 9, 10):
+                for col in (9, 10):
                     ws.cell(row=row_index, column=col, value="n/a")
             ws.cell(
                 row=row_index, column=8, value=latest["check_average"]
@@ -12927,6 +17122,12 @@ def write_management_run_notes(
         ("Previous Manifest SHA-256", integrity.get("previous_manifest_sha256", "Integrity baseline or standalone generation")),
         ("Digest Scheme", WORKBOOK_DIGEST_SCHEME),
         (WORKBOOK_PROTECTION_CONTRACT_LABEL, WORKBOOK_PROTECTION_CONTRACT),
+        (
+            WORKBOOK_OPERATOR_UNLOCK_LABEL,
+            f"Review > Unprotect Sheet or Workbook uses {WORKBOOK_OPERATOR_PASSWORD}. "
+            "This is an accidental-edit guard only; saved generated-content or structure "
+            "changes are detected by the digest and can stop the next protected run.",
+        ),
         (RUN_NOTES_DIGEST_LABEL, "Pending save/reload validation"),
         ("Source Folder", str(source_dir)),
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed."),
@@ -12958,6 +17159,22 @@ def write_management_run_notes(
             "Sales / Guest and Wine % deltas plus descriptive 4-week and 8-week "
             "direction. These visible movements do not bypass the action gates.",
         ),
+        (
+            "Performance & Consistency",
+            f"Descriptive methodology {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION} uses the latest "
+            f"{PERFORMANCE_CONSISTENCY_WINDOW_WEEKS} complete shared weeks, current-roster same-store "
+            f"weekly medians with at least {config.get('management_peer_reference', {}).get('min_distinct_peers_per_week', 5)} peers, "
+            f"a {PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP:,.0f}-guest weekly weight cap, and sample SD. "
+            "It measures selling outcomes only and does not bypass readiness, evidence, persistence, "
+            "stability, review, or Action Board controls.",
+        ),
+        (
+            "Shared POS & Area Trends",
+            "Shared four-digit POS identities are summarized separately from people. Bar, "
+            "Patio, Dining Room, Banquets, and Wine Dinners use guest-weighted Gross Sales / "
+            "Guests across complete shared weeks. Wine Dinners remains unavailable until an "
+            "actual source name or shared number is configured.",
+        ),
         ("Technical Trend Detail", "Server Week-over-Week Detail remains protected descriptive audit context. Generated coaching prompts use qualified Recent Movement, peer comparison, evidence stability, and two-week persistence."),
         ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward between weekly runs. Cleared signals move to Action History."),
         (
@@ -12981,7 +17198,7 @@ def write_management_run_notes(
                 "Metric Caveat",
             }
             else 42
-            if label in {"Check Count Coverage", "Metric Rule", "Team Trends"}
+            if label in {"Check Count Coverage", "Metric Rule", "Team Trends", "Performance & Consistency"}
             else 30
         )
 
@@ -12999,25 +17216,44 @@ def protect_worksheet(ws, password: str) -> None:
 
 
 def finalize_management_workbook(wb: Workbook) -> None:
-    # Excel's legacy worksheet/workbook protection password format accepts at
-    # most 15 characters. Longer values are written by openpyxl but Excel
-    # silently drops their hashes on save, so keep the random recovery token
-    # comfortably inside that compatibility limit.
-    protection_password = secrets.token_hex(6)
+    # This documented convenience password is an accidental-edit guard, not a
+    # security boundary. The substantive workbook digest and manifest chain
+    # remain the authoritative controls for generated content and structure.
+    protection_password = WORKBOOK_OPERATOR_PASSWORD
+    visible_management_sheets = tuple(
+        name for name in VISIBLE_MANAGEMENT_SHEETS if name in wb.sheetnames
+    )
+    if not visible_management_sheets:
+        # Compatibility for narrow fixture and migration workbooks assembled from
+        # the former standalone management surfaces. Strict validation still
+        # requires the declared contract for any published workbook.
+        visible_management_sheets = tuple(
+            name
+            for name in ("Management Setup", "Action Board", "Run Notes")
+            if name in wb.sheetnames
+        )
     for sheet in wb.worksheets:
-        if sheet.title in VISIBLE_MANAGEMENT_SHEETS:
+        if sheet.title in visible_management_sheets:
             sheet.sheet_state = "visible"
             add_management_navigation(sheet)
             configure_management_print_layout(sheet)
         else:
             sheet.sheet_state = "veryHidden"
         protect_worksheet(sheet, protection_password)
-    ordered = [wb[name] for name in VISIBLE_MANAGEMENT_SHEETS if name in wb.sheetnames]
-    ordered.extend(sheet for sheet in wb.worksheets if sheet.title not in VISIBLE_MANAGEMENT_SHEETS)
+    ordered = [wb[name] for name in visible_management_sheets]
+    ordered.extend(
+        sheet for sheet in wb.worksheets if sheet.title not in visible_management_sheets
+    )
     wb._sheets = ordered
     wb.active = 0
     tab_colors = {
         "How to Use": "FFD966",
+        "Performance Dashboard": "8B1E23",
+        "Server Scorecards": "2F6F6D",
+        "Weekly Performance": "3E6FA8",
+        "Shared & Area Trends": "8064A2",
+        "Methodology": "B77900",
+        "Management Center": "4472C4",
         "Dashboard": "7A1E1E",
         "Action Board": "C00000", "Team Trends": "5B9BD5",
         "Store & Group Scorecards": "70AD47",
@@ -13028,6 +17264,24 @@ def finalize_management_workbook(wb: Workbook) -> None:
     for name, color in tab_colors.items():
         if name in wb.sheetnames:
             wb[name].sheet_properties.tabColor = color
+    # Desktop Excel materializes these AutoFit results on its first no-edit save.
+    # Write them into generated output up front so the visible row sizes remain
+    # part of the substantive digest instead of being treated as serializer noise.
+    for sheet_name, row_heights in EXCEL_AUTOFIT_ROW_HEIGHTS.items():
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        for row_index, height in row_heights.items():
+            if ws.row_dimensions[row_index].height is None:
+                ws.row_dimensions[row_index].height = height
+    for ws in wb.worksheets:
+        for dimension in ws.row_dimensions.values():
+            if dimension.height is None:
+                continue
+            dimension.height = EXCEL_ROW_HEIGHT_SERIALIZATION.get(
+                float(dimension.height),
+                float(dimension.height),
+            )
     wb.security = WorkbookProtection(lockStructure=True, lockWindows=False)
     wb.security.set_workbook_password(protection_password)
 
@@ -13077,6 +17331,12 @@ def write_master_workbook(
         server_rows = management_server_rows(
             weekly_server_rows, weekly_location_rows, ranked_rows, state["targets"], config
         )
+        performance_consistency_model = build_performance_consistency_model(
+            weekly_server_rows, weekly_location_rows, config
+        )
+        shared_area_trends_model = build_shared_area_trends_model(
+            weekly_server_rows, weekly_location_rows, config
+        )
         store_rows = management_entity_rows(
             weekly_location_rows, "location", state["targets"], config, full_by_location
         )
@@ -13096,25 +17356,13 @@ def write_master_workbook(
             remove_sheet_if_present(wb, "_Data Quality Detail")
             wb["Data Quality"].title = "_Data Quality Detail"
         for name in (
-            "How to Use", "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars",
+            "How to Use", "Performance Dashboard", "Server Scorecards", "Weekly Performance", "Shared & Area Trends",
+            "Methodology", "Management Center", "_Consistency Calc", "Dashboard", "Action Focus", "Action Board", "Rising & Falling Stars",
             "Recent Movement Signals", "Run Notes",
             "Server Scorecard", "Team Trends", "Store & Group Scorecards", "Action History", "Management Setup",
             "Evidence Detail",
         ):
             remove_sheet_if_present(wb, name)
-        write_management_setup_sheet(
-            wb,
-            state["targets"],
-            state["owner_roster"],
-            config,
-            state["owner_roster_capacity"],
-        )
-        write_owner_validation_sheet(
-            wb,
-            state["owner_roster"],
-            state["owner_roster_capacity"],
-        )
-        write_action_tracking_sheet(wb, "Action Board", current_actions, editable=True)
         write_team_trends_sheet(wb, visible_server_rows)
         write_store_group_scorecards_sheet(
             wb,
@@ -13124,8 +17372,6 @@ def write_master_workbook(
             weekly_group_rows,
             readiness,
         )
-        write_action_tracking_sheet(wb, "Action History", action_history, editable=False)
-        write_evidence_detail_sheet(wb, current_actions, action_history)
         write_management_data_quality_sheet(
             wb,
             weekly_location_rows,
@@ -13134,6 +17380,30 @@ def write_master_workbook(
             owner_warnings,
             records=records,
         )
+        write_management_center_sheet(
+            wb,
+            state["targets"],
+            state["owner_roster"],
+            current_actions,
+            action_history,
+            config,
+            readiness,
+            owner_warnings,
+            state["owner_roster_capacity"],
+        )
+        write_evidence_detail_sheet(wb, current_actions, action_history)
+        write_owner_validation_sheet(
+            wb,
+            state["owner_roster"],
+            state["owner_roster_capacity"],
+        )
+        write_performance_consistency_sheets(
+            wb,
+            performance_consistency_model,
+            config,
+            readiness,
+        )
+        write_shared_area_trends_sheet(wb, shared_area_trends_model)
         write_management_run_notes(wb, records, source_dir, public_start, public_end, config)
         write_management_dashboard_sheet(
             wb, records, weekly_location_rows, weekly_group_rows, visible_server_rows,
@@ -13644,7 +17914,7 @@ def manifest_pinned_master_snapshot(
     run_id = payload.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
         raise IntegrityError(
-            "The legacy manifest cannot identify its archived master without a run ID."
+            "The prior manifest cannot identify its archived master without a run ID."
         )
     suffix = (
         f"/{run_id}/published/Red_Onion_Server_Master.xlsx"
@@ -13657,7 +17927,7 @@ def manifest_pinned_master_snapshot(
     ]
     if len(matches) > 1:
         raise IntegrityError(
-            "The legacy manifest must pin exactly one archived published master for its run."
+            "The prior manifest must pin exactly one archived published master for its run."
         )
     root = generated_workbook_archive_dir(archive_dir)
 
@@ -13791,10 +18061,13 @@ def current_master_digest_state(output_dir: Path) -> tuple[str | None, str | Non
         stamped = stamped_workbook_digest(wb)
     finally:
         wb.close()
-    if scheme == LEGACY_WORKBOOK_DIGEST_SCHEME:
+    if scheme in {
+        LEGACY_WORKBOOK_DIGEST_SCHEME,
+        PREVIOUS_WORKBOOK_DIGEST_SCHEME,
+    }:
         if not stamped or not re.fullmatch(r"[0-9a-f]{64}", stamped):
             raise IntegrityError(
-                "Legacy master workbook is missing its frozen stamped v2 digest."
+                "Prior master workbook is missing its frozen stamped digest."
             )
         return stamped, scheme
     if scheme == WORKBOOK_DIGEST_SCHEME:
@@ -14062,6 +18335,7 @@ def verify_integrity_state(
             recorded_scheme = LEGACY_WORKBOOK_DIGEST_SCHEME
         if recorded_scheme not in {
             LEGACY_WORKBOOK_DIGEST_SCHEME,
+            PREVIOUS_WORKBOOK_DIGEST_SCHEME,
             WORKBOOK_DIGEST_SCHEME,
         }:
             raise IntegrityError(
@@ -14069,19 +18343,29 @@ def verify_integrity_state(
                 f"{recorded_scheme!r}."
             )
         legacy_reference: Path | None = None
-        if (
+        current_metadata = workbook_metadata_sha256(master_path)
+        if recorded_scheme == PREVIOUS_WORKBOOK_DIGEST_SCHEME:
+            legacy_reference = manifest_pinned_master_snapshot(archive_dir, payload)
+        elif (
             recorded_scheme == LEGACY_WORKBOOK_DIGEST_SCHEME
-            and workbook_metadata_sha256(master_path) != expected_master
+            and current_metadata != expected_master
         ):
             legacy_reference = manifest_pinned_master_snapshot(archive_dir, payload)
         expected_metadata = payload.get("master_metadata_sha256")
-        metadata_drift = legacy_reference is not None
+        metadata_drift = (
+            recorded_scheme == LEGACY_WORKBOOK_DIGEST_SCHEME
+            and legacy_reference is not None
+        )
         if (
-            recorded_scheme == WORKBOOK_DIGEST_SCHEME
+            recorded_scheme in {
+                PREVIOUS_WORKBOOK_DIGEST_SCHEME,
+                WORKBOOK_DIGEST_SCHEME,
+            }
             and expected_metadata is None
         ):
             raise IntegrityError(
-                "V3 integrity manifest is missing the required master metadata digest."
+                "Substantive-content integrity manifest is missing the required "
+                "master metadata digest."
             )
         if expected_metadata is not None:
             if not isinstance(expected_metadata, str) or not re.fullmatch(
@@ -14090,7 +18374,7 @@ def verify_integrity_state(
                 raise IntegrityError(
                     "Integrity manifest contains an invalid master metadata digest."
                 )
-            if workbook_metadata_sha256(master_path) != expected_metadata:
+            if current_metadata != expected_metadata:
                 metadata_drift = True
                 warnings.warn(
                     "Master workbook metadata differs from the recorded generated version; "
@@ -14109,7 +18393,7 @@ def verify_integrity_state(
         )
         payload["_master_generated_content_digest_scheme"] = recorded_scheme
         payload["_master_metadata_drift"] = metadata_drift
-        payload["_master_metadata_sha256"] = workbook_metadata_sha256(master_path)
+        payload["_master_metadata_sha256"] = current_metadata
         if legacy_reference is not None:
             payload["_legacy_master_reference_path"] = str(legacy_reference)
         payload["_legacy_master_upgrade_pending"] = (
@@ -15544,7 +19828,7 @@ def build_management_evidence_package(
                 ),
                 comparator_type=str(
                     row.get("Comparator Type")
-                    or "Same-store prior-four-week median"
+                    or default_management_comparator_type(row)
                 ),
                 peer_cohort_size=int(row.get("Peer Cohort Size") or 0),
                 peer_cohort_weeks=int(row.get("Peer Cohort Weeks") or 0),
@@ -15779,11 +20063,11 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
         config = None
         add("Configuration", "Attention", str(exc))
 
-    python_ready = sys.version_info >= (3, 10)
+    python_ready = (3, 10) <= sys.version_info[:2] < (3, 13)
     add(
         "Python",
         "Ready" if python_ready else "Attention",
-        f"{sys.version.split()[0]} (minimum supported: 3.10).",
+        f"{sys.version.split()[0]} (supported: 3.10-3.12).",
     )
     for label, path in (
         ("Input folder", input_dir),
@@ -15830,7 +20114,13 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
                     "The latest manifest does not match the machine-local trusted head."
                 )
             verified_manifest_payload, verified_sha256 = verify_integrity_state(
-                archive_dir, output_dir, latest_manifest
+                archive_dir,
+                output_dir,
+                latest_manifest,
+                # The trusted anchor already pins this exact manifest head. A
+                # read-only health check must therefore recognize a supported
+                # one-way workbook-layout upgrade just as ordinary preflight does.
+                allow_legacy_master_upgrade=True,
             )
             if not secrets.compare_digest(verified_sha256, anchored_sha256):
                 raise IntegrityError(

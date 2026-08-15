@@ -136,6 +136,57 @@ def test_context_only_change_updates_audit_evidence_without_resetting_review() -
     assert current[0]["Review Date"] == date(2026, 7, 20)
 
 
+def test_source_provenance_change_resets_prior_review() -> None:
+    prior = current_action()
+    prior.update(
+        {
+            "Status": "In Progress",
+            "Review Disposition": "Coaching Accepted",
+            "Reviewed By": "Pat Manager",
+            "Review Date": date(2026, 7, 20),
+        }
+    )
+    changed_signal = sample_signal()
+    changed_signal["_source_evidence"][0].update(
+        {
+            "sha256": "b" * 64,
+            "format": ".xls",
+            "parser_engine": "pandas-xlrd",
+        }
+    )
+    changed = metrics.enrich_management_signal(changed_signal)
+
+    assert metrics.review_reset_fingerprint(changed) != (
+        metrics.review_reset_fingerprint(prior)
+    )
+    current, _ = metrics.merge_management_actions(
+        [changed],
+        {"active_actions": [prior], "action_history": []},
+    )
+
+    assert current[0]["Evidence ID"] == changed["Evidence ID"]
+    assert current[0]["Status"] == "Review Needed"
+    assert current[0]["Review Disposition"] == "Pending Review"
+    assert current[0]["Reviewed By"] == ""
+    assert current[0]["Review Date"] is None
+
+
+def test_data_quality_evidence_defaults_to_no_comparator() -> None:
+    signal = metrics.enrich_management_signal(
+        {
+            "Entity Key": "data-quality|rc richmond|latest-week",
+            "Action": "Data Quality",
+            "Signal": "Incomplete Latest Week",
+            "Last Seen": date(2026, 7, 19),
+            "_evidence_week_ends": ["2026-07-19"],
+            "_source_evidence": [],
+            "_metric_evidence": {"source_days": 5},
+        }
+    )
+
+    assert signal["Comparator Type"] == "Not applicable"
+
+
 def test_action_board_is_single_queue_and_evidence_links_to_it() -> None:
     wb = Workbook()
     wb.remove(wb.active)
