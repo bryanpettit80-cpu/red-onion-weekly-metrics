@@ -2789,6 +2789,104 @@ def test_evidence_source_accepts_manifest_pinned_pre_guide_v031_master(
     }
 
 
+def test_evidence_export_stages_current_consolidated_workbook(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "02 Finished Reports"
+    archive_dir = tmp_path / "03 Archive"
+    output_dir.mkdir()
+    archive_dir.mkdir()
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    shutil.copy2(valid_master_template, master)
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        assert "Action Board" not in workbook.sheetnames
+        assert "Management Setup" not in workbook.sheetnames
+        center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+        assert {
+            "ActionBoardTable",
+            metrics.OWNER_ROSTER_TABLE_NAME,
+        }.issubset(center.tables)
+        set_current_owner(workbook, "Current Manager")
+        (bounds, headers) = table_bounds_and_headers(center, "ActionBoardTable")
+        action_row = bounds[1] + 1
+        center.cell(action_row, headers["Status"], "Blocked")
+        center.cell(action_row, headers["Owner"], "Current Manager")
+        center.cell(action_row, headers["Due Date"], date(2026, 8, 6))
+        center.cell(
+            action_row,
+            headers["Review Disposition"],
+            "Coaching Accepted",
+        )
+        center.cell(action_row, headers["Reviewed By"], "Current Manager")
+        center.cell(action_row, headers["Review Date"], date(2026, 8, 1))
+        expected_action_id = str(center.cell(action_row, headers["Action ID"]).value)
+        workbook.save(master)
+    finally:
+        workbook.close()
+
+    expected_digest = metrics.verify_existing_management_workbook_integrity(master)
+    manifest = archive_dir / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    manifest_sha256 = "a" * 64
+    manifest_payload = {
+        "run_id": "current-consolidated-run",
+        "created_at_utc": "2026-08-10T12:00:00+00:00",
+        "master_generated_content_sha256": expected_digest,
+        "provenance": {
+            "git": {"commit": "b" * 40},
+            "effective_config_sha256": "c" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        metrics,
+        "latest_integrity_manifest_path",
+        lambda archive: manifest,
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_anchor",
+        lambda archive, anchor: (manifest.resolve(), manifest_sha256),
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_state",
+        lambda archive, output, selected_manifest: (
+            manifest_payload,
+            manifest_sha256,
+        ),
+    )
+
+    candidate = tmp_path / "management-evidence.json"
+    paths = metrics.stage_management_evidence(
+        Namespace(
+            output_dir=str(output_dir),
+            archive_dir=str(archive_dir),
+            integrity_anchor_dir=str(tmp_path / "anchors"),
+        ),
+        candidate,
+    )
+
+    assert paths == [
+        candidate,
+        metrics.evidence_fingerprint_path(candidate),
+        metrics.evidence_approval_template_path(candidate),
+    ]
+    package = integrity.read_json_manifest(candidate)
+    exported = {
+        row["action_id"]: row
+        for row in package["records"]
+    }
+    assert expected_action_id in exported
+    assert exported[expected_action_id]["status"] == "Blocked"
+    assert exported[expected_action_id]["owner"] == "Current Manager"
+    assert exported[expected_action_id]["reviewed_by"] == "Current Manager"
+    assert package["source"]["workbook_generated_content_sha256"] == expected_digest
+
+
 def test_v2_evidence_export_rejects_legacy_action_schema(
     tmp_path: Path,
     valid_master_template: Path,

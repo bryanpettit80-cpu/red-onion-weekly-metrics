@@ -19658,15 +19658,35 @@ def validate_v2_management_evidence_workbook(
     wb = load_workbook(workbook_path, data_only=False)
     try:
         protection_contract = stamped_workbook_protection_contract(wb)
-        action_headers = (
-            {
-                str(cell.value)
-                for cell in wb["Action Board"][4]
-                if cell.value is not None
-            }
-            if "Action Board" in wb.sheetnames
-            else set()
-        )
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames:
+            management_center = wb[MANAGEMENT_CENTER_SHEET]
+            has_current_evidence_surfaces = (
+                "ActionBoardTable" in management_center.tables
+                and OWNER_ROSTER_TABLE_NAME in management_center.tables
+            )
+            if has_current_evidence_surfaces:
+                action_min_col, action_min_row, action_max_col, _ = range_boundaries(
+                    management_center.tables["ActionBoardTable"].ref
+                )
+                action_headers = {
+                    str(management_center.cell(action_min_row, column).value)
+                    for column in range(action_min_col, action_max_col + 1)
+                    if management_center.cell(action_min_row, column).value is not None
+                }
+            else:
+                action_headers = set()
+        else:
+            # Exact fallback for protected V2 workbooks created before the
+            # management surfaces were consolidated into Management Center.
+            action_headers = (
+                {
+                    str(cell.value)
+                    for cell in wb["Action Board"][4]
+                    if cell.value is not None
+                }
+                if "Action Board" in wb.sheetnames
+                else set()
+            )
         has_v2_action_schema = {
             "Context Notes",
             "Review Disposition",
@@ -19749,15 +19769,27 @@ def verified_evidence_source(
     )
     wb = load_workbook(workbook_path, data_only=False)
     try:
-        allowed_reviewers = (
-            active_owner_names(
-                owner_roster_from_sheet(wb["Management Setup"])
+        if MANAGEMENT_CENTER_SHEET in wb.sheetnames:
+            management_center = wb[MANAGEMENT_CENTER_SHEET]
+            allowed_reviewers = active_owner_names(
+                owner_roster_from_sheet(management_center)
             )
-            if "Management Setup" in wb.sheetnames
-            else None
-        )
+            action_records = records_from_table(
+                management_center, "ActionBoardTable"
+            )
+        else:
+            # Exact fallback for protected V2 workbooks created before the
+            # management surfaces were consolidated into Management Center.
+            allowed_reviewers = (
+                active_owner_names(
+                    owner_roster_from_sheet(wb["Management Setup"])
+                )
+                if "Management Setup" in wb.sheetnames
+                else None
+            )
+            action_records = records_from_sheet(wb["Action Board"], "Action ID")
         action_rows = validate_action_board_records(
-            records_from_sheet(wb["Action Board"], "Action ID"),
+            action_records,
             allowed_reviewers=allowed_reviewers,
         )
         evidence_rows = records_from_sheet(wb["Evidence Detail"], "Evidence ID")
