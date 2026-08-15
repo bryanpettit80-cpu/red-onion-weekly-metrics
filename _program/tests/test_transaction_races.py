@@ -20,6 +20,13 @@ ACTIVE_WEEK_END = date(2026, 7, 26)  # Sunday
 ACTIVE_NAME = "Daily Report - TM - 07-21-2026.xlsx"
 
 
+def action_header_column(header: str) -> int:
+    return metrics.ACTION_HEADERS.index(header) + 1
+
+
+CONTEXT_NOTES_COLUMN = action_header_column("Context Notes")
+
+
 def workflow_args(tmp_path: Path, *, initialize_baseline: bool = False) -> Namespace:
     return Namespace(
         input_dir=str(tmp_path / "01 Daily Reports - Drop Here"),
@@ -84,7 +91,7 @@ def valid_master_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         center.tables["ActionBoardTable"].ref
     )
     assert action_last_row > action_header_row
-    center.cell(action_header_row + 1, 14).value = ""
+    center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).value = ""
     workbook.save(path)
     workbook.close()
     metrics.stamp_generated_content_digest(path)
@@ -95,7 +102,10 @@ def valid_master_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     _, action_header_row, _, _ = metrics.range_boundaries(
         center.tables["ActionBoardTable"].ref
     )
-    assert center.cell(action_header_row + 1, 14).protection.locked is False
+    assert (
+        center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).protection.locked
+        is False
+    )
     workbook.close()
     return path
 
@@ -475,7 +485,7 @@ def test_manager_edit_after_staging_is_preserved_when_publication_aborts(
         _, action_header_row, _, _ = metrics.range_boundaries(
             center.tables["ActionBoardTable"].ref
         )
-        center.cell(action_header_row + 1, 14).value = late_note
+        center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).value = late_note
         workbook.save(live_master)
         workbook.close()
         edit_injected = True
@@ -496,7 +506,9 @@ def test_manager_edit_after_staging_is_preserved_when_publication_aborts(
     _, action_header_row, _, _ = metrics.range_boundaries(
         center.tables["ActionBoardTable"].ref
     )
-    assert center.cell(action_header_row + 1, 14).value == late_note
+    assert (
+        center.cell(action_header_row + 1, CONTEXT_NOTES_COLUMN).value == late_note
+    )
     workbook.close()
 
 
