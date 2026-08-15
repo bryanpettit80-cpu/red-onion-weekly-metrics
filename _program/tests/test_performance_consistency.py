@@ -107,6 +107,61 @@ def test_shared_pos_number_does_not_reclassify_an_embedded_number() -> None:
     )
 
 
+@pytest.mark.parametrize("name", ["Barbara Smith", "Bart Jones"])
+def test_weekly_area_bar_pattern_does_not_match_person_name_prefixes(
+    name: str,
+) -> None:
+    row = weekly_server_row(date(2026, 8, 9), name)
+
+    assert metrics.weekly_area_for_row(row, one_location_config()) == "Dining Room"
+
+
+def test_weekly_area_patterns_match_explicit_labels_and_fallback_totals() -> None:
+    week_end = date(2026, 8, 9)
+    rows = [
+        weekly_server_row(week_end, "Main Bar", spg=60.0, guests=10.0),
+        weekly_server_row(week_end, "Barbara Smith", spg=100.0, guests=20.0),
+        weekly_server_row(week_end, "Bart Jones", spg=80.0, guests=30.0),
+    ]
+    config = one_location_config()
+
+    model = metrics.build_shared_area_trends_model(
+        rows,
+        [weekly_location_row(week_end)],
+        config,
+    )
+
+    assert metrics.weekly_area_for_row(rows[0], config) == "Bar"
+    for location in ("All Stores", "RC Richmond"):
+        area_rows = {
+            row["area"]: row
+            for row in model["area_rows"]
+            if row["location"] == location
+        }
+        assert area_rows["Bar"]["latest_guest_count"] == pytest.approx(10.0)
+        assert area_rows["Bar"]["latest_check_average"] == pytest.approx(60.0)
+        assert area_rows["Dining Room"]["latest_guest_count"] == pytest.approx(50.0)
+        assert area_rows["Dining Room"]["latest_gross_sales"] == pytest.approx(
+            4_400.0
+        )
+        assert area_rows["Dining Room"]["latest_check_average"] == pytest.approx(
+            88.0
+        )
+
+
+def test_weekly_area_uses_a_configured_literal_phrase() -> None:
+    config = one_location_config()
+    config["weekly_area_name_patterns"]["Bar"] = ["Cocktail Station"]  # type: ignore[index]
+
+    assert (
+        metrics.weekly_area_for_row(
+            weekly_server_row(date(2026, 8, 9), "Cocktail Station 1"),
+            config,
+        )
+        == "Bar"
+    )
+
+
 @pytest.mark.parametrize(
     ("spg_gap", "wine_gap", "expected"),
     [
@@ -217,6 +272,97 @@ def test_peer_pool_excludes_people_not_on_the_latest_complete_roster() -> None:
     assert "Former Peer" not in {
         row["display_name"] for row in model["summary_rows"]  # type: ignore[index]
     }
+
+
+def test_shared_pos_row_has_no_scorecard_and_does_not_shift_peer_median() -> None:
+    first = date(2026, 6, 21)
+    week_ends = [first + timedelta(days=7 * offset) for offset in range(8)]
+    server_rows: list[dict[str, object]] = []
+    for week_end in week_ends:
+        server_rows.append(weekly_server_row(week_end, "Taylor Guest", spg=100.0))
+        for peer_number, peer_spg in enumerate((80, 90, 100, 110, 120), start=1):
+            server_rows.append(
+                weekly_server_row(
+                    week_end,
+                    f"Peer {peer_number}",
+                    spg=float(peer_spg),
+                )
+            )
+        # This high-value shared identity would move the six-row median from
+        # $100 to $105 if it leaked into the current-person peer pool.
+        server_rows.append(weekly_server_row(week_end, "5050 Bar", spg=1_000.0))
+    location_rows = [weekly_location_row(week_end) for week_end in week_ends]
+
+    model = metrics.build_performance_consistency_model(
+        server_rows,
+        location_rows,
+        one_location_config(),
+    )
+
+    assert "5050 Bar" not in {
+        row["display_name"] for row in model["summary_rows"]  # type: ignore[index]
+    }
+    assert "5050 Bar" not in {
+        row["display_name"] for row in model["detail_rows"]  # type: ignore[index]
+    }
+    taylor_details = [
+        row
+        for row in model["detail_rows"]  # type: ignore[index]
+        if row["display_name"] == "Taylor Guest"
+    ]
+    assert len(taylor_details) == 8
+    assert {row["distinct_peer_count"] for row in taylor_details} == {5}
+    assert {row["peer_spg"] for row in taylor_details} == {100.0}
+    assert row_for(model, "Taylor Guest")["average_spg_gap"] == pytest.approx(0.0)
+
+
+def test_historical_shared_pos_alias_is_absent_from_row_lookup_and_peer_pool() -> None:
+    first = date(2026, 6, 21)
+    week_ends = [first + timedelta(days=7 * offset) for offset in range(8)]
+    server_rows: list[dict[str, object]] = []
+    for week_end in week_ends:
+        server_rows.append(weekly_server_row(week_end, "Taylor Guest", spg=100.0))
+        for peer_number, peer_spg in enumerate((80, 90, 110, 120), start=1):
+            server_rows.append(
+                weekly_server_row(
+                    week_end,
+                    f"Peer {peer_number}",
+                    spg=float(peer_spg),
+                )
+            )
+        alias = weekly_server_row(week_end, "Alex Guest", spg=100.0)
+        if week_end == week_ends[0]:
+            alias["display_name"] = "5050 Bar"
+            alias["check_average"] = 1_000.0
+            alias["gross_sales"] = 50_000.0
+        server_rows.append(alias)
+    location_rows = [weekly_location_row(week_end) for week_end in week_ends]
+    config = one_location_config()
+    config["management_peer_reference"][  # type: ignore[index]
+        "min_distinct_peers_per_week"
+    ] = 4
+
+    model = metrics.build_performance_consistency_model(
+        server_rows,
+        location_rows,
+        config,
+    )
+
+    alex_details = [
+        row
+        for row in model["detail_rows"]  # type: ignore[index]
+        if row["raw_user_name"] == "Alex Guest"
+    ]
+    assert len(alex_details) == 7
+    assert week_ends[0] not in {row["week_end"] for row in alex_details}
+    first_taylor = next(
+        row
+        for row in model["detail_rows"]  # type: ignore[index]
+        if row["display_name"] == "Taylor Guest" and row["week_end"] == week_ends[0]
+    )
+    assert first_taylor["distinct_peer_count"] == 4
+    assert first_taylor["peer_spg"] == pytest.approx(100.0)
+    assert first_taylor["spg_gap"] == pytest.approx(0.0)
 
 
 def test_confidence_gates_include_the_exact_six_200_and_four_150_boundaries() -> None:

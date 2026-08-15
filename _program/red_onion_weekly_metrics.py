@@ -2570,6 +2570,26 @@ def row_matches_name_patterns(row: dict[str, Any], patterns: Iterable[Any]) -> b
     return any(str(pattern).casefold() in haystack for pattern in patterns)
 
 
+def row_matches_weekly_area_patterns(
+    row: dict[str, Any], patterns: Iterable[Any]
+) -> bool:
+    """Match configured area labels as literal whole tokens or phrases."""
+
+    names = (
+        "" if is_blank(row.get(field)) else str(row.get(field)).casefold()
+        for field in ("raw_user_name", "display_name")
+    )
+    normalized_names = tuple(names)
+    for pattern in patterns:
+        phrase = str(pattern).strip().casefold()
+        if not phrase:
+            continue
+        token_phrase = re.compile(rf"(?<!\w){re.escape(phrase)}(?!\w)")
+        if any(token_phrase.search(name) for name in normalized_names):
+            return True
+    return False
+
+
 def dashboard_exclusion_patterns(config: dict[str, Any]) -> list[Any]:
     patterns: list[Any] = []
     for key in ("dashboard_exclude_name_contains", "public_exclude_name_contains"):
@@ -5314,7 +5334,7 @@ def weekly_area_for_row(
     )
     # Specific multi-word concepts precede broader matches such as Bar.
     for area in ("Wine Dinners", "Patio", "Banquets", "Bar", "Dining Room"):
-        if row_matches_name_patterns(row, patterns.get(area, [])):
+        if row_matches_weekly_area_patterns(row, patterns.get(area, [])):
             return area
     # Remaining dashboard-eligible named people are the dining-room population.
     # Managers, takeout, generic placeholders, and other excluded identities are
@@ -5723,6 +5743,7 @@ def build_performance_consistency_model(
         row
         for row in weekly_server_rows
         if row["week_end"] == latest_complete_week_end
+        and shared_pos_number(row) is None
         and not dashboard_excluded(row, config)
     ]
     roster = {
@@ -5733,7 +5754,9 @@ def build_performance_consistency_model(
     row_lookup = {
         (row["week_end"], str(row["location"]), str(row["raw_user_name"])): row
         for row in weekly_server_rows
-        if row["week_end"] in selected_weeks and not dashboard_excluded(row, config)
+        if row["week_end"] in selected_weeks
+        and shared_pos_number(row) is None
+        and not dashboard_excluded(row, config)
     }
     qualified_peer_pool: dict[tuple[date, str], list[dict[str, Any]]] = defaultdict(list)
     for row in weekly_server_rows:
@@ -5741,6 +5764,7 @@ def build_performance_consistency_model(
         if (
             row["week_end"] in selected_weeks
             and identity in roster
+            and shared_pos_number(row) is None
             and not dashboard_excluded(row, config)
             and dashboard_trend_eligible(row, config)
         ):
