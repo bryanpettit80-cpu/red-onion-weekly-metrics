@@ -3403,6 +3403,92 @@ def test_successful_staged_run_chains_manifest_snapshots_outputs_and_deletes_sou
     }
 
 
+def test_post_anchor_status_failure_still_persists_terminal_success_attempt(
+    tmp_path: Path,
+    valid_master_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_args = workflow_args(tmp_path, initialize_baseline=True)
+    metrics.run(baseline_args)
+
+    args = workflow_args(tmp_path)
+    input_dir = Path(args.input_dir)
+    input_dir.mkdir(parents=True)
+    source = input_dir / "Daily Report - TM - 07-21-2026.xlsx"
+    source.write_bytes(b"post-anchor-status-failure")
+    install_synthetic_parser(monkeypatch)
+
+    def write_valid_master(
+        records: list[metrics.MetricRecord],
+        output_path: Path,
+        config: dict,
+        source_dir: Path,
+        public_start: date,
+        public_end: date,
+    ) -> Path:
+        shutil.copy2(valid_master_template, output_path)
+        return output_path
+
+    monkeypatch.setattr(metrics, "write_master_workbook", write_valid_master)
+    original_write = metrics.RunAttemptRecorder.write
+    failed_run_ids: list[str] = []
+    committed_message = (
+        "Integrity manifest and trusted anchor verified; exact local publication "
+        "is complete."
+    )
+
+    def fail_exact_post_anchor_stage_once(
+        recorder: metrics.RunAttemptRecorder,
+    ) -> None:
+        if recorder.message == committed_message and not failed_run_ids:
+            failed_run_ids.append(recorder.run_id)
+            raise PermissionError("simulated post-anchor status persistence failure")
+        original_write(recorder)
+
+    monkeypatch.setattr(
+        metrics.RunAttemptRecorder,
+        "write",
+        fail_exact_post_anchor_stage_once,
+    )
+
+    generated = metrics.run(args)
+
+    assert failed_run_ids
+    assert not source.exists()
+    assert {path.name for path in generated} == {
+        f"Check_Wine_RVA{ACTIVE_WEEK_END:%m%d%y}.xlsx",
+        "Red_Onion_Server_Master.xlsx",
+    }
+    attempt_payloads = [
+        integrity.read_json_manifest(path)
+        for path in (
+            Path(args.archive_dir) / metrics.RUN_ATTEMPT_FOLDER
+        ).glob("*.json")
+    ]
+    weekly_attempt = next(
+        payload
+        for payload in attempt_payloads
+        if payload["operation"] == "weekly-run"
+    )
+    assert weekly_attempt["run_id"] == failed_run_ids[0]
+    assert weekly_attempt["outcome"] == "Success"
+    assert weekly_attempt["stage"] == "Complete"
+    assert weekly_attempt["completed_at_utc"] is not None
+    assert weekly_attempt["readiness"]["integrity"] == "Ready"
+    assert weekly_attempt["readiness"]["workbook"] == "Ready"
+    assert weekly_attempt["readiness"]["distribution"] == "Ready"
+    assert "simulated post-anchor" in weekly_attempt["details"][
+        "post_commit_status_write_warning"
+    ]
+    status = (
+        Path(args.output_dir) / metrics.LAST_RUN_STATUS_FILE
+    ).read_text(encoding="utf-8")
+    assert "Outcome: Success" in status
+    assert "Stage: Complete" in status
+    trusted_manifest, _ = metrics.verify_integrity_anchor(Path(args.archive_dir))
+    assert integrity.read_json_manifest(trusted_manifest)["run_id"] == failed_run_ids[0]
+
+
 def test_raw_archive_tampering_fails_preflight_before_writers_or_source_deletion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

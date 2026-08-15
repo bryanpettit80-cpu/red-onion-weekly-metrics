@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
+
+
+_OPERATIONAL_STATUS_REPLACE_RETRY_DELAYS = (0.05, 0.15)
 
 
 class RunStage(str, Enum):
@@ -109,6 +114,151 @@ def write_text_atomic(path: Path, text: str) -> Path:
     return path
 
 
+def _verify_operational_status_bytes(path: Path, expected: bytes) -> None:
+    persisted = path.read_bytes()
+    if persisted != expected:
+        raise OSError(
+            f"Operational status verification failed after writing {path}."
+        )
+
+
+def _assert_opened_operational_status_identity(path: Path, handle: Any) -> None:
+    path_stat = os.lstat(path)
+    opened_stat = os.fstat(handle.fileno())
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise OSError(
+            f"Refusing in-place operational status rewrite through a link: {path}"
+        )
+    if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(opened_stat.st_mode):
+        raise OSError(
+            f"Operational status fallback requires a regular file: {path}"
+        )
+    if path_stat.st_nlink != 1 or opened_stat.st_nlink != 1:
+        raise OSError(
+            "Operational status fallback requires exactly one filesystem link: "
+            f"{path}"
+        )
+    path_identity = (path_stat.st_dev, path_stat.st_ino)
+    opened_identity = (opened_stat.st_dev, opened_stat.st_ino)
+    if path_identity != opened_identity:
+        raise OSError(
+            f"Operational status destination changed while it was opened: {path}"
+        )
+
+
+def _rewrite_existing_operational_status(path: Path, content: bytes) -> None:
+    """Rewrite an existing status file when a cloud placeholder blocks replace."""
+
+    # A Dropbox placeholder is a regular file reparse point. Reject actual links so
+    # the narrowly scoped fallback cannot be redirected outside the managed path.
+    if path.is_symlink():
+        raise OSError(
+            f"Refusing in-place operational status rewrite through a link: {path}"
+        )
+    with path.open("r+b") as handle:
+        _assert_opened_operational_status_identity(path, handle)
+        handle.seek(0)
+        handle.write(content)
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+    _verify_operational_status_bytes(path, content)
+
+
+def _hydrate_operational_status_for_retry(path: Path) -> None:
+    if path.is_symlink():
+        raise OSError(
+            f"Refusing operational status replacement through a link: {path}"
+        )
+    try:
+        with path.open("rb") as handle:
+            handle.read(1)
+    except OSError:
+        # A bounded replace retry can still succeed if the placeholder disappeared
+        # between checks. If it does not, the verified fallback reports its own error.
+        pass
+
+
+def _write_operational_status_bytes(path: Path, content: bytes) -> Path:
+    """Persist a run-status artifact despite an existing cloud-placeholder race.
+
+    Run-attempt JSON and LAST RUN STATUS are operational status artifacts that are
+    rewritten at every stage. They normally retain the same atomic replace behavior
+    as other writers. Some Dropbox Windows placeholders reject replacing an existing
+    reparse-point destination with ``PermissionError``. Only for an already-existing,
+    single-link regular operational status file, fall back to an fsynced in-place
+    rewrite and verify the exact persisted bytes. Critical workbook, manifest,
+    anchor, and other general atomic writers do not use this helper.
+    """
+
+    path = path.absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    destination_existed = path.is_file()
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(temporary, path)
+        except PermissionError as replace_error:
+            if not destination_existed:
+                raise
+            for delay in _OPERATIONAL_STATUS_REPLACE_RETRY_DELAYS:
+                _hydrate_operational_status_for_retry(path)
+                time.sleep(delay)
+                try:
+                    os.replace(temporary, path)
+                except PermissionError as retry_error:
+                    replace_error = retry_error
+                else:
+                    temporary = None
+                    _verify_operational_status_bytes(path, content)
+                    break
+            else:
+                try:
+                    _rewrite_existing_operational_status(path, content)
+                except OSError as fallback_error:
+                    raise fallback_error from replace_error
+        else:
+            temporary = None
+            _verify_operational_status_bytes(path, content)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    return path
+
+
+def write_operational_json(path: Path, payload: Mapping[str, Any]) -> Path:
+    serialized = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return _write_operational_status_bytes(path, serialized)
+
+
+def write_operational_text(path: Path, text: str) -> Path:
+    serialized = (text.rstrip() + "\n").encode("utf-8")
+    return _write_operational_status_bytes(path, serialized)
+
+
 @dataclass
 class RunAttemptRecorder:
     run_id: str
@@ -193,9 +343,9 @@ class RunAttemptRecorder:
         return "\n".join(lines)
 
     def write(self) -> None:
-        write_json_atomic(self.attempt_path, self.payload())
+        write_operational_json(self.attempt_path, self.payload())
         if self.status_path is not None:
-            write_text_atomic(self.status_path, self._status_text())
+            write_operational_text(self.status_path, self._status_text())
 
     def update(
         self,
@@ -231,16 +381,16 @@ class RunAttemptRecorder:
         # The attempt log is the authoritative post-commit result. A human-readable
         # status-file refresh is useful but must not turn an already committed
         # publication and manifest into a reported operational failure.
-        write_json_atomic(self.attempt_path, self.payload())
+        write_operational_json(self.attempt_path, self.payload())
         if self.status_path is not None:
             try:
-                write_text_atomic(self.status_path, self._status_text())
+                write_operational_text(self.status_path, self._status_text())
             except OSError as exc:
                 self.details["last_run_status_write_warning"] = safe_message(
                     f"{type(exc).__name__}: {exc}"
                 )
                 try:
-                    write_json_atomic(self.attempt_path, self.payload())
+                    write_operational_json(self.attempt_path, self.payload())
                 except OSError:
                     # The successful attempt was already persisted before the
                     # optional status-file write was attempted.

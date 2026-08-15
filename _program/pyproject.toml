@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "red-onion-weekly-metrics"
-version = "0.5.0"
+version = "0.5.1"
 description = "Red Onion weekly metrics workbook builder"
 requires-python = ">=3.10,<3.13"
 dependencies = [

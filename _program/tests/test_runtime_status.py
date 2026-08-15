@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -96,7 +97,7 @@ def test_success_remains_success_when_final_human_status_write_fails(
     def reject_status_write(path: Path, text: str) -> Path:
         raise PermissionError("status file is open in another application")
 
-    monkeypatch.setattr(runtime, "write_text_atomic", reject_status_write)
+    monkeypatch.setattr(runtime, "write_operational_text", reject_status_write)
 
     recorder.succeed("Publication and manifest committed.")
 
@@ -109,6 +110,242 @@ def test_success_remains_success_when_final_human_status_write_fails(
         "last_run_status_write_warning"
     ]
     assert not status_path.exists()
+
+
+def test_recorder_rewrites_existing_cloud_placeholders_when_replace_is_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt_path = tmp_path / "archive" / "attempt.json"
+    status_path = tmp_path / "output" / metrics.LAST_RUN_STATUS_FILE
+    recorder = RunAttemptRecorder(
+        run_id="run-placeholder-race",
+        operation="weekly-run",
+        attempt_path=attempt_path,
+        status_path=status_path,
+    )
+    recorder.write()
+
+    original_replace = runtime.os.replace
+    denied_destinations: list[Path] = []
+
+    def reject_replacing_existing_status(source: object, destination: object) -> None:
+        destination_path = Path(destination)
+        if (
+            destination_path in {attempt_path, status_path}
+            and destination_path.exists()
+        ):
+            denied_destinations.append(destination_path)
+            raise PermissionError(13, "cloud placeholder rejected replace", destination)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(runtime.os, "replace", reject_replacing_existing_status)
+    monkeypatch.setattr(runtime.time, "sleep", lambda delay: None)
+
+    recorder.update(
+        RunStage.PUBLISHING,
+        "Publishing verified bytes.",
+        readiness={"distribution": RunReadiness.RUNNING},
+    )
+    recorder.succeed("Publication and manifest committed.")
+
+    payload = json.loads(attempt_path.read_text(encoding="utf-8"))
+    assert payload["outcome"] == "Success"
+    assert payload["stage"] == "Complete"
+    assert payload["completed_at_utc"] is not None
+    assert "Outcome: Success" in status_path.read_text(encoding="utf-8")
+    retries_per_write = 1 + len(runtime._OPERATIONAL_STATUS_REPLACE_RETRY_DELAYS)
+    assert denied_destinations.count(attempt_path) == 2 * retries_per_write
+    assert denied_destinations.count(status_path) == 2 * retries_per_write
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_operational_status_first_write_permission_error_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "new-status.txt"
+
+    def reject_replace(source: object, destination: object) -> None:
+        raise PermissionError(13, "destination rejected replace", destination)
+
+    monkeypatch.setattr(runtime.os, "replace", reject_replace)
+
+    with pytest.raises(PermissionError, match="destination rejected replace"):
+        runtime.write_operational_text(status_path, "Running")
+
+    assert not status_path.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_operational_status_retries_atomic_replace_before_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.txt"
+    status_path.write_text("Running\n", encoding="utf-8")
+    original_replace = runtime.os.replace
+    replace_attempts = 0
+    delays: list[float] = []
+
+    def transient_placeholder_race(source: object, destination: object) -> None:
+        nonlocal replace_attempts
+        replace_attempts += 1
+        if replace_attempts < 3:
+            raise PermissionError(13, "cloud placeholder rejected replace", destination)
+        original_replace(source, destination)
+
+    def reject_fallback(path: Path, content: bytes) -> None:
+        raise AssertionError("in-place fallback should not run after a successful retry")
+
+    monkeypatch.setattr(runtime.os, "replace", transient_placeholder_race)
+    monkeypatch.setattr(runtime.time, "sleep", delays.append)
+    monkeypatch.setattr(
+        runtime,
+        "_rewrite_existing_operational_status",
+        reject_fallback,
+    )
+
+    runtime.write_operational_text(status_path, "Success")
+
+    assert status_path.read_bytes() == b"Success\n"
+    assert replace_attempts == 3
+    assert delays == list(runtime._OPERATIONAL_STATUS_REPLACE_RETRY_DELAYS)
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_operational_status_fallback_failure_propagates_and_cleans_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.txt"
+    original = b"Running\n"
+    status_path.write_bytes(original)
+    original_open = runtime.Path.open
+
+    def reject_replace(source: object, destination: object) -> None:
+        raise PermissionError(13, "cloud placeholder rejected replace", destination)
+
+    def reject_destination_open(
+        path: Path,
+        mode: str = "r",
+        *args: object,
+        **kwargs: object,
+    ):
+        if path == status_path and mode == "r+b":
+            raise PermissionError(13, "cloud placeholder remained unavailable", path)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.os, "replace", reject_replace)
+    monkeypatch.setattr(runtime.time, "sleep", lambda delay: None)
+    monkeypatch.setattr(runtime.Path, "open", reject_destination_open)
+
+    with pytest.raises(PermissionError, match="remained unavailable"):
+        runtime.write_operational_text(status_path, "Success")
+
+    with original_open(status_path, "rb") as handle:
+        assert handle.read() == original
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_operational_status_fallback_rejects_link_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.txt"
+    status_path.write_text("Running\n", encoding="utf-8")
+    original = status_path.read_bytes()
+    original_is_symlink = runtime.Path.is_symlink
+
+    def reject_replace(source: object, destination: object) -> None:
+        raise PermissionError(13, "destination rejected replace", destination)
+
+    def report_managed_status_as_link(path: Path) -> bool:
+        return path == status_path or original_is_symlink(path)
+
+    monkeypatch.setattr(runtime.os, "replace", reject_replace)
+    monkeypatch.setattr(runtime.Path, "is_symlink", report_managed_status_as_link)
+
+    with pytest.raises(OSError, match="through a link"):
+        runtime.write_operational_text(status_path, "Success")
+
+    assert status_path.read_bytes() == original
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_operational_status_fallback_rejects_hard_link_without_mutating_victim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    victim = tmp_path / "victim.txt"
+    victim_bytes = b"do-not-change\n"
+    victim.write_bytes(victim_bytes)
+    status_path = tmp_path / "status.txt"
+    os.link(victim, status_path)
+
+    def reject_replace(source: object, destination: object) -> None:
+        raise PermissionError(13, "destination rejected replace", destination)
+
+    monkeypatch.setattr(runtime.os, "replace", reject_replace)
+    monkeypatch.setattr(runtime.time, "sleep", lambda delay: None)
+
+    with pytest.raises(OSError, match="exactly one filesystem link"):
+        runtime.write_operational_text(status_path, "Success")
+
+    assert victim.read_bytes() == victim_bytes
+    assert status_path.read_bytes() == victim_bytes
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_operational_status_fallback_rejects_opened_file_identity_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.txt"
+    original = b"Running\n"
+    status_path.write_bytes(original)
+    other_path = tmp_path / "other.txt"
+    other_path.write_bytes(b"Other\n")
+    original_lstat = runtime.os.lstat
+
+    def reject_replace(source: object, destination: object) -> None:
+        raise PermissionError(13, "destination rejected replace", destination)
+
+    def report_different_identity(path: object):
+        if Path(path) == status_path:
+            return original_lstat(other_path)
+        return original_lstat(path)
+
+    monkeypatch.setattr(runtime.os, "replace", reject_replace)
+    monkeypatch.setattr(runtime.os, "lstat", report_different_identity)
+    monkeypatch.setattr(runtime.time, "sleep", lambda delay: None)
+
+    with pytest.raises(OSError, match="changed while it was opened"):
+        runtime.write_operational_text(status_path, "Success")
+
+    assert status_path.read_bytes() == original
+    assert other_path.read_bytes() == b"Other\n"
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_general_atomic_writer_does_not_use_operational_status_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "critical.json"
+    original = b'{"state": "old"}\n'
+    destination.write_bytes(original)
+
+    def reject_replace(source: object, target: object) -> None:
+        raise PermissionError(13, "destination rejected replace", target)
+
+    monkeypatch.setattr(runtime.os, "replace", reject_replace)
+
+    with pytest.raises(PermissionError, match="destination rejected replace"):
+        runtime.write_json_atomic(destination, {"state": "new"})
+
+    assert destination.read_bytes() == original
+    assert not list(tmp_path.rglob("*.tmp"))
 
 
 def test_failed_attempt_preserves_safe_error_without_recovery_claim(tmp_path: Path) -> None:
