@@ -18900,6 +18900,45 @@ def record_run_stage(
         )
 
 
+def record_post_commit_run_stage(
+    args: argparse.Namespace,
+    stage: RunStage,
+    message: str,
+    *,
+    readiness: dict[str, RunReadiness | str] | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Record advisory progress after the manifest and trusted anchor committed."""
+
+    recorder = getattr(args, "_run_attempt_recorder", None)
+    if not isinstance(recorder, RunAttemptRecorder):
+        return
+    try:
+        recorder.update(
+            stage,
+            message,
+            readiness=readiness,
+            details=details,
+        )
+    except OSError as exc:
+        # Publication is already committed. Preserve the intended in-memory state so
+        # run() can make the authoritative terminal Success/Complete write next.
+        recorder.stage = stage
+        recorder.message = safe_message(message)
+        if readiness:
+            recorder.readiness.update(
+                {
+                    key: value.value if isinstance(value, RunReadiness) else str(value)
+                    for key, value in readiness.items()
+                }
+            )
+        if details:
+            recorder.details.update(dict(details))
+        recorder.details["post_commit_status_write_warning"] = safe_message(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 def nearest_existing_directory(path: Path) -> Path:
     candidate = path.absolute()
     while not candidate.exists() and candidate.parent != candidate:
@@ -19570,7 +19609,7 @@ def _run_with_lock_held(args: argparse.Namespace) -> list[Path]:
             # status-reporting or intake-cleanup failure must not roll back outputs while
             # leaving the independently stored anchor pointed at a removed manifest.
             manifest_committed = True
-            record_run_stage(
+            record_post_commit_run_stage(
                 args,
                 RunStage.COMMITTING_MANIFEST,
                 (
