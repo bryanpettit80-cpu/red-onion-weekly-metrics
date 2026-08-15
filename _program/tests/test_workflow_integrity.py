@@ -2887,6 +2887,113 @@ def test_evidence_export_stages_current_consolidated_workbook(
     assert package["source"]["workbook_generated_content_sha256"] == expected_digest
 
 
+def test_evidence_export_accepts_empty_consolidated_current_action_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "02 Finished Reports"
+    archive_dir = tmp_path / "03 Archive"
+    output_dir.mkdir()
+    archive_dir.mkdir()
+    master = output_dir / "Red_Onion_Server_Master.xlsx"
+    config = metrics.load_config(tmp_path / "missing-config.json")
+    records = [
+        metrics.MetricRecord(
+            source_file=f"{location}-{day.isoformat()}.xlsx",
+            report_date=day,
+            location=location,
+            raw_user_name="",
+            display_name="",
+            is_location_total=True,
+            gross_sales=1000.0,
+            guest_count=50.0,
+            check_count=25.0,
+            check_average=40.0,
+            wine_sales=100.0,
+            wine_pct=0.10,
+            rate_of_sale_by_guest_count=0.20,
+            average_ticket_time_seconds=600.0,
+        )
+        for offset in range((ACTIVE_WEEK_END - ACTIVE_DAY).days + 1)
+        for day in [ACTIVE_DAY + timedelta(days=offset)]
+        for location in config["locations"]
+    ]
+    metrics.write_master_workbook(
+        records,
+        master,
+        config,
+        tmp_path / "source",
+        ACTIVE_DAY,
+        ACTIVE_WEEK_END,
+    )
+
+    workbook = load_workbook(master, data_only=False)
+    try:
+        center = workbook[metrics.MANAGEMENT_CENTER_SHEET]
+        assert metrics.OWNER_ROSTER_TABLE_NAME in center.tables
+        assert "ActionBoardTable" not in center.tables
+        action_header_row = metrics.management_center_current_action_header_row(center)
+        assert action_header_row is not None
+        assert [
+            center.cell(row=action_header_row, column=column).value
+            for column in range(1, len(metrics.ACTION_HEADERS) + 1)
+        ] == metrics.ACTION_HEADERS
+    finally:
+        workbook.close()
+
+    expected_digest = metrics.verify_existing_management_workbook_integrity(master)
+    manifest = archive_dir / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    manifest_sha256 = "a" * 64
+    manifest_payload = {
+        "run_id": "empty-current-action-run",
+        "created_at_utc": "2026-08-15T12:00:00+00:00",
+        "master_generated_content_sha256": expected_digest,
+        "_master_generated_content_digest_scheme": metrics.WORKBOOK_DIGEST_SCHEME,
+        "provenance": {
+            "git": {"commit": "b" * 40},
+            "effective_config_sha256": "c" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        metrics,
+        "latest_integrity_manifest_path",
+        lambda archive: manifest,
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_anchor",
+        lambda archive, anchor: (manifest.resolve(), manifest_sha256),
+    )
+    monkeypatch.setattr(
+        metrics,
+        "verify_integrity_state",
+        lambda archive, output, selected_manifest: (
+            manifest_payload,
+            manifest_sha256,
+        ),
+    )
+
+    candidate = tmp_path / "empty-management-evidence.json"
+    paths = metrics.stage_management_evidence(
+        Namespace(
+            output_dir=str(output_dir),
+            archive_dir=str(archive_dir),
+            integrity_anchor_dir=str(tmp_path / "anchors"),
+        ),
+        candidate,
+    )
+
+    assert paths == [
+        candidate,
+        metrics.evidence_fingerprint_path(candidate),
+        metrics.evidence_approval_template_path(candidate),
+    ]
+    package = integrity.read_json_manifest(candidate)
+    assert package["records"] == []
+    assert package["source"]["workbook_generated_content_sha256"] == expected_digest
+
+
 def test_v2_evidence_export_rejects_legacy_action_schema(
     tmp_path: Path,
     valid_master_template: Path,

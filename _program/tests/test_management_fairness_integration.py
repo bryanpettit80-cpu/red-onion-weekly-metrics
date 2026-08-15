@@ -179,6 +179,130 @@ def test_rank_and_excluded_rows_cannot_change_a_person_signal() -> None:
     assert changed["average_rank_movement"] is None
 
 
+def test_shared_pos_rows_stay_aggregate_only_and_out_of_management_peers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows, locations, config = synthetic_history()
+    baseline = focal_result(rows, locations, config)
+    contaminated = deepcopy(rows)
+    shared_numbers = (
+        "1010",
+        "2020",
+        "3030",
+        "4040",
+        "5050",
+        "6060",
+        "7070",
+        "8080",
+    )
+    for week_end in sorted({row["week_end"] for row in locations}):
+        for number in shared_numbers:
+            contaminated.append(
+                weekly_row(
+                    week_end,
+                    f"{number} Shared",
+                    check_average=1_000.0,
+                    wine_pct=0.95,
+                    rate=0.001,
+                    ticket_seconds=10.0,
+                )
+            )
+    config["weekly_shared_number_areas"] = {
+        "5050": "Bar",
+        "7070": "Wine Dinners",
+    }
+
+    observed_peer_ids: set[str] = set()
+    original_reference = metrics.leave_one_out_same_store_peer_reference
+
+    def capture_peer_observations(observations, *args, **kwargs):
+        observations = list(observations)
+        observed_peer_ids.update(observation.person_id for observation in observations)
+        return original_reference(observations, *args, **kwargs)
+
+    monkeypatch.setattr(
+        metrics,
+        "leave_one_out_same_store_peer_reference",
+        capture_peer_observations,
+    )
+
+    management_rows = metrics.management_server_rows(
+        contaminated,
+        locations,
+        [],
+        {},
+        config,
+    )
+    changed = next(
+        row for row in management_rows if row["raw_user_name"] == "entity-focus"
+    )
+
+    assert all(metrics.shared_pos_number(row) is None for row in management_rows)
+    assert all(
+        metrics.shared_pos_number({"raw_user_name": person_id}) is None
+        for person_id in observed_peer_ids
+    )
+    for field in (
+        "action",
+        "momentum",
+        "performance_level",
+        "candidate_polarity",
+        "composite_score",
+        "peer_composite_score",
+        "benchmark_values",
+        "peer_cohort_size",
+        "peer_server_weeks",
+    ):
+        assert changed[field] == baseline[field]
+
+    aggregate_model = metrics.build_shared_area_trends_model(
+        contaminated,
+        locations,
+        config,
+    )
+    assert {row["shared_number"] for row in aggregate_model["shared_rows"]} == set(
+        shared_numbers
+    )
+    area_rows = {
+        (row["location"], row["area"]): row
+        for row in aggregate_model["area_rows"]
+    }
+    assert area_rows[("RC Richmond", "Bar")]["latest_check_average"] == 1_000.0
+    assert (
+        area_rows[("RC Richmond", "Wine Dinners")]["latest_check_average"]
+        == 1_000.0
+    )
+
+
+def test_shared_only_latest_week_does_not_surface_stale_people_reviews() -> None:
+    rows, locations, config = synthetic_history()
+    latest_week_end = max(row["week_end"] for row in rows)
+    shared_only_latest = [
+        row for row in rows if row["week_end"] < latest_week_end
+    ]
+    shared_only_latest.append(
+        weekly_row(
+            latest_week_end,
+            "5050 Bar",
+            check_average=40.0,
+            wine_pct=0.20,
+            rate=0.10,
+            ticket_seconds=3_000.0,
+        )
+    )
+
+    assert (
+        metrics.management_server_rows(
+            shared_only_latest,
+            locations,
+            [],
+            {},
+            config,
+        )
+        == []
+    )
+
+
 def test_person_targets_do_not_replace_leave_one_out_peer_reference() -> None:
     rows, locations, config = synthetic_history()
     baseline = focal_result(rows, locations, config)
