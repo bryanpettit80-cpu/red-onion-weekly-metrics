@@ -27,8 +27,15 @@ def test_release_preflight_runs_before_any_runtime_mutation() -> None:
     assert 'refs/remotes/origin/main^{commit}' in launcher
     assert "function Assert-NoSourceBytecode" in launcher
     assert 'Where-Object { $_.Extension -in @(".pyc", ".pyo") }' in launcher
+    assert "-ErrorAction Stop" in launcher
+    assert "could not be completely inspected" in launcher
     assert 'PYTHONDONTWRITEBYTECODE = "1"' in launcher
     assert "PYTHONPYCACHEPREFIX" in launcher
+    assert "Invoke-IsolatedPythonSourceProgram" in launcher
+    assert "Refusing sourceless bytecode import" in launcher
+    assert 'return @("py", $PythonSelector, "-I", "-B")' in launcher
+    assert 'return @("python", "-I", "-B")' in launcher
+    assert '& $VenvPython -I -B -m pip check' in launcher
     preflight_call = launcher.index(
         "if ($IsDeployedCheckout) {\n    Assert-DeployedRelease"
     )
@@ -48,7 +55,9 @@ def test_release_preflight_runs_before_any_runtime_mutation() -> None:
     assert "[string]$RebindRestoredIntegrityAnchor" in launcher
     assert "environment-state.json" in launcher
     assert "red_onion_config.py" in launcher
-    config_preflight = launcher.index("$ValidationExitCode = Invoke-PythonLauncher")
+    config_preflight = launcher.index(
+        "$ValidationExitCode = Invoke-IsolatedPythonSourceProgram"
+    )
     assert config_preflight < launcher.index(
         "foreach ($dir in @($InputDir, $OutputDir, $ArchiveDir))"
     )
@@ -68,13 +77,13 @@ def test_environment_reuse_verifies_every_locked_dependency_pin() -> None:
 
     assert "$InstallRequirementsPath" in launcher
     assert (
-        "$VenvPython -B -c $VerifyScript $InstallRequirementsPath"
+        "$VenvPython -I -B -c $VerifyScript $InstallRequirementsPath"
         in compact_launcher
     )
     assert "x.split('==',1)[1].strip().split()[0]" in launcher
     assert "m.distributions()" in launcher
     assert (
-        "$VenvPython -B -c $VerifyScript $DirectRequirementsPath"
+        "$VenvPython -I -B -c $VerifyScript $DirectRequirementsPath"
         not in compact_launcher
     )
 
@@ -231,6 +240,106 @@ def test_clean_main_deployment_at_local_origin_main_runs(
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Verified deployed release: main at" in result.stdout
     assert (tmp_path / "01 Daily Reports - Drop Here").is_dir()
+
+
+@pytest.mark.skipif(
+    not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
+    reason="Windows PowerShell and Git required",
+)
+def test_deployed_checkout_isolates_caller_working_directory_bytecode(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
+    launcher = _write_minimal_runner(repository_root)
+    (repository_root / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+    _initialize_release_checkout(repository_root)
+
+    execution_marker = tmp_path / "working-directory-bytecode-executed.txt"
+    malicious_source = tmp_path / "attacker_json.py"
+    malicious_source.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(execution_marker)!r}).write_text("
+        "'executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    py_compile.compile(
+        str(malicious_source),
+        cfile=str(repository_root / "json.pyc"),
+        doraise=True,
+    )
+    assert _git(repository_root, "status", "--porcelain=v1").stdout == ""
+
+    capture_path = tmp_path / "isolated-arguments.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    result = _run_launcher(launcher, environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert capture_path.exists()
+    assert not execution_marker.exists()
+
+
+@pytest.mark.skipif(
+    not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
+    reason="Windows PowerShell and Git required",
+)
+def test_source_bootstrap_rejects_bytecode_added_after_initial_preflight(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
+    launcher = _write_minimal_runner(repository_root)
+    program_path = launcher.parent / "red_onion_weekly_metrics.py"
+    program_path.write_text(
+        """from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+if "--validate-config" in sys.argv:
+    shutil.copy2(
+        os.environ["RED_ONION_LATE_BYTECODE"],
+        Path(__file__).with_name("pandas.pyc"),
+    )
+    raise SystemExit(0)
+
+import pandas
+
+capture_path = os.environ.get("RED_ONION_TEST_ARGUMENTS_PATH")
+if capture_path:
+    Path(capture_path).write_text("invoked", encoding="utf-8")
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    (repository_root / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+    _initialize_release_checkout(repository_root)
+
+    execution_marker = tmp_path / "late-bytecode-executed.txt"
+    malicious_source = tmp_path / "late_attacker_pandas.py"
+    malicious_source.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(execution_marker)!r}).write_text("
+        "'executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    late_bytecode = tmp_path / "late-pandas.pyc"
+    py_compile.compile(
+        str(malicious_source), cfile=str(late_bytecode), doraise=True
+    )
+
+    capture_path = tmp_path / "late-arguments.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_LATE_BYTECODE"] = str(late_bytecode)
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    result = _run_launcher(launcher, environment)
+    normalized_output = " ".join((result.stdout + result.stderr).split())
+
+    assert result.returncode != 0
+    assert "Refusing sourceless bytecode import" in normalized_output
+    assert not capture_path.exists()
+    assert not execution_marker.exists()
 
 
 @pytest.mark.skipif(

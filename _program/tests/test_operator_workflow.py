@@ -460,7 +460,8 @@ def test_launchers_route_to_named_operator_workspace() -> None:
     assert "01 Daily Reports - Drop Here" in powershell_runner
     assert "02 Finished Reports" in powershell_runner
     assert "03 Archive" in powershell_runner
-    assert "$ReportExitCode = $LASTEXITCODE" in powershell_runner
+    assert "$ReportExitCode = Invoke-IsolatedPythonSourceProgram" in powershell_runner
+    assert '-Launcher @($VenvPython, "-I", "-B")' in powershell_runner
     assert "exit $ReportExitCode" in powershell_runner
 
 
