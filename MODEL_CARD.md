@@ -3,7 +3,8 @@
 ## Identity And Status
 
 - **System:** Red Onion Weekly Metrics
-- **Release contract:** `v0.5.2` (descriptive performance/consistency views;
+- **Release contract:** `v0.5.3` (deployed-launcher source-bytecode preflight;
+  descriptive performance/consistency views;
   people-review methodology remains `2026.07-v3`)
 - **Operational status:** protected backfill migration, exact post-migration
   replay, and managed local publication are complete; authorized people-review

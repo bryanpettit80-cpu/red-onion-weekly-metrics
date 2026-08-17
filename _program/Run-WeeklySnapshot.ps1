@@ -28,6 +28,28 @@ function Stop-ReleasePreflight {
     )
 }
 
+function Assert-NoSourceBytecode {
+    # Git intentionally ignores Python bytecode, so a clean status alone cannot
+    # prove that the deployed source directory contains only reviewed code.
+    $BytecodeArtifacts = @(
+        Get-ChildItem -LiteralPath $ProgramDir -Recurse -Force -File |
+            Where-Object { $_.Extension -in @(".pyc", ".pyo") }
+    )
+    if ($BytecodeArtifacts.Count -eq 0) {
+        return
+    }
+
+    $ArtifactPaths = @(
+        $BytecodeArtifacts | ForEach-Object {
+            $_.FullName.Substring($RepositoryRoot.Length).TrimStart("\", "/")
+        }
+    )
+    Stop-ReleasePreflight (
+        "The automation source contains Python bytecode that cannot be verified by Git: " +
+        ($ArtifactPaths -join ", ") + ". Remove the bytecode artifacts before retrying."
+    )
+}
+
 function Invoke-LocalGit {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -101,6 +123,7 @@ function Assert-DeployedRelease {
 
 if ($IsDeployedCheckout) {
     Assert-DeployedRelease
+    Assert-NoSourceBytecode
 }
 
 # -B/PYTHONDONTWRITEBYTECODE prevents this run from creating source-tree

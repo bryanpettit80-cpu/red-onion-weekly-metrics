@@ -336,6 +336,6 @@ evidence are verified separately.
 - Keep dependencies small and listed in `pyproject.toml` and `requirements.txt`.
 - Do not add external services or credentials for the weekly run.
 - Do not commit customer-facing workbooks, Red Onion source files, or archive contents unless explicitly requested.
-- Keep the deployed Dropbox checkout clean, on `main`, and aligned with its local `origin/main`; never add a launcher bypass for the release preflight.
+- Keep the deployed Dropbox checkout clean, on `main`, aligned with its local `origin/main`, and free of ignored `.pyc`/`.pyo` files under `_program`; never add a launcher bypass for the release preflight.
 - On personal Dropbox plans, reserve edit access to the automation, archive, and manifests for the stable owner/technical maintainer. Give weekly submitters only the intake access they require and report consumers view-only access to finished reports.
 - Require two-factor authentication and preserve Dropbox version history, while maintaining a separate independently retained backup and a documented restore test outside this repository.
