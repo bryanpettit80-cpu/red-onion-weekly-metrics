@@ -96,7 +96,7 @@ When the repository folder is named exactly `Red Onion Weekly Metrics Automation
 - The checkout is attached to branch `main`.
 - `HEAD` equals the existing local `refs/remotes/origin/main` commit.
 
-The launcher permits existing ignored Python bytecode but isolates each run by disabling bytecode writes and redirecting bytecode lookup to a fresh unused cache path. It does not delete those files, fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root.
+The deployed launcher rejects ignored `.pyc` and `.pyo` files under `_program`. It also starts Python in isolated mode and uses a source-only loader that compiles reviewed `.py` files directly, so neither the caller's working directory nor a late-arriving adjacent or `__pycache__` bytecode file can supply executable code. It does not delete those files, fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root.
 
 ## Operational Context And Person-Action Scope
 
@@ -336,6 +336,6 @@ evidence are verified separately.
 - Keep dependencies small and listed in `pyproject.toml` and `requirements.txt`.
 - Do not add external services or credentials for the weekly run.
 - Do not commit customer-facing workbooks, Red Onion source files, or archive contents unless explicitly requested.
-- Keep the deployed Dropbox checkout clean, on `main`, and aligned with its local `origin/main`; never add a launcher bypass for the release preflight.
+- Keep the deployed Dropbox checkout clean, on `main`, aligned with its local `origin/main`, and free of ignored `.pyc`/`.pyo` files under `_program`; preserve both isolated Python startup and the source-program import guard, and never add a launcher bypass for the release preflight.
 - On personal Dropbox plans, reserve edit access to the automation, archive, and manifests for the stable owner/technical maintainer. Give weekly submitters only the intake access they require and report consumers view-only access to finished reports.
 - Require two-factor authentication and preserve Dropbox version history, while maintaining a separate independently retained backup and a documented restore test outside this repository.

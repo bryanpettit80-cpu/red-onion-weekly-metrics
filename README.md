@@ -26,7 +26,7 @@ Red Onion Metrics\
 2. Double-click `Run Weekly Snapshot.cmd`.
 3. Open the generated workbooks in `02 Finished Reports`.
 
-In the named Dropbox deployment, the launcher first verifies that `Red Onion Weekly Metrics Automation` is a clean Git checkout on `main` and that `HEAD` matches the checkout's local `origin/main` reference. A failed release check stops before the run creates folders, installs packages, builds workbooks, or moves source files. The check is intentionally local and does not fetch from GitHub; a technical maintainer must update and verify the deployed checkout as a separate release step.
+In the named Dropbox deployment, the launcher first verifies that `Red Onion Weekly Metrics Automation` is a clean Git checkout on `main`, that `HEAD` matches the checkout's local `origin/main` reference, and that `_program` contains no ignored `.pyc` or `.pyo` files that could bypass Git review. Python then runs in isolated mode with a source-program import guard that rejects sourceless bytecode even if it appears after the preflight. A failed release check stops before the run creates folders, installs packages, builds workbooks, or moves source files. The check is intentionally local and does not fetch from GitHub; a technical maintainer must update and verify the deployed checkout as a separate release step.
 
 The report files should be named like:
 

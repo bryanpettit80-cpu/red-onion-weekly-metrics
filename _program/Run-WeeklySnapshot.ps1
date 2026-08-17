@@ -28,6 +28,48 @@ function Stop-ReleasePreflight {
     )
 }
 
+function Assert-NoSourceBytecode {
+    # Git intentionally ignores Python bytecode, so a clean status alone cannot
+    # prove that the deployed source directory contains only reviewed code.
+    try {
+        $RepositoryPrefix = (
+            [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
+                [char[]]@("\", "/")
+            ) + [System.IO.Path]::DirectorySeparatorChar
+        )
+        $BytecodeArtifacts = @(
+            Get-ChildItem -LiteralPath $ProgramDir -Recurse -Force -File `
+                -ErrorAction Stop |
+                Where-Object { $_.Extension -in @(".pyc", ".pyo") }
+        )
+        $ArtifactPaths = @(
+            $BytecodeArtifacts | ForEach-Object {
+                $ArtifactFullPath = [System.IO.Path]::GetFullPath($_.FullName)
+                if ($ArtifactFullPath.StartsWith(
+                    $RepositoryPrefix,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $ArtifactFullPath.Substring($RepositoryPrefix.Length)
+                } else {
+                    "[outside repository] $($_.Name)"
+                }
+            }
+        )
+    } catch {
+        Stop-ReleasePreflight (
+            "The automation source could not be completely inspected for " +
+            "unverified Python bytecode ($($_.Exception.GetType().Name))."
+        )
+    }
+    if ($BytecodeArtifacts.Count -eq 0) {
+        return
+    }
+    Stop-ReleasePreflight (
+        "The automation source contains Python bytecode that cannot be verified by Git: " +
+        ($ArtifactPaths -join ", ") + ". Remove the bytecode artifacts before retrying."
+    )
+}
+
 function Invoke-LocalGit {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -101,12 +143,13 @@ function Assert-DeployedRelease {
 
 if ($IsDeployedCheckout) {
     Assert-DeployedRelease
+    Assert-NoSourceBytecode
 }
 
-# -B/PYTHONDONTWRITEBYTECODE prevents this run from creating source-tree
-# bytecode. A fresh, deliberately nonexistent cache prefix also prevents Python
-# from reading a local __pycache__ artifact if one appears after the preflight;
-# -B by itself does not disable bytecode reads.
+# Every Python process uses isolated mode so the caller's working directory and
+# Python environment variables cannot inject imports. -B prevents this run from
+# creating source-tree bytecode. The source-program bootstrap below additionally
+# rejects sourceless bytecode imports after the reviewed program path is added.
 $env:PYTHONDONTWRITEBYTECODE = "1"
 $env:PYTHONPYCACHEPREFIX = Join-Path (
     [System.IO.Path]::GetTempPath()
@@ -142,17 +185,17 @@ $InstallRequirementsPath = if (Test-Path -LiteralPath $LockedRequirementsPath) {
 function Get-PythonLauncher {
     if (Get-Command py -ErrorAction SilentlyContinue) {
         foreach ($PythonSelector in @("-3.12", "-3.11", "-3.10")) {
-            & py $PythonSelector -B -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" *> $null
+            & py $PythonSelector -I -B -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" *> $null
             if ($LASTEXITCODE -eq 0) {
-                return @("py", $PythonSelector, "-B")
+                return @("py", $PythonSelector, "-I", "-B")
             }
         }
     }
 
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        & python -B -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" *> $null
+        & python -I -B -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" *> $null
         if ($LASTEXITCODE -eq 0) {
-            return @("python", "-B")
+            return @("python", "-I", "-B")
         }
     }
 
@@ -168,6 +211,65 @@ function Invoke-PythonLauncher {
     $Executable = $Launcher[0]
     $PrefixArguments = @($Launcher | Select-Object -Skip 1)
     $CommandOutput = @(& $Executable @PrefixArguments @Arguments)
+    $ExitCode = $LASTEXITCODE
+    foreach ($OutputLine in $CommandOutput) {
+        Write-Host $OutputLine
+    }
+    return [int]$ExitCode
+}
+
+$SourceProgramBootstrap = @'
+import importlib.machinery as machinery
+import pathlib
+import runpy
+import sys
+
+class _SourceOnlyLoader(machinery.SourceFileLoader):
+    def get_code(self, fullname):
+        source_path = self.get_filename(fullname)
+        source_bytes = self.get_data(source_path)
+        return self.source_to_code(source_bytes, source_path)
+
+class _SourceOnlyFileFinder(machinery.FileFinder):
+    def find_spec(self, fullname, target=None):
+        leaf_name = fullname.rpartition('.')[2]
+        directory = pathlib.Path(self.path)
+        candidates = (
+            directory / f'{leaf_name}.pyc',
+            directory / f'{leaf_name}.pyo',
+            directory / leaf_name / '__init__.pyc',
+            directory / leaf_name / '__init__.pyo',
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                raise ImportError(
+                    f'Refusing sourceless bytecode import: {candidate}'
+                )
+        return super().find_spec(fullname, target)
+
+program_path = pathlib.Path(sys.argv[1]).resolve()
+source_only_path_hook = _SourceOnlyFileFinder.path_hook(
+    (_SourceOnlyLoader, machinery.SOURCE_SUFFIXES),
+    (machinery.ExtensionFileLoader, machinery.EXTENSION_SUFFIXES),
+)
+sys.path_hooks.insert(0, source_only_path_hook)
+sys.path_importer_cache.clear()
+sys.path.insert(0, str(program_path.parent))
+sys.argv = [str(program_path), *sys.argv[2:]]
+runpy.run_path(str(program_path), run_name='__main__')
+'@
+
+function Invoke-IsolatedPythonSourceProgram {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Launcher,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $Executable = $Launcher[0]
+    $PrefixArguments = @($Launcher | Select-Object -Skip 1)
+    $CommandOutput = @(
+        & $Executable @PrefixArguments -c $SourceProgramBootstrap @Arguments
+    )
     $ExitCode = $LASTEXITCODE
     foreach ($OutputLine in $CommandOutput) {
         Write-Host $OutputLine
@@ -209,7 +311,7 @@ function Test-PythonEnvironment {
     if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
         return $false
     }
-    & $VenvPython -B -m pip check
+    & $VenvPython -I -B -m pip check
     if ($LASTEXITCODE -ne 0) {
         return $false
     }
@@ -223,7 +325,7 @@ function Test-PythonEnvironment {
         "bad=[n+'=='+v+': installed='+installed.get(canon(n),'missing') for n,v in pins if installed.get(canon(n))!=v];" +
         "print('\\n'.join(bad));raise SystemExit(1 if bad else 0)"
     )
-    & $VenvPython -B -c $VerifyScript $InstallRequirementsPath
+    & $VenvPython -I -B -c $VerifyScript $InstallRequirementsPath
     return $LASTEXITCODE -eq 0
 }
 
@@ -287,7 +389,7 @@ function Rebuild-PythonEnvironment {
         }
 
         $InstallArguments = @(
-            "-B", "-m", "pip", "install", "--disable-pip-version-check", "--quiet"
+            "-I", "-B", "-m", "pip", "install", "--disable-pip-version-check", "--quiet"
         )
         if ($InstallRequirementsPath -eq $LockedRequirementsPath) {
             $InstallArguments += "--require-hashes"
@@ -342,7 +444,7 @@ $ValidationArguments = @($ValidationTarget, "--config", $ConfigPath)
 if ($ValidationTarget -eq $ProgramPath) {
     $ValidationArguments += "--validate-config"
 }
-$ValidationExitCode = Invoke-PythonLauncher -Launcher $BasePython `
+$ValidationExitCode = Invoke-IsolatedPythonSourceProgram -Launcher $BasePython `
     -Arguments $ValidationArguments
 if ($ValidationExitCode -ne 0) {
     throw "Configuration validation failed (exit code $ValidationExitCode). No runtime folders or reports were changed."
@@ -421,8 +523,8 @@ if ($RebindRestoredIntegrityAnchor) {
     )
 }
 
-& $VenvPython -B @ProgramArguments
-$ReportExitCode = $LASTEXITCODE
+$ReportExitCode = Invoke-IsolatedPythonSourceProgram `
+    -Launcher @($VenvPython, "-I", "-B") -Arguments $ProgramArguments
 if ($ReportExitCode -ne 0) {
     exit $ReportExitCode
 }
