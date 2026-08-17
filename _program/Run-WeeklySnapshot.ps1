@@ -224,17 +224,36 @@ import pathlib
 import runpy
 import sys
 
-class _RejectSourcelessBytecode:
-    @classmethod
-    def find_spec(cls, fullname, path=None, target=None):
-        spec = machinery.PathFinder.find_spec(fullname, path, target)
-        origin = getattr(spec, 'origin', '') if spec is not None else ''
-        if isinstance(origin, str) and origin.lower().endswith(('.pyc', '.pyo')):
-            raise ImportError(f'Refusing sourceless bytecode import: {origin}')
-        return None
+class _SourceOnlyLoader(machinery.SourceFileLoader):
+    def get_code(self, fullname):
+        source_path = self.get_filename(fullname)
+        source_bytes = self.get_data(source_path)
+        return self.source_to_code(source_bytes, source_path)
+
+class _SourceOnlyFileFinder(machinery.FileFinder):
+    def find_spec(self, fullname, target=None):
+        leaf_name = fullname.rpartition('.')[2]
+        directory = pathlib.Path(self.path)
+        candidates = (
+            directory / f'{leaf_name}.pyc',
+            directory / f'{leaf_name}.pyo',
+            directory / leaf_name / '__init__.pyc',
+            directory / leaf_name / '__init__.pyo',
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                raise ImportError(
+                    f'Refusing sourceless bytecode import: {candidate}'
+                )
+        return super().find_spec(fullname, target)
 
 program_path = pathlib.Path(sys.argv[1]).resolve()
-sys.meta_path.insert(0, _RejectSourcelessBytecode)
+source_only_path_hook = _SourceOnlyFileFinder.path_hook(
+    (_SourceOnlyLoader, machinery.SOURCE_SUFFIXES),
+    (machinery.ExtensionFileLoader, machinery.EXTENSION_SUFFIXES),
+)
+sys.path_hooks.insert(0, source_only_path_hook)
+sys.path_importer_cache.clear()
 sys.path.insert(0, str(program_path.parent))
 sys.argv = [str(program_path), *sys.argv[2:]]
 runpy.run_path(str(program_path), run_name='__main__')

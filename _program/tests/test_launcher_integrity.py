@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import py_compile
 import shutil
@@ -33,6 +34,9 @@ def test_release_preflight_runs_before_any_runtime_mutation() -> None:
     assert "PYTHONPYCACHEPREFIX" in launcher
     assert "Invoke-IsolatedPythonSourceProgram" in launcher
     assert "Refusing sourceless bytecode import" in launcher
+    assert "class _SourceOnlyLoader" in launcher
+    assert "self.get_data(source_path)" in launcher
+    assert "sys.path_hooks.insert(0, source_only_path_hook)" in launcher
     assert 'return @("py", $PythonSelector, "-I", "-B")' in launcher
     assert 'return @("python", "-I", "-B")' in launcher
     assert '& $VenvPython -I -B -m pip check' in launcher
@@ -339,6 +343,79 @@ raise SystemExit(0)
     assert result.returncode != 0
     assert "Refusing sourceless bytecode import" in normalized_output
     assert not capture_path.exists()
+    assert not execution_marker.exists()
+
+
+@pytest.mark.skipif(
+    not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
+    reason="Windows PowerShell and Git required",
+)
+def test_source_bootstrap_ignores_late_source_backed_cache(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
+    launcher = _write_minimal_runner(repository_root)
+    helper_path = launcher.parent / "trusted_helper.py"
+    helper_path.write_text("VALUE = 'source'\n", encoding="utf-8")
+    program_path = launcher.parent / "red_onion_weekly_metrics.py"
+    program_path.write_text(
+        """from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+if "--validate-config" in sys.argv:
+    cache_destination = Path(os.environ["RED_ONION_CACHE_DESTINATION"])
+    cache_destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        os.environ["RED_ONION_LATE_BYTECODE"], cache_destination
+    )
+    raise SystemExit(0)
+
+import trusted_helper
+
+capture_path = os.environ.get("RED_ONION_TEST_ARGUMENTS_PATH")
+if capture_path:
+    Path(capture_path).write_text(trusted_helper.VALUE, encoding="utf-8")
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    (repository_root / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n", encoding="utf-8"
+    )
+    _initialize_release_checkout(repository_root)
+
+    execution_marker = tmp_path / "source-cache-executed.txt"
+    malicious_source = tmp_path / "attacker_trusted_helper.py"
+    malicious_source.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(execution_marker)!r}).write_text("
+        "'executed', encoding='utf-8')\n"
+        "VALUE = 'bytecode'\n",
+        encoding="utf-8",
+    )
+    late_bytecode = tmp_path / "trusted-helper-cache.pyc"
+    py_compile.compile(
+        str(malicious_source),
+        cfile=str(late_bytecode),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    cache_destination = Path(importlib.util.cache_from_source(str(helper_path)))
+
+    capture_path = tmp_path / "source-cache-result.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_LATE_BYTECODE"] = str(late_bytecode)
+    environment["RED_ONION_CACHE_DESTINATION"] = str(cache_destination)
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    result = _run_launcher(launcher, environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert capture_path.read_text(encoding="utf-8") == "source"
+    assert cache_destination.exists()
     assert not execution_marker.exists()
 
 

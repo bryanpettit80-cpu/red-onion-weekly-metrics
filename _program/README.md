@@ -96,7 +96,7 @@ When the repository folder is named exactly `Red Onion Weekly Metrics Automation
 - The checkout is attached to branch `main`.
 - `HEAD` equals the existing local `refs/remotes/origin/main` commit.
 
-The launcher permits existing ignored Python bytecode but isolates each run by disabling bytecode writes and redirecting bytecode lookup to a fresh unused cache path. It does not delete those files, fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root.
+The deployed launcher rejects ignored `.pyc` and `.pyo` files under `_program`. It also starts Python in isolated mode and uses a source-only loader that compiles reviewed `.py` files directly, so neither the caller's working directory nor a late-arriving adjacent or `__pycache__` bytecode file can supply executable code. It does not delete those files, fetch, pull, reset, discard files, or contact an external service. Release deployment remains a maintainer operation. A non-Git standalone copy remains supported when its repository folder does not use the canonical deployment name; its numbered runtime folders live inside that standalone root.
 
 ## Operational Context And Person-Action Scope
 
