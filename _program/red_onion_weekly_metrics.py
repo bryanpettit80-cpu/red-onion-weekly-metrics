@@ -53,6 +53,7 @@ from red_onion_integrity import (
     write_json_manifest_atomic,
 )
 from red_onion_config import DEFAULT_CONFIG, load_config
+from red_onion_ingestion import parse_single_business_date, validated_report_columns
 from red_onion_runtime import (
     RunAttemptRecorder,
     RunReadiness,
@@ -472,8 +473,6 @@ OPERATING_WEEK_END_WEEKDAY = 6  # Sunday.
 OPERATING_WEEK_DAYS = 6
 OPERATING_WEEK_LABEL = "Tuesday-Sunday"
 DATA_QUALITY_COMPLETENESS_WEEKS = 16
-FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS = 1
-DAILY_REPORT_PREFIX = "daily report"
 DAILY_REPORT_EXTENSIONS = frozenset({".xls", ".xlsx"})
 DAILY_REPORT_FORMAT_LABEL = ".xls or .xlsx"
 CANONICAL_DAILY_ARCHIVE_FOLDER = "processed-daily-reports"
@@ -595,6 +594,19 @@ class OutputRollback:
 
 
 @dataclass(frozen=True)
+class ReportingSetCoverage:
+    expected: tuple[tuple[str, date], ...]
+    received: frozenset[tuple[str, date]]
+    closed: frozenset[tuple[str, date]]
+    missing: tuple[tuple[str, date], ...]
+    conflicts: tuple[str, ...]
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.expected) and not self.missing and not self.conflicts
+
+
+@dataclass(frozen=True)
 class LatestWeekReadiness:
     latest_week_end: date | None
     latest_location_rows: tuple[dict[str, Any], ...]
@@ -604,9 +616,22 @@ class LatestWeekReadiness:
     received_dates: frozenset[date]
     missing_dates: tuple[date, ...]
     ready: bool
+    missing_restaurant_days: tuple[tuple[str, date], ...] = ()
+    closure_conflicts: tuple[str, ...] = ()
 
     @property
     def missing_parts(self) -> tuple[str, ...]:
+        if self.missing_restaurant_days or self.closure_conflicts:
+            by_location: dict[str, list[date]] = defaultdict(list)
+            for location, day in self.missing_restaurant_days:
+                by_location[location].append(day)
+            return (
+                *(
+                    f"{location} data: " + ", ".join(f"{day:%b} {day.day}" for day in days)
+                    for location, days in by_location.items()
+                ),
+                *self.closure_conflicts,
+            )
         return (
             *(f"{report_date:%b} {report_date.day}" for report_date in self.missing_dates),
             *(f"{location} data" for location in self.location_gaps),
@@ -866,21 +891,10 @@ def parse_date_text(text: str) -> date:
 
 
 def parse_report_date_with_source(df: pd.DataFrame, path: Path) -> tuple[date, str]:
-    for value in df.to_numpy().ravel():
-        if isinstance(value, str) and "Date(s):" in value:
-            match = re.search(r"Date\(s\):\s*([^\n]+)", value)
-            if match:
-                date_text = match.group(1).split("-")[-1].strip()
-                return parse_date_text(date_text), "Workbook Date(s) field"
-    match = re.search(r"(\d{2})-(\d{2})-(\d{4})", path.name)
-    if match:
-        month, day, year = map(int, match.groups())
-        return (
-            date(year, month, day)
-            - timedelta(days=FILENAME_DATE_BUSINESS_DATE_OFFSET_DAYS),
-            "Filename fallback minus one business-date day",
-        )
-    raise ValueError(f"Could not find report date in {path.name}")
+    return (
+        parse_single_business_date(df.to_numpy().ravel(), path.name),
+        "Workbook Date(s) field",
+    )
 
 
 def parse_report_date(df: pd.DataFrame, path: Path) -> date:
@@ -891,10 +905,8 @@ def find_header_row(df: pd.DataFrame) -> tuple[int, int, list[int]]:
     for row_index, row in df.iterrows():
         values = ["" if is_blank(v) else str(v).strip() for v in row.tolist()]
         if "Store" in values and "Gross Sales" in values:
-            location_col = values.index("Store")
-            block_starts = [idx for idx, value in enumerate(values) if value == "Gross Sales"]
-            if block_starts:
-                return row_index, location_col, block_starts
+            columns = validated_report_columns(values)
+            return row_index, columns.location, [block["Gross Sales"] for block in columns.blocks]
     raise ValueError("Could not find the metric header row.")
 
 
@@ -957,16 +969,17 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
             )
         df = workbook.parse("Report(All)", header=None)
     report_date, report_date_source = parse_report_date_with_source(df, path)
-    header_row, location_col, block_starts = find_header_row(df)
+    header_row, _, _ = find_header_row(df)
     header_values = [
         "" if is_blank(value) else str(value).strip()
         for value in df.iloc[header_row].tolist()
     ]
+    columns = validated_report_columns(header_values)
     location_names = set(config["locations"])
     records: list[MetricRecord] = []
 
     for _, row in df.iloc[header_row + 1 :].iterrows():
-        location_value = row.get(location_col)
+        location_value = row.get(columns.location)
         if is_blank(location_value):
             continue
 
@@ -974,18 +987,15 @@ def parse_daily_report(path: Path, config: dict[str, Any]) -> list[MetricRecord]
         if location not in location_names:
             continue
 
-        source_raw_user_name = "" if is_blank(row.get(1)) else str(row.get(1)).strip()
+        person_value = row.get(columns.person)
+        source_raw_user_name = "" if is_blank(person_value) else str(person_value).strip()
         raw_user_name = source_raw_user_name
         display_name = display_name_for(source_raw_user_name, config)
 
-        for start_col in block_starts:
-            values = [row.get(start_col + offset) for offset in range(len(METRICS))]
-            check_count_col = start_col + len(METRICS)
-            has_check_count = (
-                check_count_col < len(header_values)
-                and header_values[check_count_col] == "Check Count"
-            )
-            check_count_value = row.get(check_count_col) if has_check_count else None
+        for block in columns.blocks:
+            values = [row.get(block[label]) for _, label in METRICS]
+            has_check_count = "Check Count" in block
+            check_count_value = row.get(block["Check Count"]) if has_check_count else None
             if all(is_blank(value) for value in values) and is_blank(check_count_value):
                 continue
 
@@ -1052,7 +1062,6 @@ def is_daily_report_name(name: str) -> bool:
     path = Path(name)
     return (
         not path.name.startswith("~$")
-        and path.name.casefold().startswith(DAILY_REPORT_PREFIX)
         and path.suffix.lower() in DAILY_REPORT_EXTENSIONS
     )
 
@@ -1518,6 +1527,25 @@ def resolve_report_duplicates(
                 for path, records in richest_reports[1:]
                 if semantic_report_signature(records) != selected_signature
             ]
+            # Additional coverage may enrich an export, but must never hide an
+            # overlapping correction or discard context present in another copy.
+            def available_checks(items: list[MetricRecord]) -> dict[tuple[Any, ...], tuple[float, ...]]:
+                values: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+                for item in items:
+                    if item.check_count_available:
+                        identity = semantic_report_signature([item])[0][:-2]
+                        values[identity].append(round(float(item.check_count), 6))
+                return {key: tuple(sorted(counts)) for key, counts in values.items()}
+
+            selected_checks = available_checks(selected_records)
+            for path, items in reports:
+                if path == selected_path:
+                    continue
+                if any(
+                    selected_checks.get(key) != values
+                    for key, values in available_checks(items).items()
+                ) and path not in conflicting_paths:
+                    conflicting_paths.append(path)
         else:
             selected_path, selected_records = reports[0]
             selected_core_signature = semantic_report_signature(
@@ -1570,6 +1598,79 @@ def read_all_reports(input_dir: Path, config: dict[str, Any]) -> list[MetricReco
 
 def is_operating_day(day: date) -> bool:
     return OPERATING_WEEK_START_WEEKDAY <= day.weekday() <= OPERATING_WEEK_END_WEEKDAY
+
+
+def reporting_set_coverage(
+    records: Iterable[MetricRecord],
+    config: dict[str, Any],
+    week_start: date,
+    week_end: date,
+) -> ReportingSetCoverage:
+    """Count actual location-total receipts and explicit closures, not activity."""
+    expected = tuple(
+        (location, week_start + timedelta(days=offset))
+        for location in config["locations"]
+        for offset in range((week_end - week_start).days + 1)
+        if is_operating_day(week_start + timedelta(days=offset))
+    )
+    expected_set = set(expected)
+    closed = frozenset(
+        (location, date.fromisoformat(value))
+        for location, days in config.get("closed_dates", {}).items()
+        for value in days
+        if (location, date.fromisoformat(value)) in expected_set
+    )
+    rows_by_day: dict[tuple[str, date], list[MetricRecord]] = defaultdict(list)
+    for record in records:
+        identity = (record.location, record.report_date)
+        if identity in expected_set:
+            rows_by_day[identity].append(record)
+    received: set[tuple[str, date]] = set()
+    conflicts: list[str] = []
+    for identity, rows in sorted(rows_by_day.items()):
+        location, day = identity
+        totals = [row for row in rows if row.is_location_total]
+        if len(totals) == 1:
+            received.add(identity)
+        elif len(totals) > 1:
+            conflicts.append(f"{location} {day.isoformat()}: multiple location totals")
+        if identity in closed and any(
+            row.gross_sales != 0 or row.guest_count != 0 or row.wine_sales != 0
+            or (row.check_count_available and row.check_count != 0)
+            for row in rows
+        ):
+            conflicts.append(
+                f"{location} {day.isoformat()}: declared closed but source activity exists"
+            )
+    return ReportingSetCoverage(
+        expected=expected,
+        received=frozenset(received),
+        closed=closed,
+        missing=tuple(identity for identity in expected if identity not in received | closed),
+        conflicts=tuple(conflicts),
+    )
+
+
+def validate_complete_reporting_set(
+    records: Iterable[MetricRecord],
+    config: dict[str, Any],
+    week_start: date,
+    week_end: date,
+) -> ReportingSetCoverage:
+    """Publication gate: one full operating week for every configured restaurant."""
+    if week_period_for(week_start) != (week_start, week_end):
+        raise ValueError("Normal publication requires a complete Tuesday-Sunday reporting week.")
+    coverage = reporting_set_coverage(records, config, week_start, week_end)
+    if not coverage.ready:
+        details = [f"{location} {day.isoformat()}" for location, day in coverage.missing]
+        problems = (["Missing restaurant-days: " + ", ".join(details)] if details else [])
+        problems.extend(coverage.conflicts)
+        raise ValueError(
+            "Reporting set is incomplete or conflicting. " + "; ".join(problems)
+            + ". No complete weekly report should be published. Supply the missing "
+            "daily reports or correct an explicit closed_dates rule."
+        )
+    return coverage
 
 
 def week_period_for(day: date) -> tuple[date, date]:
@@ -2412,6 +2513,7 @@ def aggregate_records(
                     "check_count_available": True,
                     "has_active_rows": False,
                     "active_dates": set(),
+                    "receipt_dates": set(),
                     "daily_records": [],
                     "source_files": set(),
                     "source_evidence": set(),
@@ -2419,6 +2521,8 @@ def aggregate_records(
             )
 
         group = groups[key]
+        if record.is_location_total:
+            group["receipt_dates"].add(record.report_date)
         group["gross_sales"] += record.gross_sales
         group["guest_count"] += record.guest_count
         group["wine_sales"] += record.wine_sales
@@ -2531,7 +2635,8 @@ def aggregate_records(
             else "Unavailable (Check Count missing or incomplete)"
         )
         rollup["active_days"] = len(group["active_dates"])
-        rollup["source_days"] = len(group["active_dates"])
+        rollup["source_dates"] = tuple(sorted(group["receipt_dates"]))
+        rollup["source_days"] = len(group["receipt_dates"] or group["active_dates"])
         rollup["source_files"] = ", ".join(sorted(group["source_files"]))
         rollup["daily_records"] = sorted(
             group["daily_records"], key=lambda item: item["report_date"]
@@ -2554,6 +2659,7 @@ def aggregate_records(
             "ticket_weight",
             "has_active_rows",
             "active_dates",
+            "receipt_dates",
         ):
             rollup.pop(helper, None)
         rollups.append(rollup)
@@ -2753,11 +2859,27 @@ def write_public_workbook(
     public_start: date,
     public_end: date,
 ) -> Path:
-    actual_start = min(record.report_date for record in selected_records)
-    actual_end = max(record.report_date for record in selected_records)
     short_code = config["locations"][location]["short_code"]
 
     location_records = [record for record in selected_records if record.location == location]
+    coverage = reporting_set_coverage(selected_records, config, public_start, public_end)
+    local_missing = [day for store, day in coverage.missing if store == location]
+    local_closed = sorted(day for store, day in coverage.closed if store == location)
+    if not location_records and local_missing:
+        raise ValueError(f"No daily report data for {location}; missing {local_missing[0].isoformat()}.")
+    source_dates_text = (
+        format_date_range(
+            min(record.report_date for record in location_records),
+            max(record.report_date for record in location_records),
+        )
+        if location_records else "No daily source; declared closed"
+    )
+    coverage_note = (
+        "\n  PRELIMINARY - Missing: " + ", ".join(day.isoformat() for day in local_missing)
+        if local_missing else ""
+    )
+    if local_closed:
+        coverage_note += "\n  Declared closed: " + ", ".join(day.isoformat() for day in local_closed)
     totals = [record for record in location_records if record.is_location_total]
     server_records = [record for record in location_records if not record.is_location_total]
 
@@ -2777,9 +2899,9 @@ def write_public_workbook(
     ws["A1"] = (
         "FILTERS\n"
         f"  {bullet}  Week:  {format_date_range(public_start, public_end)} ({OPERATING_WEEK_LABEL})\n"
-        f"  {bullet}  Source Date(s):  {format_date_range(actual_start, actual_end)}\n"
+        f"  {bullet}  Source Date(s):  {source_dates_text}\n"
         f"  {bullet}  Location Type:  Store\n"
-        f"  {bullet}  Locations:  {location}"
+        f"  {bullet}  Locations:  {location}{coverage_note}"
     )
     headers = ["Store", "", "Gross Sales", "Guest Count", "Check Average", "Wine Sales", "Wine %"]
     for col_index, header in enumerate(headers, start=1):
@@ -2801,6 +2923,10 @@ def write_public_workbook(
 
     last_row = max(2, len(rows_to_write) + 2)
     style_public_sheet(ws, last_row)
+    if coverage_note:
+        ws.row_dimensions[1].height = max(96, 18 * len(ws["A1"].value.splitlines()))
+    if local_missing:
+        ws["A1"].fill = PatternFill("solid", fgColor="FFF2CC")
     apply_public_metric_highlights(ws, last_row)
     write_report_definition(wb.create_sheet("Report Definition"), location, public_start, public_end)
 
@@ -2906,7 +3032,9 @@ def write_table_sheet(
     return ws
 
 
-def weekly_rollups(records: list[MetricRecord]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def weekly_rollups(
+    records: list[MetricRecord], config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     grouped: dict[tuple[date, date], list[MetricRecord]] = defaultdict(list)
     for record in records:
         if not is_operating_day(record.report_date):
@@ -2932,6 +3060,15 @@ def weekly_rollups(records: list[MetricRecord]) -> tuple[list[dict[str, Any]], l
                 {"week_start": week_start, "week_end": week_end},
             )
         )
+    if config is not None:
+        for row in location_rows:
+            closed = {
+                date.fromisoformat(value)
+                for value in config.get("closed_dates", {}).get(row["location"], [])
+                if row["week_start"] <= date.fromisoformat(value) <= row["week_end"]
+            }
+            row["closed_dates"] = tuple(sorted(closed))
+            row["source_days"] = len(set(row["source_dates"]) | closed)
     return server_rows, location_rows
 
 
@@ -4529,7 +4666,7 @@ def _write_master_workbook_base(
     public_start: date,
     public_end: date,
 ) -> Path:
-    weekly_server_rows, weekly_location_rows = weekly_rollups(records)
+    weekly_server_rows, weekly_location_rows = weekly_rollups(records, config)
     rank_min_guest_count = int(
         config.get("master_min_guest_count_for_rankings", config.get("public_min_guest_count", 1))
     )
@@ -5096,7 +5233,7 @@ def _write_master_workbook_base(
         ("Operating Week", f"{OPERATING_WEEK_LABEL}; Mondays are closed and excluded from weekly rollups."),
         (
             "Report Date Source",
-            "Uses each raw workbook's Date(s) value; filename date fallback is one day after the business date.",
+            "Requires one explicit business day in the raw workbook's Date(s) field; filenames are labels only.",
         ),
         ("Raw Reports Read", len({record.source_file for record in records})),
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
@@ -5379,6 +5516,7 @@ def build_shared_area_trends_model(
     _, global_full = full_week_ends_by_location(
         weekly_location_rows,
         config.get("locations", {}),
+        closed_dates=config.get("closed_dates", {}),
     )
     week_ends = tuple(sorted(global_full)[-WEEKLY_SHARED_AREA_WINDOW_WEEKS:])
     if not week_ends:
@@ -5611,6 +5749,8 @@ def server_trend_context(recent_momentum: str, long_term_direction: str) -> str:
 def full_week_ends_by_location(
     weekly_location_rows: list[dict[str, Any]],
     required_locations: Iterable[str] | None = None,
+    *,
+    closed_dates: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, set[date]], set[date]]:
     observed_locations = {str(row["location"]) for row in weekly_location_rows}
     configured_locations = {
@@ -5625,6 +5765,17 @@ def full_week_ends_by_location(
         }
         for location in locations
     }
+    if closed_dates:
+        observed_weeks = {row["week_end"] for row in weekly_location_rows}
+        rows_by_week = {(row["location"], row["week_end"]): row for row in weekly_location_rows}
+        for location in locations:
+            closures = {date.fromisoformat(value) for value in closed_dates.get(location, [])}
+            for week_end in observed_weeks:
+                expected = {week_end - timedelta(days=offset) for offset in range(OPERATING_WEEK_DAYS)}
+                row = rows_by_week.get((location, week_end), {})
+                received = set(row.get("source_dates", ()))
+                if expected <= received | closures:
+                    by_location[location].add(week_end)
     if not locations:
         return by_location, set()
     global_full = set.intersection(*(by_location[location] for location in locations))
@@ -5704,6 +5855,7 @@ def build_performance_consistency_model(
     _, global_full = full_week_ends_by_location(
         weekly_location_rows,
         config.get("locations", {}),
+        closed_dates=config.get("closed_dates", {}),
     )
     week_ends = sorted(global_full)[-PERFORMANCE_CONSISTENCY_WINDOW_WEEKS:]
     if not week_ends:
@@ -6650,7 +6802,10 @@ def management_server_rows(
     developing_min_earlier_guests = float(
         config.get("dashboard_long_term_developing_min_earlier_guests", 50)
     )
-    full_by_location, _ = full_week_ends_by_location(weekly_location_rows)
+    full_by_location, _ = full_week_ends_by_location(
+        weekly_location_rows, config.get("locations", {}),
+        closed_dates=config.get("closed_dates", {}),
+    )
     evaluations: dict[tuple[date, str, str], dict[str, Any]] = {}
 
     def evaluation_for(row: dict[str, Any]) -> dict[str, Any]:
@@ -16037,12 +16192,24 @@ def latest_location_completeness(
     configured_locations = list(config.get("locations", {}))
     if not configured_locations:
         configured_locations = sorted(latest_by_location)
-    location_gaps = [
-        location
-        for location in configured_locations
-        if location not in latest_by_location
-        or latest_by_location[location].get("source_days", 0) < OPERATING_WEEK_DAYS
-    ]
+    location_gaps = []
+    for location in configured_locations:
+        row = latest_by_location.get(location)
+        closed = {
+            date.fromisoformat(value)
+            for value in config.get("closed_dates", {}).get(location, [])
+            if latest_week_end is not None
+            and latest_week_end - timedelta(days=OPERATING_WEEK_DAYS - 1)
+            <= date.fromisoformat(value) <= latest_week_end
+        }
+        if row is None:
+            source_days = len(closed)
+        elif "source_dates" in row:
+            source_days = len(set(row["source_dates"]) | closed)
+        else:
+            source_days = row.get("source_days", 0)
+        if source_days < OPERATING_WEEK_DAYS:
+            location_gaps.append(location)
     complete = bool(configured_locations) and not location_gaps
     return latest_rows, configured_locations, location_gaps, complete
 
@@ -16686,13 +16853,27 @@ def latest_week_readiness(
     weekly_location_rows: list[dict[str, Any]],
     config: dict[str, Any],
 ) -> LatestWeekReadiness:
-    latest_week_end = max((row["week_end"] for row in weekly_location_rows), default=None)
-    latest_rows, configured_locations, location_gaps, locations_complete = (
+    latest_week_end = max(
+        [row["week_end"] for row in weekly_location_rows]
+        + [week_period_for(record.report_date)[1] for record in records if is_operating_day(record.report_date)],
+        default=None,
+    )
+    latest_rows, configured_locations, location_gaps, _locations_complete = (
         latest_location_completeness(weekly_location_rows, latest_week_end, config)
     )
-    expected_dates, received_dates, missing_dates = latest_week_report_coverage(
-        records, latest_week_end
-    )
+    expected_dates, received_dates, missing_dates = latest_week_report_coverage(records, latest_week_end)
+    coverage = None
+    if latest_week_end is not None:
+        coverage = reporting_set_coverage(
+            records, config,
+            latest_week_end - timedelta(days=OPERATING_WEEK_DAYS - 1), latest_week_end,
+        )
+        received_dates = {day for _, day in coverage.received | coverage.closed}
+        missing_dates = [day for day in expected_dates if day not in received_dates]
+        location_gaps = [
+            location for location in configured_locations
+            if any(missing_location == location for missing_location, _ in coverage.missing)
+        ]
     return LatestWeekReadiness(
         latest_week_end=latest_week_end,
         latest_location_rows=tuple(latest_rows),
@@ -16701,7 +16882,9 @@ def latest_week_readiness(
         expected_dates=tuple(expected_dates),
         received_dates=frozenset(received_dates),
         missing_dates=tuple(missing_dates),
-        ready=locations_complete and not missing_dates,
+        ready=coverage.ready if coverage is not None else False,
+        missing_restaurant_days=coverage.missing if coverage is not None else (),
+        closure_conflicts=coverage.conflicts if coverage is not None else (),
     )
 
 
@@ -17357,14 +17540,17 @@ def write_master_workbook(
     try:
         _write_master_workbook_base(records, temp_path, config, source_dir, public_start, public_end)
         wb = load_workbook(temp_path)
-        weekly_server_rows, weekly_location_rows = weekly_rollups(records)
+        weekly_server_rows, weekly_location_rows = weekly_rollups(records, config)
         rank_min_guest_count = int(
             config.get("master_min_guest_count_for_rankings", config.get("public_min_guest_count", 1))
         )
         ranked_rows = weekly_server_rank_rows(weekly_server_rows, rank_min_guest_count)
         weekly_group_rows = group_weekly_rows(records)
         readiness = latest_week_readiness(records, weekly_location_rows, config)
-        full_by_location, global_full = full_week_ends_by_location(weekly_location_rows)
+        full_by_location, global_full = full_week_ends_by_location(
+            weekly_location_rows, config.get("locations", {}),
+            closed_dates=config.get("closed_dates", {}),
+        )
         server_rows = management_server_rows(
             weekly_server_rows, weekly_location_rows, ranked_rows, state["targets"], config
         )

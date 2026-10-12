@@ -23,6 +23,7 @@ py-modules = [
     "red_onion_config",
     "red_onion_fairness",
     "red_onion_integrity",
+    "red_onion_ingestion",
     "red_onion_model_validation",
     "red_onion_runtime",
     "red_onion_weekly_metrics",

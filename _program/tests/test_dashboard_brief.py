@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from dataclasses import replace
 
 from openpyxl import Workbook
 
@@ -91,7 +92,8 @@ def action(
 def dashboard_inputs(source_days: int = metrics.OPERATING_WEEK_DAYS):
     week_end = date(2026, 7, 12)
     records = [
-        record_for(week_end - timedelta(days=offset))
+        replace(record_for(week_end - timedelta(days=offset)), location=location)
+        for location in metrics.DEFAULT_CONFIG["locations"]
         for offset in range(metrics.OPERATING_WEEK_DAYS)
     ]
     if source_days < metrics.OPERATING_WEEK_DAYS:
@@ -230,6 +232,7 @@ def test_incomplete_week_pauses_comparisons_actions_and_recognition() -> None:
 def test_missing_configured_location_pauses_dashboard_without_stale_metrics() -> None:
     wb = Workbook()
     records, _weekly_locations, stores, groups, actions = dashboard_inputs()
+    records = [record for record in records if record.location == "RC Richmond"]
     latest_week_end = date(2026, 7, 12)
     weekly_locations = [
         weekly_location_row(latest_week_end, "RC Richmond"),

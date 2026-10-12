@@ -11,6 +11,7 @@ from typing import Any
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "closed_dates": {},
     "locations": {
         "RC Richmond": {"short_code": "RVA"},
         "RC Virginia Beach": {"short_code": "VB"},
@@ -560,6 +561,22 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     merged = _deep_merge(DEFAULT_CONFIG, payload)
     _validate_effective_locations(merged["locations"])
+    closures = _require_mapping(merged["closed_dates"], "closed_dates")
+    for location, values in closures.items():
+        if location not in merged["locations"]:
+            raise ConfigError(f"closed_dates names an unknown location: {location}.")
+        normalized = _validate_string_list(values, f"closed_dates.{location}")
+        for value in normalized:
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError as exc:
+                raise ConfigError(f"closed_dates.{location} dates must be YYYY-MM-DD.") from exc
+            if parsed.isoformat() != value or parsed.weekday() == 0:
+                raise ConfigError(
+                    f"closed_dates.{location} must contain YYYY-MM-DD Tuesday-Sunday "
+                    f"business dates; received {value!r}."
+                )
+        closures[location] = sorted(normalized)
     if (
         merged["dashboard_long_term_full_weeks"]
         != merged["dashboard_long_term_block_weeks"] * 2
