@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import os
 import py_compile
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -18,61 +22,18 @@ GIT = shutil.which("git")
 WINDOWS_LAUNCHER_AVAILABLE = os.name == "nt" and POWERSHELL is not None
 
 
-def test_release_preflight_runs_before_any_runtime_mutation() -> None:
+def test_launcher_retains_isolated_source_loading_and_prewrite_config_validation() -> None:
     launcher = LAUNCHER.read_text(encoding="utf-8")
-    compact_launcher = " ".join(launcher.split())
-
-    assert "$IsDeployedCheckout" in launcher
-    assert '"status", "--porcelain=v1", "--untracked-files=all"' in compact_launcher
-    assert '"symbolic-ref", "--quiet", "--short", "HEAD"' in compact_launcher
-    assert 'refs/remotes/origin/main^{commit}' in launcher
-    assert "function Assert-NoSourceBytecode" in launcher
-    assert 'Where-Object { $_.Extension -in @(".pyc", ".pyo") }' in launcher
-    assert "-ErrorAction Stop" in launcher
-    assert "could not be completely inspected" in launcher
-    assert 'PYTHONDONTWRITEBYTECODE = "1"' in launcher
-    assert "PYTHONPYCACHEPREFIX" in launcher
     assert "Invoke-IsolatedPythonSourceProgram" in launcher
-    assert "Refusing sourceless bytecode import" in launcher
     assert "class _SourceOnlyLoader" in launcher
-    assert "self.get_data(source_path)" in launcher
-    assert "sys.path_hooks.insert(0, source_only_path_hook)" in launcher
     assert 'return @("py", $PythonSelector, "-I", "-B")' in launcher
     assert 'return @("python", "-I", "-B")' in launcher
-    assert '& $VenvPython -I -B -m pip check' in launcher
-    preflight_call = launcher.index(
-        "if ($IsDeployedCheckout) {\n    Assert-DeployedRelease"
-    )
-    bytecode_call = launcher.index(
-        "    Assert-NoSourceBytecode", preflight_call
-    )
-    assert preflight_call < bytecode_call
-    assert bytecode_call < launcher.index('PYTHONDONTWRITEBYTECODE = "1"')
-    assert preflight_call < launcher.index(
-        "New-Item -ItemType Directory"
-    )
-    assert preflight_call < launcher.index("$InstallArguments = @(")
-    assert "[switch]$InitializeIntegrityBaseline" in launcher
-    assert '$ProgramArguments += "--initialize-integrity-baseline"' in launcher
-    assert "[switch]$RebuildEnvironment" in launcher
-    assert "[switch]$HealthCheck" in launcher
-    assert "[string]$RebindRestoredIntegrityAnchor" in launcher
-    assert "environment-state.json" in launcher
-    assert "red_onion_config.py" in launcher
-    config_preflight = launcher.index(
+    assert '--require-hashes' in launcher
+    assert launcher.index(
         "$ValidationExitCode = Invoke-IsolatedPythonSourceProgram"
-    )
-    assert config_preflight < launcher.index(
-        "foreach ($dir in @($InputDir, $OutputDir, $ArchiveDir))"
-    )
-    assert (
-        "if ($RebuildEnvironment -or (-not $HealthCheck "
-        "-and -not $EnvironmentMatches))" in compact_launcher
-    )
-    assert "--require-hashes" in launcher
-    assert '@("-3.12", "-3.11", "-3.10")' in launcher
-    assert launcher.count("(3, 10) <= sys.version_info[:2] < (3, 13)") == 2
-    assert "Python 3.10-3.12 was not found" in launcher
+    ) < launcher.index("$RequirementsSha256 = Get-FileSha256")
+    assert "Assert-DeployedRelease" not in launcher
+    assert "Assert-NoSourceBytecode" not in launcher
 
 
 def test_environment_reuse_verifies_every_locked_dependency_pin() -> None:
@@ -207,6 +168,16 @@ def launcher_environment(tmp_path_factory: pytest.TempPathFactory) -> dict[str, 
         capture_output=True,
         text=True,
     )
+    # Minimal test programs use an empty requirements file. Record that already
+    # installed environment so each module does not create the same venv twice.
+    (venv_dir.parent / "environment-state.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "python_version": sys.version.split()[0],
+            "requirements_file": "requirements.txt",
+            "requirements_sha256": hashlib.sha256(b"").hexdigest(),
+        }), encoding="utf-8",
+    )
     environment = os.environ.copy()
     environment["LOCALAPPDATA"] = str(local_app_data)
     return environment
@@ -232,7 +203,7 @@ def test_standalone_non_git_copy_remains_supported(
     not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
     reason="Windows PowerShell and Git required",
 )
-def test_clean_main_deployment_at_local_origin_main_runs(
+def test_git_checkout_remains_supported(
     tmp_path: Path, launcher_environment: dict[str, str]
 ) -> None:
     repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
@@ -242,8 +213,8 @@ def test_clean_main_deployment_at_local_origin_main_runs(
     result = _run_launcher(launcher, launcher_environment)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Verified deployed release: main at" in result.stdout
-    assert (tmp_path / "01 Daily Reports - Drop Here").is_dir()
+    assert "Verified deployed release" not in result.stdout
+    assert (repository_root / "01 Daily Reports - Drop Here").is_dir()
 
 
 @pytest.mark.skipif(
@@ -287,7 +258,7 @@ def test_deployed_checkout_isolates_caller_working_directory_bytecode(
     not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
     reason="Windows PowerShell and Git required",
 )
-def test_source_bootstrap_rejects_bytecode_added_after_initial_preflight(
+def test_source_bootstrap_rejects_sourceless_import_after_config_validation(
     tmp_path: Path, launcher_environment: dict[str, str]
 ) -> None:
     repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
@@ -423,53 +394,22 @@ raise SystemExit(0)
     not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
     reason="Windows PowerShell and Git required",
 )
-def test_deployed_checkout_rejects_ignored_sourceless_bytecode_before_python(
+def test_unused_cache_and_harmless_notes_do_not_block_reporting(
     tmp_path: Path, launcher_environment: dict[str, str]
 ) -> None:
     repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
     launcher = _write_minimal_runner(repository_root)
-    program_path = launcher.parent / "red_onion_weekly_metrics.py"
-    program_path.write_text(
-        "import pandas\n" + program_path.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    (repository_root / ".gitignore").write_text(
-        "__pycache__/\n*.pyc\n*.pyo\n", encoding="utf-8"
-    )
     _initialize_release_checkout(repository_root)
+    (repository_root / "local-note.txt").write_text("operator note", encoding="utf-8")
+    cache = launcher.parent / "__pycache__"
+    cache.mkdir()
+    (cache / "stale_module.pyc").write_bytes(b"unused old cache")
+    (launcher.parent / "unused.pyo").write_bytes(b"unused old optimized cache")
 
-    execution_marker = tmp_path / "bytecode-executed.txt"
-    malicious_source = tmp_path / "attacker_pandas.py"
-    malicious_source.write_text(
-        "from pathlib import Path\n"
-        f"Path({str(execution_marker)!r}).write_text("
-        "'executed', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    bytecode = launcher.parent / "pandas.pyc"
-    py_compile.compile(
-        str(malicious_source),
-        cfile=str(bytecode),
-        doraise=True,
-    )
-    optimized_bytecode = launcher.parent / "stale_module.pyo"
-    optimized_bytecode.write_bytes(b"unverified optimized bytecode")
-    assert _git(repository_root, "status", "--porcelain=v1").stdout == ""
+    result = _run_launcher(launcher, launcher_environment)
 
-    capture_path = tmp_path / "invoked-arguments.txt"
-    environment = launcher_environment.copy()
-    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
-    result = _run_launcher(launcher, environment)
-    normalized_output = " ".join((result.stdout + result.stderr).split())
-
-    assert result.returncode != 0
-    assert "Release preflight failed" in normalized_output
-    assert "Python bytecode that cannot be verified by Git" in normalized_output
-    assert "_program\\pandas.pyc" in normalized_output
-    assert "_program\\stale_module.pyo" in normalized_output
-    assert not capture_path.exists()
-    assert not execution_marker.exists()
-    assert not (tmp_path / "01 Daily Reports - Drop Here").exists()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repository_root / "01 Daily Reports - Drop Here").is_dir()
 
 
 @pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
@@ -570,24 +510,21 @@ def test_health_check_does_not_create_operator_folders(
         assert not (repository_root / name).exists()
 
 
-@pytest.mark.skipif(
-    not WINDOWS_LAUNCHER_AVAILABLE or GIT is None,
-    reason="Windows PowerShell and Git required",
-)
-def test_named_deployment_without_git_fails_closed(
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+def test_named_deployment_without_git_runs_without_machine_anchor(
     tmp_path: Path, launcher_environment: dict[str, str]
 ) -> None:
     repository_root = tmp_path / "Red Onion Weekly Metrics Automation"
     launcher = _write_minimal_runner(repository_root)
+    capture_path = tmp_path / "arguments.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
 
-    result = _run_launcher(launcher, launcher_environment)
-    combined_output = result.stdout + result.stderr
-    normalized_output = " ".join(combined_output.split())
+    result = _run_launcher(launcher, environment)
 
-    assert result.returncode != 0
-    assert "Release preflight failed" in normalized_output
-    assert "not a Git checkout" in normalized_output
-    assert not (tmp_path / "01 Daily Reports - Drop Here").exists()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "--integrity-anchor-dir" not in capture_path.read_text(encoding="utf-8")
+    assert (repository_root / "01 Daily Reports - Drop Here").is_dir()
 
 
 @pytest.mark.skipif(
@@ -598,7 +535,7 @@ def test_named_deployment_without_git_fails_closed(
     "invalid_state",
     ["dirty", "wrong-branch", "detached", "missing-origin", "head-mismatch"],
 )
-def test_deployed_checkout_fails_closed_before_runtime_changes(
+def test_git_worktree_state_does_not_gate_reporting(
     tmp_path: Path,
     launcher_environment: dict[str, str],
     invalid_state: str,
@@ -609,30 +546,202 @@ def test_deployed_checkout_fails_closed_before_runtime_changes(
 
     if invalid_state == "dirty":
         (repository_root / "local-note.txt").write_text("unreleased", encoding="utf-8")
-        expected = "local or untracked changes"
     elif invalid_state == "wrong-branch":
         _git(repository_root, "checkout", "-b", "manager-edit")
-        expected = "instead of 'main'"
     elif invalid_state == "detached":
         _git(repository_root, "checkout", "--detach")
-        expected = "detached HEAD instead of 'main'"
     elif invalid_state == "missing-origin":
         _git(repository_root, "update-ref", "-d", "refs/remotes/origin/main")
-        expected = "local origin/main reference is missing"
     else:
         (repository_root / "new-release.txt").write_text("ahead", encoding="utf-8")
         _git(repository_root, "add", "new-release.txt")
         _git(repository_root, "commit", "-m", "unpublished release")
-        expected = "does not match local origin/main"
 
     result = _run_launcher(launcher, launcher_environment)
     combined_output = result.stdout + result.stderr
     normalized_output = " ".join(combined_output.split())
 
+    assert result.returncode == 0, combined_output
+    assert "Release preflight failed" not in normalized_output
+    assert (repository_root / "01 Daily Reports - Drop Here").is_dir()
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+@pytest.mark.parametrize("layout", ["own", "parent", "renamed", "explicit"])
+def test_operator_root_resolves_by_folder_evidence_or_explicit_argument(
+    tmp_path: Path, launcher_environment: dict[str, str], layout: str
+) -> None:
+    repository_root = tmp_path / "Downloaded Program"
+    launcher = _write_minimal_runner(repository_root)
+    expected = repository_root if layout == "own" else tmp_path
+    (expected / "01 Daily Reports - Drop Here").mkdir(exist_ok=True)
+    if layout == "renamed":
+        renamed = tmp_path / "Any program name"
+        repository_root.rename(renamed)
+        repository_root = renamed
+        launcher = renamed / "_program" / LAUNCHER.name
+    arguments: list[str] = []
+    if layout == "explicit":
+        (repository_root / "03 Archive").mkdir()
+        expected = tmp_path / "Chosen workspace"
+        arguments = ["-OperationsRoot", str(expected)]
+    capture_path = tmp_path / "root-arguments.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+
+    result = _run_launcher(launcher, environment, *arguments)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    forwarded = capture_path.read_text(encoding="utf-8").splitlines()
+    for option, folder in [("--input-dir", "01 Daily Reports - Drop Here"),
+                           ("--output-dir", "02 Finished Reports"),
+                           ("--archive-dir", "03 Archive")]:
+        assert Path(forwarded[forwarded.index(option) + 1]) == expected / folder
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+@pytest.mark.parametrize("layout", ["standalone", "renamed-child", "explicit"])
+def test_cmd_noninteractive_routes_without_pause_or_false_recovery_claim(
+    tmp_path: Path, layout: str
+) -> None:
+    root_cmd = tmp_path / "Run Weekly Snapshot.cmd"
+    shutil.copy2(PROGRAM_DIR.parent / root_cmd.name, root_cmd)
+    program_root = tmp_path if layout == "standalone" else tmp_path / "Renamed program"
+    runner = program_root / "_program" / LAUNCHER.name
+    runner.parent.mkdir(parents=True)
+    runner.write_text(
+        'param([string]$OperationsRoot, [switch]$NonInteractive)\n'
+        'Write-Output "ROOT=$OperationsRoot"\n'
+        'Write-Output "Published with cleanup warning"\n'
+        'exit 7\n', encoding="utf-8"
+    )
+    arguments = ["-NonInteractive"]
+    if layout == "explicit":
+        arguments += ["-OperationsRoot", str(tmp_path / "Explicit workspace")]
+    result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "call", str(root_cmd), *arguments],
+        cwd=tmp_path, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    )
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert "Published with cleanup warning" in result.stdout
+    assert "Press any key" not in result.stdout
+    assert "reports were left in place" not in result.stdout
+    if layout == "renamed-child":
+        assert f"ROOT={tmp_path}" in result.stdout
+    elif layout == "explicit":
+        assert f"ROOT={tmp_path / 'Explicit workspace'}" in result.stdout
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+def test_cmd_refuses_to_guess_between_two_program_copies(tmp_path: Path) -> None:
+    root_cmd = tmp_path / "Run Weekly Snapshot.cmd"
+    shutil.copy2(PROGRAM_DIR.parent / root_cmd.name, root_cmd)
+    for name in ["Current program", "Other program"]:
+        runner = tmp_path / name / "_program" / LAUNCHER.name
+        runner.parent.mkdir(parents=True)
+        runner.write_text('throw "must not run"', encoding="utf-8")
+    result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "call", str(root_cmd), "-NonInteractive"],
+        cwd=tmp_path, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    )
+    assert result.returncode == 2
+    assert "Expected one program folder" in result.stdout
+    assert "must not run" not in result.stderr
+    assert "Press any key" not in result.stdout
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+def test_explicit_correction_and_master_choices_are_forwarded(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    launcher = _write_minimal_runner(tmp_path / "program")
+    capture_path = tmp_path / "choice-arguments.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    corrections = str(tmp_path / "Reviewed choices.json")
+    master = str(tmp_path / "Chosen master.xlsx")
+
+    result = _run_launcher(
+        launcher, environment, "-CorrectionsFile", corrections,
+        "-ManagementWorkbook", master, "-NonInteractive",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    forwarded = capture_path.read_text(encoding="utf-8").splitlines()
+    assert forwarded[forwarded.index("--corrections-file") + 1] == corrections
+    assert forwarded[forwarded.index("--management-workbook") + 1] == master
+    assert "--review-corrections" not in forwarded
+
+    result = _run_launcher(launcher, environment, "-ReviewCorrections")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "--review-corrections" in capture_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+def test_noninteractive_review_is_rejected_before_python(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    launcher = _write_minimal_runner(tmp_path / "program")
+    capture_path = tmp_path / "must-not-exist.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    result = _run_launcher(launcher, environment, "-NonInteractive", "-ReviewCorrections")
     assert result.returncode != 0
-    assert "Release preflight failed" in normalized_output
-    assert expected in normalized_output
-    assert "No reports were created and no source files were moved" in normalized_output
-    assert not (tmp_path / "01 Daily Reports - Drop Here").exists()
-    assert not (tmp_path / "02 Finished Reports").exists()
-    assert not (tmp_path / "03 Archive").exists()
+    assert "needs an interactive review" in result.stdout + result.stderr
+    assert not capture_path.exists()
+    assert not (launcher.parent.parent / "03 Archive").exists()
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+def test_review_question_is_visible_before_an_answer_is_supplied(
+    tmp_path: Path, launcher_environment: dict[str, str]
+) -> None:
+    launcher = _write_minimal_runner(tmp_path / "program")
+    (launcher.parent / "red_onion_weekly_metrics.py").write_text(
+        'import sys\n'
+        'if "--review-corrections" in sys.argv:\n'
+        '    print("Choose correction:", flush=True)\n'
+        '    print("Chosen=" + input())\n', encoding="utf-8",
+    )
+    # Finish environment setup before starting the prompt visibility deadline.
+    setup = _run_launcher(launcher, launcher_environment)
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+    process = subprocess.Popen(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+         str(launcher), "-ReviewCorrections"],
+        cwd=launcher.parent.parent, env=launcher_environment,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    visible: queue.Queue[str] = queue.Queue()
+    observed: list[str] = []
+
+    def read_question() -> None:
+        text = ""
+        assert process.stdout is not None
+        while True:
+            character = process.stdout.read(1)
+            text += character
+            observed.append(character)
+            if not character or "Choose correction:" in text:
+                visible.put(text)
+                return
+
+    reader = threading.Thread(target=read_question, daemon=True)
+    reader.start()
+    try:
+        try:
+            output = visible.get(timeout=90)
+        except queue.Empty:
+            pytest.fail("Question did not become visible: " + "".join(observed))
+        assert "Choose correction:" in output, output
+        assert process.stdin is not None
+        process.stdin.write("2\n")
+        process.stdin.flush()
+        remaining, _ = process.communicate(timeout=30)
+        assert process.returncode == 0, output + remaining
+        assert "Chosen=2" in remaining
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        reader.join(timeout=10)

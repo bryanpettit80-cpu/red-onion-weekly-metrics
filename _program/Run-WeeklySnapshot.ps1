@@ -6,145 +6,26 @@ param(
     [switch]$InitializeIntegrityBaseline,
     [switch]$RebuildEnvironment,
     [switch]$HealthCheck,
+    [switch]$NonInteractive,
+    [switch]$ReviewCorrections,
+    [string]$CorrectionsFile,
+    [string]$ManagementWorkbook,
     [string]$RebindRestoredIntegrityAnchor
 )
 
 $ErrorActionPreference = "Stop"
+if ($NonInteractive -and $ReviewCorrections) {
+    throw "-ReviewCorrections needs an interactive review; omit -NonInteractive or supply an already reviewed -CorrectionsFile."
+}
 if ($HealthCheck -and $RebindRestoredIntegrityAnchor) {
     throw "-HealthCheck and -RebindRestoredIntegrityAnchor are separate maintenance operations."
 }
 
 $ProgramDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepositoryRoot = Split-Path -Parent $ProgramDir
-$IsDeployedCheckout = (Split-Path -Leaf $RepositoryRoot) -eq "Red Onion Weekly Metrics Automation"
-
-function Stop-ReleasePreflight {
-    param([Parameter(Mandatory = $true)][string]$Reason)
-
-    throw (
-        "Release preflight failed: $Reason " +
-        "No reports were created and no source files were moved. " +
-        "Ask the technical maintainer to restore a clean, released main checkout."
-    )
-}
-
-function Assert-NoSourceBytecode {
-    # Git intentionally ignores Python bytecode, so a clean status alone cannot
-    # prove that the deployed source directory contains only reviewed code.
-    try {
-        $RepositoryPrefix = (
-            [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
-                [char[]]@("\", "/")
-            ) + [System.IO.Path]::DirectorySeparatorChar
-        )
-        $BytecodeArtifacts = @(
-            Get-ChildItem -LiteralPath $ProgramDir -Recurse -Force -File `
-                -ErrorAction Stop |
-                Where-Object { $_.Extension -in @(".pyc", ".pyo") }
-        )
-        $ArtifactPaths = @(
-            $BytecodeArtifacts | ForEach-Object {
-                $ArtifactFullPath = [System.IO.Path]::GetFullPath($_.FullName)
-                if ($ArtifactFullPath.StartsWith(
-                    $RepositoryPrefix,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )) {
-                    $ArtifactFullPath.Substring($RepositoryPrefix.Length)
-                } else {
-                    "[outside repository] $($_.Name)"
-                }
-            }
-        )
-    } catch {
-        Stop-ReleasePreflight (
-            "The automation source could not be completely inspected for " +
-            "unverified Python bytecode ($($_.Exception.GetType().Name))."
-        )
-    }
-    if ($BytecodeArtifacts.Count -eq 0) {
-        return
-    }
-    Stop-ReleasePreflight (
-        "The automation source contains Python bytecode that cannot be verified by Git: " +
-        ($ArtifactPaths -join ", ") + ". Remove the bytecode artifacts before retrying."
-    )
-}
-
-function Invoke-LocalGit {
-    param([Parameter(Mandatory = $true)][string[]]$Arguments)
-
-    $PreviousErrorActionPreference = $ErrorActionPreference
-    try {
-        # Windows PowerShell can promote native stderr to a terminating error when
-        # ErrorActionPreference is Stop. Capture the exit code and handle it below.
-        $ErrorActionPreference = "Continue"
-        $GitOutput = @(& git -C $RepositoryRoot @Arguments 2>$null)
-        $GitExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $PreviousErrorActionPreference
-    }
-
-    return [pscustomobject]@{
-        ExitCode = $GitExitCode
-        Text = (($GitOutput | ForEach-Object { $_.ToString() }) -join "`n").Trim()
-    }
-}
-
-function Assert-DeployedRelease {
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Stop-ReleasePreflight "Git is not available, so this deployed checkout cannot be verified."
-    }
-
-    $InsideWorkTree = Invoke-LocalGit -Arguments @("rev-parse", "--is-inside-work-tree")
-    if ($InsideWorkTree.ExitCode -ne 0 -or $InsideWorkTree.Text -ne "true") {
-        Stop-ReleasePreflight "The deployed automation folder is not a Git checkout."
-    }
-
-    $StatusResult = Invoke-LocalGit -Arguments @(
-        "status", "--porcelain=v1", "--untracked-files=all"
-    )
-    if ($StatusResult.ExitCode -ne 0) {
-        Stop-ReleasePreflight "Git could not inspect the deployed checkout."
-    }
-    $Status = $StatusResult.Text
-    if ($Status) {
-        Stop-ReleasePreflight "The deployed automation has local or untracked changes: $Status"
-    }
-
-    $BranchResult = Invoke-LocalGit -Arguments @(
-        "symbolic-ref", "--quiet", "--short", "HEAD"
-    )
-    $Branch = $BranchResult.Text
-    if ($BranchResult.ExitCode -ne 0 -or $Branch -ne "main") {
-        $BranchDescription = if ($Branch) { "'$Branch'" } else { "a detached HEAD" }
-        Stop-ReleasePreflight "The deployed automation is on $BranchDescription instead of 'main'."
-    }
-
-    $HeadResult = Invoke-LocalGit -Arguments @("rev-parse", "--verify", "HEAD^{commit}")
-    if ($HeadResult.ExitCode -ne 0) {
-        Stop-ReleasePreflight "Git could not resolve the deployed HEAD commit."
-    }
-    $Head = $HeadResult.Text
-
-    $OriginMainResult = Invoke-LocalGit -Arguments @(
-        "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"
-    )
-    if ($OriginMainResult.ExitCode -ne 0) {
-        Stop-ReleasePreflight "The local origin/main reference is missing."
-    }
-    $OriginMain = $OriginMainResult.Text
-    if ($Head -ne $OriginMain) {
-        Stop-ReleasePreflight "HEAD ($Head) does not match local origin/main ($OriginMain)."
-    }
-
-    $env:RED_ONION_VERIFIED_RELEASE_COMMIT = $Head
-    Write-Host "Verified deployed release: main at $($Head.Substring(0, 12))."
-}
-
-if ($IsDeployedCheckout) {
-    Assert-DeployedRelease
-    Assert-NoSourceBytecode
-}
+# The runner uses the installed source and locked dependencies. Git branch,
+# local notes, and Python cache files are not reporting prerequisites.
+$env:RED_ONION_VERIFIED_RELEASE_COMMIT = $null
 
 # Every Python process uses isolated mode so the caller's working directory and
 # Python environment variables cannot inject imports. -B prevents this run from
@@ -155,9 +36,23 @@ $env:PYTHONPYCACHEPREFIX = Join-Path (
     [System.IO.Path]::GetTempPath()
 ) ("RedOnionMetrics-PythonCache-" + [guid]::NewGuid().ToString("N"))
 
+function Test-OperatorFolders {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    foreach ($Name in @("01 Daily Reports - Drop Here", "02 Finished Reports", "03 Archive")) {
+        if (Test-Path -LiteralPath (Join-Path $Root $Name) -PathType Container) {
+            return $true
+        }
+    }
+    return $false
+}
+
 if (-not $OperationsRoot) {
-    if ($IsDeployedCheckout) {
-        $OperationsRoot = Split-Path -Parent $RepositoryRoot
+    $ParentRoot = Split-Path -Parent $RepositoryRoot
+    if (Test-OperatorFolders -Root $RepositoryRoot) {
+        $OperationsRoot = $RepositoryRoot
+    } elseif ($ParentRoot -and (Test-OperatorFolders -Root $ParentRoot)) {
+        $OperationsRoot = $ParentRoot
     } else {
         $OperationsRoot = $RepositoryRoot
     }
@@ -507,11 +402,23 @@ $ProgramArguments = @(
     "--input-dir", $InputDir,
     "--output-dir", $OutputDir,
     "--archive-dir", $ArchiveDir,
-    "--config", $ConfigPath,
-    "--integrity-anchor-dir", $IntegrityAnchorDir
+    "--config", $ConfigPath
 )
+# Machine-local anchors belong only to explicit legacy maintenance operations.
+if ($InitializeIntegrityBaseline -or $RebindRestoredIntegrityAnchor) {
+    $ProgramArguments += @("--integrity-anchor-dir", $IntegrityAnchorDir)
+}
 if ($InitializeIntegrityBaseline) {
     $ProgramArguments += "--initialize-integrity-baseline"
+}
+if ($ReviewCorrections) {
+    $ProgramArguments += "--review-corrections"
+}
+if ($CorrectionsFile) {
+    $ProgramArguments += @("--corrections-file", $CorrectionsFile)
+}
+if ($ManagementWorkbook) {
+    $ProgramArguments += @("--management-workbook", $ManagementWorkbook)
 }
 if ($HealthCheck) {
     $ProgramArguments += "--health-check"
@@ -521,6 +428,13 @@ if ($RebindRestoredIntegrityAnchor) {
         "--rebind-restored-integrity-anchor",
         $RebindRestoredIntegrityAnchor
     )
+}
+
+if ($ReviewCorrections) {
+    # A real console must see the question before Python reads the answer.
+    # Capturing stdout in the helper would withhold the prompt until process exit.
+    & $VenvPython -I -B -c $SourceProgramBootstrap @ProgramArguments
+    exit $LASTEXITCODE
 }
 
 $ReportExitCode = Invoke-IsolatedPythonSourceProgram `

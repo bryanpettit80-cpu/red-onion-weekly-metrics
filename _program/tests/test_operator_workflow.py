@@ -447,7 +447,7 @@ def test_parser_defaults_point_to_operator_root_folders() -> None:
     assert Path(args.config).parent == metrics.PROGRAM_DIR
 
 
-def test_launchers_route_to_named_operator_workspace() -> None:
+def test_launchers_route_to_operator_workspace() -> None:
     root_launcher = (metrics.REPOSITORY_ROOT / "Run Weekly Snapshot.cmd").read_text(
         encoding="utf-8"
     )
@@ -455,7 +455,8 @@ def test_launchers_route_to_named_operator_workspace() -> None:
         encoding="utf-8"
     )
 
-    assert "Red Onion Weekly Metrics Automation" in root_launcher
+    assert "PROGRAM_COUNT" in root_launcher
+    assert "-NonInteractive" in root_launcher
     assert "-OperationsRoot" in root_launcher
     assert "01 Daily Reports - Drop Here" in powershell_runner
     assert "02 Finished Reports" in powershell_runner
