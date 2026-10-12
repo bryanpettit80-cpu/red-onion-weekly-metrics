@@ -12,6 +12,81 @@ Calculation and workbook behavior remain in the existing generator; ordinary
 orchestration, management input, and recoverable publication have small,
 separate modules.
 
+## Development and tests
+
+Use a source checkout outside the live Dropbox workspace. Do not point tests,
+experiments, or Cloud tasks at the numbered operational folders. The tests
+create synthetic workbooks and isolated temporary workspaces; private source
+reports are not required. Supported package runtimes are Python 3.10-3.12;
+use Python 3.12 for a new development environment.
+
+From the repository root, create an isolated environment on Windows:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+On Linux, including a Cloud setup workspace:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
+Then use the same commands on either platform:
+
+```text
+cd _program
+python -m pip install --require-hashes -r requirements.lock
+python -m pip install -e ".[dev]"
+python -m pip check
+python red_onion_config.py --config red_onion_config.json
+python -m pytest -q
+python -m compileall -q .
+```
+
+Run `git diff --check` from the repository root before committing. Production
+dependencies are pinned and hash-checked; the development extra currently
+allows `pytest>=8` and the build backend is not locked. Record the actual Python
+and installed package versions when diagnosing a difference between runs.
+There is no separate configured linter. Linux skips tests requiring Windows
+PowerShell; CI separately runs launcher behavior tests in the
+`windows-launcher-test` job.
+
+### Codex Cloud development
+
+Current [Cloud environments](https://learn.chatgpt.com/docs/environments/cloud-environments)
+provide published reusable development workspaces. Legacy environments remain
+relevant to Code Review and GitHub integrations. Inspect both inventories and
+reuse the environment associated with this repository before creating another.
+Keep a legacy review environment if those integrations still use it.
+
+Configure the development environment for this repository and its reviewed
+`main` branch, Python 3.12, and the installation commands above. Use the actual
+checkout directory reported by setup; no fixed `/workspace` path is required.
+There is no web server, background service, startup command, application secret,
+or required application environment variable. Each task should activate the
+virtual environment, or call its Python executable explicitly. Install packages
+from `pypi.org` and `files.pythonhosted.org`; repository access uses GitHub.
+Review the existing network and privacy settings before any change. A personal
+environment should be limited to its owner unless sharing is approved.
+
+After setup tests pass, save and publish or republish. Start a **fresh task**
+from that published environment, record its environment identifier and
+`git rev-parse HEAD`, verify `python --version` and `python -m pip check`, and
+rerun configuration validation, the test suite, and compilation. Record the
+commands, counts, skips, and failures. Saved settings or local/CI success alone
+do not establish that the published Cloud environment works.
+
+Cloud tasks use synthetic data. They do not inherit this computer's Dropbox
+files, sign-ins, scheduled tasks, local Python runtime, or Excel session.
+Do not run the operator `.cmd`/PowerShell launcher, process live intake, import
+private history, or upload operating workbooks for routine Cloud development.
+Windows launcher verification remains a Windows CI/local responsibility.
+
+### Source releases
+
 For a material source release:
 
 1. Make a focused branch and update the package version.
@@ -24,6 +99,11 @@ For a material source release:
 6. Deploy source deliberately while no reporting run is active. Use a
    fast-forward update for a maintained checkout, or replace the program source
    from the reviewed release. Preserve the operational folders and config.
+7. The tracked `00 START HERE - Red Onion Weekly Metrics.txt` is the operator
+   guide template. If its shared outer copy needs updating, review that exact
+   destination and obtain approval for the live-folder change. Back up the old
+   guide, copy the reviewed template beside the outer launcher, and compare
+   hashes. Updating the repository alone does not refresh that outer copy.
 
 Git/release review controls code deployment. They are not daily prerequisites.
 Do not commit source workbooks, finished reports, reporting state, credentials,

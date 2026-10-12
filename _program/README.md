@@ -29,15 +29,16 @@ requirements-lock identity locally and validates installed versions and
 `pip check`. A valid environment is reused; a missing or stale one is rebuilt
 for an ordinary invocation. A plain health check never installs dependencies.
 
-From this folder:
+For a local operational workspace, the setup-only command is:
 
 ```powershell
 .\Run-WeeklySnapshot.ps1 -RebuildEnvironment -HealthCheck
-python -m pip install -e ".[dev]"
-python -m pytest -q
-python -m py_compile red_onion_weekly_metrics.py
-python red_onion_config.py --config red_onion_config.json
 ```
+
+For source development and Linux/Cloud testing, use the isolated environment
+and commands in [MAINTAINER.md](../MAINTAINER.md#development-and-tests).
+The operational health check requires the local reporting folders and is not
+part of a fresh source checkout's test setup.
 
 The launcher loads local Python source directly under isolated startup.
 Adjacent or cached bytecode is not an execution source. Harmless cache files

@@ -4,6 +4,28 @@ Red Onion turns daily Marketing Vitals reports into weekly restaurant reports
 and a master workbook. Operators use the numbered folders and one launcher.
 See [SETUP.md](SETUP.md) to prepare another Windows computer.
 
+The current release is [v0.6.0](https://github.com/bryanpettit80-cpu/red-onion-weekly-metrics/releases/tag/v0.6.0).
+The reporting workflow runs locally on Windows with Python 3.10-3.12;
+Python 3.12 is recommended. Excel is optional for generation and useful for
+reviewing and editing the finished workbooks. Linux CI exercises the Python
+calculation and recovery tests; a separate Windows job tests the launchers.
+Cloud development can use the source and synthetic tests. Live Dropbox data,
+Windows launchers, and cross-computer sync require the local workflow.
+
+- Operators: [quick guide](00%20START%20HERE%20-%20Red%20Onion%20Weekly%20Metrics.txt),
+  [Windows setup](SETUP.md), and the weekly steps below.
+- Developers: [development and Cloud setup](MAINTAINER.md#development-and-tests),
+  [program map](_program/README.md), and [repository instructions](AGENTS.md).
+- Maintainers: [releases and corrections](MAINTAINER.md),
+  [recovery](RECOVERY.md), and [incident response](INCIDENT_RESPONSE.md).
+
+GitHub's reviewed `main` branch is the shared source history. A maintainer
+checkout is for source changes; the program folder in Dropbox is the deployed
+copy used by the launcher. The numbered Dropbox folders hold the operational
+inputs, finished workbooks, and recovery history. Keep the latest master with
+its management edits and the archive together. A source checkout or release
+archive is not a backup of that operational data.
+
 ## Folder layout
 
 ```text
@@ -124,57 +146,25 @@ their underlying amounts, rather than averages of displayed percentages.
 
 Rate of Sale is Red Onion's inverse conversion measure,
 `opportunities / qualifying sales`; lower positive values are better. The
-current field uses Guests as opportunities. Positive row rates combine as
-`sum(guests) / sum(guests / row rate)`. Missing or nonpositive rates make
-the combined context unavailable.
+current field uses Guests as opportunities. Missing or nonpositive rates
+make the combined context unavailable.
 
 Ticket Time is check-weighted only when every contributing row has valid
-Check Count and the total is positive:
-`sum(ticket time * checks) / sum(checks)`. The same complete check coverage
-supports Sales/Check and Guests/Check. Guest weighting is not a substitute.
+Check Count and the total is positive. Guest weighting is not a substitute.
+See the [metric formulas](MODEL_CARD.md#descriptive-context-metrics) for
+aggregation details and unavailable-data rules.
 
-### Descriptive scorecards: 2026.10-v2
+The `2026.10-v2` descriptive scorecards cover every resolved named server
+seen in the latest eight complete weeks, including someone absent from the
+latest week. Low-data people remain visible with explicit coverage limits.
+Shared POS identities and operational areas remain separate. The
+[scorecard methodology](MODEL_CARD.md#descriptive-performance-and-consistency-layer)
+defines qualified weeks, historical peers, weights, and classification rules.
 
-The latest eight globally complete weeks include every resolved named server
-who appears anywhere in that window, including someone absent from the
-latest week. Low-data people remain visible with their last-worked information
-and the reason they cannot yet be classified. Shared or numbered POS identities,
-area labels, managers, and configured exclusions are kept outside person
-comparisons and explained separately.
-
-A server-week qualifies with at least 25 guests, three active days, and five
-other qualified named peers in that store and week. Historical peers come
-from the actual historical week. Weekly peer references are medians.
-
-The main actual and peer values use identical qualified-week weights,
-`min(guests, 50)`, so their difference reconciles. Sales/Guest differences
-are dollars; Wine Mix differences are percentage points. Supporting rows
-show pooled observed actuals, variation, and recent movement separately.
-
-Data Coverage is High at six qualified weeks and 200 qualified guests,
-Provisional at four weeks and 150 guests, and Insufficient otherwise.
-Insufficient coverage receives no performance or consistency classification.
-Consistency uses the sample standard deviation of weekly peer differences:
-High requires at most $11.50 and 4.1 wine percentage points; Moderate allows
-$17.50 and 5.7 points. Recent movement compares the recent and preceding
-four-week blocks. Missing weeks are never zero.
-
-Optional exact, per-location `person_identity_aliases` can join verified name
-variants for descriptive reporting. There is no fuzzy name matching, alias
-chain, or shared-ID-to-person conversion. These aliases do not change
-management action identities or assignments.
-
-### People-review prompts: 2026.07-v3
-
-Only Sales/Guest and Wine Percentage can drive people-review prompts.
-Rate of Sale, Ticket Time, Check Count, per-check measures, and descriptive
-scorecard labels cannot create or escalate those prompts.
-
-The existing rules retain minimum samples, prior self-history, qualified
-prior same-store peers, two consecutive signals with recurring drivers,
-store-wide context checks, and leave-one-active-day stability. Targets and
-ranks remain context. Missing references or insufficient evidence prevent
-escalation.
+The separate `2026.07-v3` people-review prompts use only Sales/Guest and Wine
+Percentage with sample, history, peer, persistence, and stability checks.
+Operational context and descriptive scorecard labels cannot create or escalate
+those prompts. Missing evidence prevents escalation; missing weeks are not zero.
 
 These are rule-based observational review prompts. They do not establish
 causation, statistical confidence, total job performance, or employment

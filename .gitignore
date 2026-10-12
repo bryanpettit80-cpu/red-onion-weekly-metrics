@@ -5,6 +5,13 @@ __pycache__/
 *.egg-info/
 debug.log
 
+# Known local test/debug workspaces. Preserve their contents until cleanup is approved.
+/.pytest-tmp/
+/_program/.debug-usability/
+/_program/.pytest-usability-contract/
+/_program/.pytest-usability-one/
+/_program/.test-tmp-model-validation/
+
 # Excel source data, generated workbooks, and archives are business data, not source code.
 *.xls
 *.xlsx
