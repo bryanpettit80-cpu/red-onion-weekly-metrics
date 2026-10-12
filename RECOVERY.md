@@ -14,8 +14,8 @@ may contain management edits newer than the last run and is also needed.
 
 Store operational copies in the approved restricted backup location, outside
 the live synchronized tree. They contain Restricted Employee Performance
-Information. Retain the newest 13 weekly and 12 month-end recovery copies
-under the existing retention policy. Record and exercise a restore quarterly.
+Information. Retain the newest 13 weekly copies and the newest 12 month-end
+copies under the existing retention policy. Record and exercise a restore quarterly.
 
 Do not copy the local Python virtual environment, credentials, or application
 sign-in state. They are not reporting history. The Python environment is

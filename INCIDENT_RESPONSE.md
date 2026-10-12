@@ -32,6 +32,7 @@ If state itself is damaged, restore its matching backup as described in
 [RECOVERY.md](RECOVERY.md). Historical legacy-manifest problems should be
 investigated in a preserved legacy copy; they are not a reason to reconstruct
 machine-bound trust for portable reporting.
+Do not initialize a replacement baseline to conceal a legacy discrepancy.
 
 ## Management workbook conflict
 
