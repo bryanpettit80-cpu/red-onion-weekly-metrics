@@ -7,6 +7,10 @@ run must be downloaded locally; an unavailable cloud folder is not an empty week
 1. Download the program and the existing reporting workspace, including its
    archive and latest master workbook. Keep the plain operator folders:
    `01 Daily Reports - Drop Here`, `02 Finished Reports`, and `03 Archive`.
+   For a new workspace with no reporting history, create those three
+   folders once in File Explorer before setup. For an existing workspace,
+   download or restore any missing folder. Ordinary runs stop when a required
+   folder is unavailable and never replace it with an empty folder.
 2. Install Python 3.10, 3.11 or 3.12 with the Python launcher or Python on PATH.
    Python 3.12 is recommended. Windows PowerShell is included with Windows.
 3. From the program folder, run this setup/check command:

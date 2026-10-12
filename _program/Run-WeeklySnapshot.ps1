@@ -326,8 +326,8 @@ if (-not $ArchiveDir) {
 $BasePython = Get-PythonLauncher
 $PythonIdentity = Get-BasePythonIdentity -Launcher $BasePython
 
-# Use the standard-library-only validator before creating operator folders,
-# workflow locks, the virtual environment, or package state. The fallback keeps
+# Use the standard-library-only validator before creating workflow locks,
+# the virtual environment, or package state. The fallback keeps
 # older standalone test/copy layouts operable; released copies include the
 # dedicated validator.
 $ValidationTarget = if (Test-Path -LiteralPath $ConfigValidatorPath) {
@@ -343,6 +343,20 @@ $ValidationExitCode = Invoke-IsolatedPythonSourceProgram -Launcher $BasePython `
     -Arguments $ValidationArguments
 if ($ValidationExitCode -ne 0) {
     throw "Configuration validation failed (exit code $ValidationExitCode). No runtime folders or reports were changed."
+}
+
+$MaintenanceOnly = $HealthCheck -or [bool]$RebindRestoredIntegrityAnchor
+if (-not $MaintenanceOnly) {
+    foreach ($dir in @($InputDir, $OutputDir, $ArchiveDir)) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            throw (
+                "Reporting workspace folder unavailable: $dir. " +
+                "Download or restore the complete workspace before reporting. " +
+                "For a new workspace without reporting history, create its three operator folders once as described in SETUP.md. " +
+                "No reporting folders or reports were changed."
+            )
+        }
+    }
 }
 
 $RequirementsSha256 = Get-FileSha256 -Path $InstallRequirementsPath
@@ -388,13 +402,6 @@ if (-not (Test-PythonEnvironment)) {
         "The Red Onion Python environment failed local dependency verification. " +
         "A technical maintainer should rerun with -RebuildEnvironment."
     )
-}
-
-$MaintenanceOnly = $HealthCheck -or [bool]$RebindRestoredIntegrityAnchor
-if (-not $MaintenanceOnly) {
-    foreach ($dir in @($InputDir, $OutputDir, $ArchiveDir)) {
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    }
 }
 
 $ProgramArguments = @(

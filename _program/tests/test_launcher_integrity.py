@@ -20,6 +20,7 @@ LAUNCHER = PROGRAM_DIR / "Run-WeeklySnapshot.ps1"
 POWERSHELL = shutil.which("powershell.exe")
 GIT = shutil.which("git")
 WINDOWS_LAUNCHER_AVAILABLE = os.name == "nt" and POWERSHELL is not None
+OPERATOR_FOLDERS = ("01 Daily Reports - Drop Here", "02 Finished Reports", "03 Archive")
 
 
 def test_launcher_retains_isolated_source_loading_and_prewrite_config_validation() -> None:
@@ -78,9 +79,16 @@ def test_production_dependency_pins_are_exact_and_consistent() -> None:
         assert dependency in lock
 
 
-def _write_minimal_runner(repository_root: Path) -> Path:
+def _write_operator_folders(root: Path) -> None:
+    for name in OPERATOR_FOLDERS:
+        (root / name).mkdir(parents=True, exist_ok=True)
+
+
+def _write_minimal_runner(repository_root: Path, *, operator_folders: bool = True) -> Path:
     program_dir = repository_root / "_program"
     program_dir.mkdir(parents=True)
+    if operator_folders:
+        _write_operator_folders(repository_root)
     shutil.copy2(LAUNCHER, program_dir / LAUNCHER.name)
     (program_dir / "requirements.txt").write_text("", encoding="utf-8")
     (program_dir / "red_onion_weekly_metrics.py").write_text(
@@ -197,6 +205,42 @@ def test_standalone_non_git_copy_remains_supported(
     assert (repository_root / "01 Daily Reports - Drop Here").is_dir()
     assert (repository_root / "02 Finished Reports").is_dir()
     assert (repository_root / "03 Archive").is_dir()
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+@pytest.mark.parametrize("missing_folder", [*OPERATOR_FOLDERS, "all", "explicit archive"])
+def test_missing_workspace_folder_stops_without_recreating_data_or_environment(
+    tmp_path: Path, launcher_environment: dict[str, str], missing_folder: str,
+) -> None:
+    root = tmp_path / "Existing reporting workspace"
+    launcher = _write_minimal_runner(root, operator_folders=False)
+    selected = list(OPERATOR_FOLDERS) if missing_folder == "explicit archive" else [
+        name for name in OPERATOR_FOLDERS if name != missing_folder and missing_folder != "all"
+    ]
+    preserved = {}
+    for name in selected:
+        folder = root / name
+        folder.mkdir()
+        existing = folder / "Existing operator data.txt"
+        existing.write_text(name, encoding="utf-8")
+        preserved[existing] = existing.read_bytes()
+    environment = launcher_environment.copy()
+    local_state = tmp_path / "Unused local environment"
+    environment["LOCALAPPDATA"] = str(local_state)
+    capture_path = tmp_path / "python-arguments.txt"
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+    args = ["-ArchiveDir", str(tmp_path / "Unavailable archive")] if missing_folder == "explicit archive" else []
+
+    result = _run_launcher(launcher, environment, *args)
+
+    assert result.returncode != 0
+    assert "Reporting workspace folder unavailable" in " ".join((result.stdout + result.stderr).split())
+    assert not local_state.exists()
+    assert "--input-dir" not in capture_path.read_text(encoding="utf-8")
+    assert {p: p.read_bytes() for p in preserved} == preserved
+    for name in OPERATOR_FOLDERS:
+        assert (root / name).exists() is (name in selected)
+    assert not (tmp_path / "Unavailable archive").exists()
 
 
 @pytest.mark.skipif(
@@ -572,9 +616,9 @@ def test_operator_root_resolves_by_folder_evidence_or_explicit_argument(
     tmp_path: Path, launcher_environment: dict[str, str], layout: str
 ) -> None:
     repository_root = tmp_path / "Downloaded Program"
-    launcher = _write_minimal_runner(repository_root)
+    launcher = _write_minimal_runner(repository_root, operator_folders=False)
     expected = repository_root if layout == "own" else tmp_path
-    (expected / "01 Daily Reports - Drop Here").mkdir(exist_ok=True)
+    _write_operator_folders(expected)
     if layout == "renamed":
         renamed = tmp_path / "Any program name"
         repository_root.rename(renamed)
@@ -584,6 +628,7 @@ def test_operator_root_resolves_by_folder_evidence_or_explicit_argument(
     if layout == "explicit":
         (repository_root / "03 Archive").mkdir()
         expected = tmp_path / "Chosen workspace"
+        _write_operator_folders(expected)
         arguments = ["-OperationsRoot", str(expected)]
     capture_path = tmp_path / "root-arguments.txt"
     environment = launcher_environment.copy()
@@ -681,7 +726,7 @@ def test_explicit_correction_and_master_choices_are_forwarded(
 def test_noninteractive_review_is_rejected_before_python(
     tmp_path: Path, launcher_environment: dict[str, str]
 ) -> None:
-    launcher = _write_minimal_runner(tmp_path / "program")
+    launcher = _write_minimal_runner(tmp_path / "program", operator_folders=False)
     capture_path = tmp_path / "must-not-exist.txt"
     environment = launcher_environment.copy()
     environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
