@@ -51,6 +51,7 @@ def reconciled_day(report_date: date, source_file: str) -> list[metrics.MetricRe
 
 def rebuild_args(tmp_path: Path) -> Namespace:
     return Namespace(
+        legacy_integrity=True,
         input_dir=str(tmp_path / "01 Daily Reports - Drop Here"),
         output_dir=str(tmp_path / "02 Finished Reports"),
         archive_dir=str(tmp_path / "03 Archive"),

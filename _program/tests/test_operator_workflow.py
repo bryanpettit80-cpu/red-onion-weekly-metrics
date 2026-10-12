@@ -207,6 +207,7 @@ def full_week_records(
 
 def args_for(tmp_path: Path) -> Namespace:
     return Namespace(
+        legacy_integrity=True,
         input_dir=str(tmp_path / "Daily Reports"),
         output_dir=str(tmp_path / "Output"),
         archive_dir=str(tmp_path / "Archive - Old Files"),
@@ -217,6 +218,8 @@ def args_for(tmp_path: Path) -> Namespace:
 
 
 def initialize_integrity(args: Namespace) -> None:
+    # Explicit compatibility coverage for the legacy manifest workflow.
+    args.legacy_integrity = True
     baseline_args = Namespace(**vars(args), initialize_integrity_baseline=True)
     metrics.run(baseline_args)
 
@@ -447,7 +450,7 @@ def test_parser_defaults_point_to_operator_root_folders() -> None:
     assert Path(args.config).parent == metrics.PROGRAM_DIR
 
 
-def test_launchers_route_to_named_operator_workspace() -> None:
+def test_launchers_route_to_operator_workspace() -> None:
     root_launcher = (metrics.REPOSITORY_ROOT / "Run Weekly Snapshot.cmd").read_text(
         encoding="utf-8"
     )
@@ -455,7 +458,8 @@ def test_launchers_route_to_named_operator_workspace() -> None:
         encoding="utf-8"
     )
 
-    assert "Red Onion Weekly Metrics Automation" in root_launcher
+    assert "PROGRAM_COUNT" in root_launcher
+    assert "-NonInteractive" in root_launcher
     assert "-OperationsRoot" in root_launcher
     assert "01 Daily Reports - Drop Here" in powershell_runner
     assert "02 Finished Reports" in powershell_runner

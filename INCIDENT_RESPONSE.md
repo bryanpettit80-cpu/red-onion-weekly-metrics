@@ -1,45 +1,68 @@
-# Incident Response
+# Incident response
 
-Stop weekly processing when integrity, release, input, workbook, environment,
-or evidence approval checks fail. Preserve the intake files, console error,
-`LAST RUN STATUS.txt`, the matching `03 Archive\run-attempts` JSON, current
-manifest/anchor, and affected artifact hashes.
+Preserve the intake, console error, `LAST RUN STATUS.txt`, and relevant
+`03 Archive\Reporting State` attempt, receipt, and journal before changing
+files. Read the outcome first: `published_with_warnings` means the report
+committed even if cleanup or a status refresh needs attention.
 
-## Release or Environment Failure
+## Missing or incorrect daily reports
 
-- Do not edit the deployed checkout to silence preflight.
-- Restore a clean `main` at the approved release commit.
-- Use `-RebuildEnvironment` only after configuration and lock review.
-- Resume after release parity, dependency verification, health check, and full
-  tests pass.
+Leave intake available for correction. Confirm the embedded business date,
+both restaurant locations, and the listed missing restaurant-days. Replace
+invalid exports from the authoritative reporting source. An actual closure
+needs an explicit verified `closed_dates` entry; do not assume a missing day
+was closed.
 
-## Manifest, Raw Data, or Workbook Integrity Failure
+Identical business facts are safe duplicates. For changed facts, run
+`-ReviewCorrections`, inspect the displayed differences, and choose once per
+date. Do not delete accepted history or rename a conflicting report to hide it.
 
-- Do not initialize a replacement baseline.
-- Prevent further Dropbox edits where practical.
-- Compare the trusted anchor, manifest chain, canonical raw inventory,
-  generated-workbook snapshot, published workbook, and independent recovery
-  copy.
-- Restore only an exact verified version. Record hashes and who approved it.
-- Resume only after health and integrity verification succeed.
+## Publication or recovery conflict
 
-## Incorrect or Missing Daily Report
+Close Excel and wait for cloud files to be available. Retry only after
+resolving the stated issue. The runner reconciles pending journals before
+starting new reporting work.
 
-- Leave active files in intake.
-- Replace incomplete exports from the authoritative Red Onion reporting source.
-- Re-run only after the business date, locations, and duplicate/conflict
-  messages are reconciled.
+If recovery detects a newer external edit, preserve both that file and the
+previous-good copy identified by the journal. Reconcile the business inputs
+before choosing the intended version. Do not remove Reporting State, edit
+receipt hashes, or reset a baseline to silence an error.
 
-## Employee-Performance or Evidence Incident
+If state itself is damaged, restore its matching backup as described in
+[RECOVERY.md](RECOVERY.md). Historical legacy-manifest problems should be
+investigated in a preserved legacy copy; they are not a reason to reconstruct
+machine-bound trust for portable reporting.
+Do not initialize a replacement baseline to conceal a legacy discrepancy.
 
-- Restrict access immediately and preserve the approved candidate,
-  fingerprint, approval receipt, and distribution facts.
-- Do not create a replacement approval for altered bytes.
-- Notify the business owner; document recipients, scope, dates, and requested
-  deletion/correction.
-- Resume evidence use only after the exact approved purpose and 365-day
-  retention obligations are restored.
+## Management workbook conflict
 
-For every incident, record owner, timeline, evidence preserved, root cause,
-corrective action, validation, approval to resume, and any required employee
-correction.
+A filename change or formatting save is allowed. Required tables, columns,
+Action IDs, and valid input values must remain readable. If multiple copies
+contain different edits, preserve them and select the intended copy with
+`-ManagementWorkbook`. Missing/duplicate Action IDs or invalid dispositions
+must be corrected explicitly.
+
+The committed snapshot can recover management state saved at the last run.
+It cannot recover later workbook edits without that newer workbook or backup.
+
+## Source or environment failure
+
+Review a source change through normal repository maintenance. Ordinary runs
+do not require a clean branch or `HEAD == origin/main`.
+
+For a missing/stale Python environment, use
+`-RebuildEnvironment -HealthCheck`. This repairs local dependencies without
+processing reports. Verify the corrected source/environment on a copy when
+the failure involves implementation changes.
+
+## Employee evidence or distribution incident
+
+Restrict access and preserve the candidate, fingerprint, approval receipt, and
+known distribution facts. An approval for one candidate/purpose cannot be
+reused for altered bytes or broader distribution. Document the business owner,
+recipients, dates, scope, correction/deletion actions, and retention obligations.
+The reporting application does not send evidence automatically.
+
+Record the incident owner, timeline, cause, preserved evidence, correction,
+validation, and decision to resume. Report what was verified and what remains
+unknown.

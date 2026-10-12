@@ -375,6 +375,7 @@ def test_health_check_is_read_only_when_runtime_folders_are_missing(
     tmp_path: Path,
 ) -> None:
     args = Namespace(
+        legacy_integrity=True,
         input_dir=str(tmp_path / "input"),
         output_dir=str(tmp_path / "output"),
         archive_dir=str(tmp_path / "archive"),
@@ -436,6 +437,7 @@ def test_health_check_does_not_call_empty_integrity_baseline_a_publication(
 
     payload = metrics.build_health_check(
         Namespace(
+            legacy_integrity=True,
             input_dir=str(input_dir),
             output_dir=str(output_dir),
             archive_dir=str(archive_dir),
@@ -492,6 +494,7 @@ def test_health_check_reports_metadata_drift_as_structured_ready_warning(
 
     payload = metrics.build_health_check(
         Namespace(
+            legacy_integrity=True,
             input_dir=str(input_dir),
             output_dir=str(output_dir),
             archive_dir=str(archive_dir),

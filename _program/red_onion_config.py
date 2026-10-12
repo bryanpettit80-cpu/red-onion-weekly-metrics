@@ -11,6 +11,7 @@ from typing import Any
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "closed_dates": {},
     "locations": {
         "RC Richmond": {"short_code": "RVA"},
         "RC Virginia Beach": {"short_code": "VB"},
@@ -32,7 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dashboard_long_term_developing_min_recent_guests": 75,
     "dashboard_long_term_developing_min_earlier_guests": 50,
     "dashboard_exclude_name_contains": ["Banquet", "Server"],
-    "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout"],
+    "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout", "* Office Computer"],
     "management_score_thresholds": {
         "check_average": {"neutral": 11.5, "strong": 17.5, "lower_is_better": False},
         "wine_pct": {"neutral": 0.041, "strong": 0.057, "lower_is_better": False},
@@ -98,6 +99,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "Bar Server": "Bar",
         "BarPatio Bartender Patio": "Patio",
     },
+    "person_identity_aliases": {},
     "weekly_area_name_patterns": {
         "Bar": ["Bar"],
         "Patio": ["Patio"],
@@ -316,6 +318,43 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 target, f"public_name_aliases.{source}"
             )
         payload["public_name_aliases"] = normalized_aliases
+
+    if "person_identity_aliases" in payload:
+        locations = {**DEFAULT_CONFIG["locations"], **payload.get("locations", {})}
+        identity_aliases = _require_mapping(
+            payload["person_identity_aliases"], "person_identity_aliases"
+        )
+        normalized_identity_aliases: dict[str, dict[str, str]] = {}
+        for location, aliases_value in identity_aliases.items():
+            location = _require_string(location, "person_identity_aliases location")
+            if location not in locations:
+                raise ConfigError(
+                    f"person_identity_aliases location {location!r} is not configured."
+                )
+            if location in normalized_identity_aliases:
+                raise ConfigError("person_identity_aliases locations must be unique after trimming.")
+            aliases = _require_mapping(aliases_value, f"person_identity_aliases.{location}")
+            normalized: dict[str, str] = {}
+            for source, target in aliases.items():
+                source = _require_string(source, f"person_identity_aliases.{location} key")
+                target = _require_string(target, f"person_identity_aliases.{location}.{source}")
+                if source in normalized:
+                    raise ConfigError("person_identity_aliases keys must be unique after trimming.")
+                if source == target:
+                    raise ConfigError("person_identity_aliases must map different raw names.")
+                if any(
+                    name.isdecimal()
+                    or re.match(r"^\d{4}\b", name)
+                    or re.fullmatch(r"\d+\s+Server\d*(?:\s+Server\d*)*", name, re.IGNORECASE)
+                    or re.fullmatch(r"server\s*\d+(?:\s+server\s*\d+)?", name, re.IGNORECASE)
+                    for name in (source, target)
+                ):
+                    raise ConfigError("person_identity_aliases cannot convert shared POS or numbered server identities into people.")
+                normalized[source] = target
+            if set(normalized) & set(normalized.values()):
+                raise ConfigError("person_identity_aliases must map directly to a canonical name; chains and cycles are not allowed.")
+            normalized_identity_aliases[location] = normalized
+        payload["person_identity_aliases"] = normalized_identity_aliases
 
     if "weekly_area_name_patterns" in payload:
         patterns = _require_mapping(
@@ -560,6 +599,22 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     merged = _deep_merge(DEFAULT_CONFIG, payload)
     _validate_effective_locations(merged["locations"])
+    closures = _require_mapping(merged["closed_dates"], "closed_dates")
+    for location, values in closures.items():
+        if location not in merged["locations"]:
+            raise ConfigError(f"closed_dates names an unknown location: {location}.")
+        normalized = _validate_string_list(values, f"closed_dates.{location}")
+        for value in normalized:
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError as exc:
+                raise ConfigError(f"closed_dates.{location} dates must be YYYY-MM-DD.") from exc
+            if parsed.isoformat() != value or parsed.weekday() == 0:
+                raise ConfigError(
+                    f"closed_dates.{location} must contain YYYY-MM-DD Tuesday-Sunday "
+                    f"business dates; received {value!r}."
+                )
+        closures[location] = sorted(normalized)
     if (
         merged["dashboard_long_term_full_weeks"]
         != merged["dashboard_long_term_block_weeks"] * 2

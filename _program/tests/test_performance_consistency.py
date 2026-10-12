@@ -107,7 +107,34 @@ def test_shared_pos_number_does_not_reclassify_an_embedded_number() -> None:
     )
 
 
-@pytest.mark.parametrize("name", ["Barbara Smith", "Bart Jones"])
+def test_verified_office_account_is_shared_without_guessing_an_operating_area() -> None:
+    week_end = date(2026, 8, 9)
+    office = weekly_server_row(week_end, "* Office Computer", guests=10, spg=50)
+    person = weekly_server_row(week_end, "Taylor Office", guests=20, spg=100)
+    config = one_location_config()
+    location_rows = [weekly_location_row(week_end)]
+
+    people = metrics.build_performance_consistency_model([office, person], location_rows, config)
+    assert {row["raw_user_name"] for row in people["summary_rows"]} == {"Taylor Office"}
+    assert people["excluded_rows"][0]["raw_user_name"] == "* Office Computer"
+    assert people["excluded_rows"][0]["reason"].startswith("Shared POS identity")
+    assert metrics.dashboard_excluded(office, config) is True
+    assert metrics.shared_pos_number(office) is None
+    assert metrics.weekly_area_for_row(office, config) is None
+
+    shared = metrics.build_shared_area_trends_model([office, person], location_rows, config)
+    assert len(shared["shared_rows"]) == 1
+    row = shared["shared_rows"][0]
+    assert row["shared_number"] == "Office Computer"
+    assert row["pos_label"] == "* Office Computer"
+    assert row["latest_gross_sales"] == pytest.approx(500)
+    assert row["latest_guest_count"] == pytest.approx(10)
+    dining = next(row for row in shared["area_rows"] if row["location"] == "RC Richmond" and row["area"] == "Dining Room")
+    assert dining["latest_gross_sales"] == pytest.approx(2000)
+    assert dining["latest_guest_count"] == pytest.approx(20)
+
+
+@pytest.mark.parametrize("name", ["Barbara Smith", "Bart Jones", "Taylor Serverton"])
 def test_weekly_area_bar_pattern_does_not_match_person_name_prefixes(
     name: str,
 ) -> None:
@@ -210,7 +237,11 @@ def test_model_uses_capped_weighted_peer_gaps_and_sample_sd() -> None:
     assert target["recent_wine_delta"] == pytest.approx(0.0)
     assert target["performance_level"] == "Strong"
     assert target["consistency"] == "High"
-    assert target["confidence"] == "High"
+    assert target["data_coverage"] == "High"
+    assert target["comparison_spg"] == pytest.approx(112.0)
+    assert target["peer_spg"] == pytest.approx(100.0)
+    assert target["comparison_wine_pct"] == pytest.approx(0.12)
+    assert target["peer_wine_pct"] == pytest.approx(0.10)
     assert target["overall_read"] == "Consistently Strong"
     overall = model["overall_store"]
     assert overall["gross_sales"] == pytest.approx(100_000.0)
@@ -247,12 +278,12 @@ def test_models_require_every_configured_location_for_a_complete_shared_week() -
     assert shared_areas["latest_complete_week_end"] is None
 
 
-def test_peer_pool_excludes_people_not_on_the_latest_complete_roster() -> None:
+def test_historical_peers_and_roster_include_people_absent_from_the_latest_week() -> None:
     first = date(2026, 6, 21)
     week_ends = [first + timedelta(days=7 * offset) for offset in range(8)]
     server_rows: list[dict[str, object]] = []
     for week_end in week_ends:
-        server_rows.append(weekly_server_row(week_end, "Taylor Guest"))
+        server_rows.append(weekly_server_row(week_end, "Taylor Guest", spg=112.0, wine_pct=0.12, guests=60))
         for peer_number in range(1, 5):
             server_rows.append(weekly_server_row(week_end, f"Current Peer {peer_number}"))
         if week_end != week_ends[-1]:
@@ -266,12 +297,23 @@ def test_peer_pool_excludes_people_not_on_the_latest_complete_roster() -> None:
     )
     target = row_for(model, "Taylor Guest")
 
-    assert target["qualified_weeks"] == 0
-    assert target["confidence"] == "Insufficient"
-    assert target["overall_read"] == "Insufficient Data"
-    assert "Former Peer" not in {
+    assert target["qualified_weeks"] == 7
+    assert target["qualified_guests"] == 420
+    assert target["data_coverage"] == "High"
+    assert target["overall_read"] == "Consistently Strong"
+    assert target["average_spg_gap"] == pytest.approx(12.0)
+    assert target["average_wine_gap"] == pytest.approx(0.02)
+    assert target["weekly_spg_gap_sd"] == pytest.approx(0.0)
+    assert "Former Peer" in {
         row["display_name"] for row in model["summary_rows"]  # type: ignore[index]
     }
+    former = row_for(model, "Former Peer")
+    assert former["last_worked_week_end"] == week_ends[-2]
+    assert former["present_latest_week"] is False
+    assert former["weekly_bands"][week_ends[-1]] == "—"
+    latest_taylor = next(row for row in model["detail_rows"] if row["display_name"] == "Taylor Guest" and row["week_end"] == week_ends[-1])
+    assert latest_taylor["qualified"] is False
+    assert latest_taylor["qualification_note"] == "4 eligible peers; needs 5"
 
 
 def test_shared_pos_row_has_no_scorecard_and_does_not_shift_peer_median() -> None:
@@ -365,7 +407,7 @@ def test_historical_shared_pos_alias_is_absent_from_row_lookup_and_peer_pool() -
     assert first_taylor["spg_gap"] == pytest.approx(0.0)
 
 
-def test_confidence_gates_include_the_exact_six_200_and_four_150_boundaries() -> None:
+def test_data_coverage_gates_include_the_exact_six_200_and_four_150_boundaries() -> None:
     first = date(2026, 6, 21)
     week_ends = [first + timedelta(days=7 * offset) for offset in range(8)]
     high_guests = (34, 34, 33, 33, 33, 33, 24, 24)
@@ -401,13 +443,13 @@ def test_confidence_gates_include_the_exact_six_200_and_four_150_boundaries() ->
     provisional = row_for(model, "Provisional Boundary")
 
     assert (high["qualified_weeks"], high["qualified_guests"]) == (6, 200)
-    assert high["confidence"] == "High"
+    assert high["data_coverage"] == "High"
     assert high["weekly_spg_gap_sd"] == pytest.approx(stdev(high_gaps[:6]))
     assert (provisional["qualified_weeks"], provisional["qualified_guests"]) == (
         4,
         150,
     )
-    assert provisional["confidence"] == "Provisional"
+    assert provisional["data_coverage"] == "Provisional"
 
 
 def test_shared_numbers_and_areas_use_complete_week_weighted_rollups() -> None:
@@ -463,6 +505,182 @@ def test_shared_numbers_and_areas_use_complete_week_weighted_rollups() -> None:
     assert all_store["Banquets"]["latest_check_average"] == pytest.approx(140.0)
     assert all_store["Wine Dinners"]["latest_check_average"] == pytest.approx(160.0)
     assert all_store["Dining Room"]["latest_guest_count"] == pytest.approx(40.0)
+
+
+def test_stable_below_peer_results_remain_below_with_high_data_coverage() -> None:
+    server_rows, location_rows = eight_week_dataset()
+    for row in server_rows:
+        if row["raw_user_name"] == "Taylor Guest":
+            row.update(weekly_server_row(row["week_end"], "Taylor Guest", spg=88.0, wine_pct=0.08, guests=60))
+    target = row_for(metrics.build_performance_consistency_model(server_rows, location_rows, one_location_config()), "Taylor Guest")
+
+    assert target["overall_read"] == "Consistently Below"
+    assert target["data_coverage"] == "High"
+    assert target["consistency"] == "High"
+    assert target["average_spg_gap"] == pytest.approx(-12.0)
+    assert target["average_wine_gap"] == pytest.approx(-0.02)
+    assert target["weekly_spg_gap_sd"] == pytest.approx(0.0)
+
+
+def test_low_sample_server_stays_visible_with_actuals_last_worked_and_reason() -> None:
+    server_rows, location_rows = eight_week_dataset()
+    last_worked = location_rows[-2]["week_end"] - timedelta(days=2)
+    novice = weekly_server_row(location_rows[-2]["week_end"], "New Colleague", spg=130, wine_pct=0.14, guests=12, active_days=1)
+    novice["daily_records"] = [{"report_date": last_worked, "guest_count": 12, "gross_sales": 1560, "wine_sales": 218.4}]
+    server_rows.append(novice)
+    model = metrics.build_performance_consistency_model(server_rows, location_rows, one_location_config())
+    target = row_for(model, "New Colleague")
+
+    assert target["data_coverage"] == "Insufficient"
+    assert target["performance_level"] == "Not Evaluated"
+    assert target["overall_read"] == "Insufficient Data"
+    assert target["comparison_spg"] is None
+    assert target["observed_spg"] == pytest.approx(130.0)
+    assert target["observed_wine_pct"] == pytest.approx(0.14)
+    assert target["last_worked_date"] == last_worked
+    assert target["present_latest_week"] is False
+    assert "1 week below 25 guests or 3 active days" in target["coverage_note"]
+    assert "4 qualified weeks and 150 guests" in target["coverage_note"]
+
+
+def test_roster_uses_only_the_latest_eight_globally_complete_weeks() -> None:
+    server_rows, location_rows = eight_week_dataset()
+    old_week = location_rows[0]["week_end"] - timedelta(days=7)
+    incomplete_week = location_rows[-1]["week_end"] + timedelta(days=7)
+    location_rows.insert(0, weekly_location_row(old_week))
+    incomplete = weekly_location_row(incomplete_week)
+    incomplete["source_days"] = 5
+    location_rows.append(incomplete)
+    server_rows.extend([
+        weekly_server_row(old_week, "Outside Window"),
+        weekly_server_row(incomplete_week, "Incomplete Week Only"),
+    ])
+    model = metrics.build_performance_consistency_model(server_rows, location_rows, one_location_config())
+
+    assert len(model["week_ends"]) == 8
+    assert model["complete_week_count"] == 9
+    assert {row["display_name"] for row in model["summary_rows"]}.isdisjoint({"Outside Window", "Incomplete Week Only"})
+
+
+def test_configured_exclusions_have_reasons_without_matching_name_substrings() -> None:
+    server_rows, location_rows = eight_week_dataset()
+    latest = location_rows[-1]["week_end"]
+    server_rows.extend([
+        weekly_server_row(latest, "Taylor Serverton", guests=10, active_days=1),
+        weekly_server_row(latest, "Jonathan Josephs"),
+        weekly_server_row(latest, "5050 Server Server2"),
+    ])
+    config = one_location_config()
+    model = metrics.build_performance_consistency_model(server_rows, location_rows, config)
+
+    assert row_for(model, "Taylor Serverton")["data_coverage"] == "Insufficient"
+    exclusions = {row["raw_user_name"]: row["reason"] for row in model["excluded_rows"]}
+    assert exclusions["Jonathan Josephs"] == "Configured exclusion: Jonathan Josephs"
+    assert exclusions["5050 Server Server2"].startswith("Shared POS identity")
+    # The isolated descriptive correction must not change the existing management gate.
+    assert metrics.dashboard_excluded(server_rows[-3], config) is True
+
+
+def test_explicit_person_alias_joins_history_without_changing_management_identities() -> None:
+    server_rows, location_rows = eight_week_dataset()
+    original = deepcopy(server_rows)
+    for row in server_rows:
+        if row["raw_user_name"] == "Taylor Guest" and row["week_end"] <= location_rows[2]["week_end"]:
+            row["raw_user_name"] = "Taylor G."
+            row["display_name"] = "Taylor G."
+    before = deepcopy(server_rows)
+    config = one_location_config()
+    config["person_identity_aliases"] = {"RC Richmond": {"Taylor G.": "Taylor Guest"}}
+    mapped = metrics.build_performance_consistency_model(server_rows, location_rows, config)
+    baseline = metrics.build_performance_consistency_model(original, location_rows, one_location_config())
+    target = row_for(mapped, "Taylor Guest")
+
+    assert server_rows == before
+    assert target["qualified_weeks"] == 8
+    assert target["average_spg_gap"] == row_for(baseline, "Taylor Guest")["average_spg_gap"]
+    assert target["source_raw_names"] == ("Taylor G.", "Taylor Guest")
+    assert "Taylor G." not in {row["display_name"] for row in mapped["summary_rows"]}
+    unmapped = metrics.build_performance_consistency_model(server_rows, location_rows, one_location_config())
+    assert {"Taylor G.", "Taylor Guest"}.issubset({row["display_name"] for row in unmapped["summary_rows"]})
+
+
+def test_person_alias_only_combines_same_week_when_daily_dates_do_not_overlap() -> None:
+    week_end = date(2026, 8, 9)
+    config = one_location_config()
+    config["person_identity_aliases"] = {"RC Richmond": {"Taylor G.": "Taylor Guest"}}
+    parts = [
+        weekly_server_row(week_end, "Taylor G.", spg=100, guests=10, active_days=1),
+        weekly_server_row(week_end, "Taylor Guest", spg=120, guests=20, active_days=1),
+    ]
+    for index, row in enumerate(parts):
+        row["daily_records"] = [{"report_date": week_end - timedelta(days=index), "guest_count": row["guest_count"], "gross_sales": row["gross_sales"], "wine_sales": row["wine_sales"]}]
+    resolved, excluded = metrics.descriptive_person_rows(parts, config)
+    assert not excluded
+    assert len(resolved) == 1
+    assert resolved[0]["active_days"] == 2
+    assert resolved[0]["guest_count"] == 30
+    assert resolved[0]["check_average"] == pytest.approx(3400 / 30)
+
+    parts[1]["daily_records"][0]["report_date"] = week_end
+    with pytest.raises(ValueError, match="overlap or lack daily evidence"):
+        metrics.descriptive_person_rows(parts, config)
+    parts[1].pop("daily_records")
+    with pytest.raises(ValueError, match="overlap or lack daily evidence"):
+        metrics.descriptive_person_rows(parts, config)
+
+
+def test_alias_mapping_cannot_turn_shared_identity_into_a_person_even_without_validation() -> None:
+    config = one_location_config()
+    config["person_identity_aliases"] = {"RC Richmond": {"5050 Server Server2": "Taylor Guest"}}
+    resolved, excluded = metrics.descriptive_person_rows([weekly_server_row(date(2026, 8, 9), "5050 Server Server2")], config)
+    assert resolved == []
+    assert excluded[0]["reason"].startswith("Shared POS identity")
+
+
+def test_displayed_actual_and_peer_values_reconcile_with_capped_weighted_gaps() -> None:
+    server_rows, location_rows = eight_week_dataset()
+    for index, location in enumerate(location_rows):
+        for row in server_rows:
+            if row["week_end"] != location["week_end"]:
+                continue
+            row.update(weekly_server_row(row["week_end"], row["raw_user_name"],
+                spg=(112 if index < 4 else 150) if row["raw_user_name"] == "Taylor Guest" else (100 if index < 4 else 120),
+                guests=(30 if index < 4 else 100) if row["raw_user_name"] == "Taylor Guest" else 50,
+                wine_pct=0.12 if row["raw_user_name"] == "Taylor Guest" else 0.10))
+    target = row_for(metrics.build_performance_consistency_model(server_rows, location_rows, one_location_config()), "Taylor Guest")
+
+    assert target["comparison_spg"] == pytest.approx((112 * 30 + 150 * 50) / 80)
+    assert target["peer_spg"] == pytest.approx((100 * 30 + 120 * 50) / 80)
+    assert target["comparison_spg"] - target["peer_spg"] == pytest.approx(target["average_spg_gap"])
+    assert target["comparison_wine_pct"] - target["peer_wine_pct"] == pytest.approx(target["average_wine_gap"])
+    assert target["observed_spg"] == pytest.approx((112 * 30 + 150 * 100) / 130)
+
+
+def test_dashboard_does_not_hide_seventh_server_or_insufficient_data_people() -> None:
+    server_rows, location_rows = eight_week_dataset()
+    for location in location_rows:
+        for number in range(1, 6):
+            server_rows.append(weekly_server_row(location["week_end"], f"Additional Colleague {number}"))
+    server_rows.append(weekly_server_row(location_rows[-2]["week_end"], "Limited Colleague", guests=10, active_days=1))
+    config = one_location_config()
+    model = metrics.build_performance_consistency_model(server_rows, location_rows, config)
+    latest = model["latest_complete_week_end"]
+    readiness = metrics.LatestWeekReadiness(
+        latest_week_end=latest, latest_location_rows=(location_rows[-1],), configured_locations=("RC Richmond",),
+        location_gaps=(), expected_dates=(), received_dates=frozenset(), missing_dates=(), ready=True,
+    )
+    workbook = Workbook()
+    metrics.write_performance_consistency_sheets(workbook, model, config, readiness)
+    dashboard = workbook["Performance Dashboard"]
+    values = [cell.value for cell in dashboard._cells.values()]
+    for row in model["summary_rows"]:
+        assert values.count(row["display_name"]) == 1
+    assert "Limited Colleague" in values
+    assert "all 11 qualifying servers" in dashboard["A17"].value
+    assert "Confidence" not in values
+    last_name_row = max(cell.row for cell in dashboard._cells.values() if cell.value in {row["display_name"] for row in model["summary_rows"]})
+    assert int(dashboard._charts[0].anchor[1:]) > last_name_row
+    workbook.close()
 
 
 def test_shared_number_can_feed_a_configured_area_without_becoming_a_person() -> None:
@@ -574,7 +792,20 @@ def test_generated_sheets_preserve_navigation_protection_and_audit_boundary(
         assert reloaded["_Consistency Calc"].sheet_state == "veryHidden"
         assert reloaded["_Consistency Calc"].protection.sheet is True
         assert reloaded["Server Scorecards"].tables["ServerScorecardsTable"].ref == "A6:P12"
-        assert reloaded["Weekly Performance"].tables["WeeklyPerformanceTable"].ref == "A6:O12"
+        assert reloaded["Weekly Performance"].tables["WeeklyPerformanceTable"].ref == "A6:Q12"
+        assert "ServerScorecardDetailTable" in reloaded["Server Scorecards"].tables
+        scorecards = reloaded["Server Scorecards"]
+        assert [scorecards.cell(6, column).value for column in (3, 4, 9, 10, 11, 12, 13, 14)] == [
+            "Last Worked", "Data Coverage", "Actual $ / Guest", "Peer $ / Guest", "$ / Guest Difference",
+            "Actual Wine Share", "Peer Wine Share", "Wine Difference (pp)",
+        ]
+        taylor_row = next(row for row in range(7, 13) if scorecards.cell(row, 2).value == "Taylor Guest")
+        assert scorecards.cell(taylor_row, 9).value == pytest.approx(112.0)
+        assert scorecards.cell(taylor_row, 10).value == pytest.approx(100.0)
+        assert scorecards.cell(taylor_row, 11).value == pytest.approx(12.0)
+        assert scorecards.cell(taylor_row, 14).value == pytest.approx(2.0)
+        assert '" pp"' in scorecards.cell(taylor_row, 14).number_format
+        assert not any(" SD" in str(scorecards.cell(6, column).value) for column in range(1, 17))
         assert "SharedPosTrendTable" in reloaded["Shared & Area Trends"].tables
         assert "AreaCheckAverageTrendTable" in reloaded["Shared & Area Trends"].tables
         shared_area_sheet = reloaded["Shared & Area Trends"]

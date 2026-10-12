@@ -35,12 +35,12 @@ def test_daily_report_discovery_accepts_xls_and_xlsx_and_ignores_temporary_files
         "Daily Report first.xls",
         "Daily Report second.xlsx",
         "daily report third.XLSX",
+        "Other workbook.xlsx",
     }
     for name in [
         *expected_names,
         "~$Daily Report temporary.xlsx",
         "Daily Report notes.csv",
-        "Other workbook.xlsx",
     ]:
         (tmp_path / name).write_text("placeholder", encoding="utf-8")
 

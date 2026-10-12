@@ -1,132 +1,171 @@
-# Red Onion Maintainer Guide
+# Red Onion maintainer guide
 
-This repository is the released generator inside the operator-friendly Dropbox
-workspace. Operators use the root `Run Weekly Snapshot.cmd`; maintainers own
-release, configuration, recovery, and incident work.
+Operators use `Run Weekly Snapshot.cmd`. Maintainers own configuration,
+program releases, unusual corrections, and recovery. The ordinary workflow
+does not require Git, a release tag, a clean checkout, historical derivative
+hashes, or a machine-local trust anchor.
 
-## Architecture
+## Architecture and releases
 
-- `_program/red_onion_config.py`: standard-library schema validation.
-- `_program/red_onion_runtime.py`: atomic attempt logs and last-run status.
-- `_program/red_onion_integrity.py`: inventories, manifests, hashes, and atomic
-  chained-manifest primitives.
-- `_program/red_onion_weekly_metrics.py`: parsing, deterministic business rules,
-  workbook generation, evidence export, publication, and transactional rollback.
-- `_program/Run-WeeklySnapshot.ps1`: release preflight, environment validation,
-  explicit environment rebuild, read-only health-check routing, and Python launch.
+[Program notes](./_program/README.md) map module responsibilities.
+Calculation and workbook behavior remain in the existing generator; ordinary
+orchestration, management input, and recoverable publication have small,
+separate modules.
 
-Generated workbooks, source reports, archives, machine-local environments, and
-recovery bundles are operating data and are not committed.
+For a material source release:
 
-## Release Procedure
+1. Make a focused branch and update the package version.
+2. From `_program`, install `.[dev]`, run `python -m pytest -q`, and run
+   `python -m py_compile red_onion_weekly_metrics.py`.
+3. Validate configuration and run `git diff --check`.
+4. Review the patch and CI, including Python 3.10-3.12 and Windows launcher
+   checks. Record what was actually validated.
+5. Publish the reviewed source through the repository's normal release process.
+6. Deploy source deliberately while no reporting run is active. Use a
+   fast-forward update for a maintained checkout, or replace the program source
+   from the reviewed release. Preserve the operational folders and config.
 
-1. Start from a clean branch based on `origin/main`.
-2. Update the package version for a material release.
-3. From `_program`, run:
+Git/release review controls code deployment. They are not daily prerequisites.
+Do not commit source workbooks, finished reports, reporting state, credentials,
+or machine-local environments. A local source/release bundle can be built with
+`Build-RecoveryBundle.ps1`; portable operational backup is covered separately
+in [RECOVERY.md](RECOVERY.md).
 
-   ```powershell
-   python -m pip install -e ".[dev]"
-   python -m pytest -q
-   python -m py_compile red_onion_weekly_metrics.py
-   ```
-
-4. Run `git diff --check`.
-5. Use a pull request and require all Python 3.10-3.12 and Windows launcher
-   checks to pass.
-6. Merge, update the deployed Dropbox checkout by fast-forward only, and prove
-   `HEAD == origin/main`. The launcher isolates Python bytecode lookup and does
-   not require maintainer cleanup of ignored `__pycache__` files.
-7. Create an annotated `vX.Y.Z` tag and GitHub Release.
-8. Build and independently retain a recovery bundle:
-
-   ```powershell
-   .\Build-RecoveryBundle.ps1 -DestinationDirectory C:\Recovery\RedOnion
-   ```
-
-No generated customer workbook belongs in a GitHub Release.
-
-## Configuration
-
-Validate before review or deployment:
+## Configuration and environment
 
 ```powershell
 python _program\red_onion_config.py --config _program\red_onion_config.json
 python _program\red_onion_weekly_metrics.py --validate-config
-```
-
-Unknown keys, duplicate JSON keys, empty or duplicate location codes, invalid
-types, non-finite/negative thresholds, and inconsistent trend windows fail.
-Configuration is validated before runtime folders, locks, or environments are
-created.
-
-## Dependencies and Runtime
-
-`requirements.txt` lists direct dependencies. `requirements.lock` contains the
-reviewed transitive graph and hashes. `requirements-constraints.txt` keeps the
-single lock compatible with Python 3.10-3.12.
-
-Regenerate deliberately:
-
-```powershell
-python -m pip install pip-tools==7.5.2
-python -m piptools compile requirements.txt `
-  --constraint requirements-constraints.txt `
-  --generate-hashes --allow-unsafe `
-  --output-file requirements.lock
-```
-
-The weekly launcher does not reinstall packages. It verifies the Python
-identity, lock hash, installed direct versions, and `pip check`. It rebuilds
-only when state is missing/stale or a maintainer explicitly runs:
-
-```powershell
 .\_program\Run-WeeklySnapshot.ps1 -RebuildEnvironment -HealthCheck
 ```
 
-That combination rebuilds and validates the environment without processing
-weekly reports. Using `-RebuildEnvironment` by itself rebuilds first and then
-continues with the requested weekly run.
+The rebuild/check combination installs locked dependencies and checks the
+workspace without processing intake. Ordinary runs reuse a valid environment
+and rebuild it if missing or stale. Plain `-HealthCheck` is read-only and
+does not install. The environment under
+`%LOCALAPPDATA%\RedOnionMetrics` is disposable; do not copy it between PCs.
 
-## Health and Evidence
+Keep `requirements.txt`, `pyproject.toml`, the hashed `requirements.lock`,
+and `requirements-constraints.txt` aligned. Regenerate a lock deliberately
+using the documented Python range and review the dependency diff:
 
-The local health check is read-only:
+```powershell
+python -m pip install pip-tools==7.5.2
+python -m piptools compile requirements.txt --constraint requirements-constraints.txt --generate-hashes --allow-unsafe --output-file requirements.lock
+```
+
+Run those dependency commands from `_program`. A dependency update is a
+source-maintenance task; ordinary reporting does not download a new release.
+
+`closed_dates` is an explicit per-location list of verified Tuesday-Sunday
+closures, not a way to suppress missing-report messages. `person_identity_aliases`
+maps exact raw names to verified canonical names per location for descriptive
+scorecards only. It cannot map shared/numbered IDs to people or chain aliases.
+Same-week merges require disjoint daily evidence; ambiguous overlaps stop.
+Neither setting should be inferred from a person's apparent absence.
+
+## Health, result, and readiness are different
 
 ```powershell
 .\_program\Run-WeeklySnapshot.ps1 -HealthCheck
 python _program\red_onion_weekly_metrics.py --health-check-json
 ```
 
-It verifies exact managed per-location workbook bytes plus the protected
-substantive content of the master workbook through the integrity manifest.
-Generated values and formulas, workbook schema, editable-cell boundaries,
-display-affecting formats, chart content and bindings, hidden dimensions,
-internal-link destinations, drawings, external links, and protection controls
-remain fail-closed. Proven equivalent Excel serialization defaults are reported
-without blocking when substantive content still matches the manifest-pinned
-archived master. Approved editable master values, `LAST RUN STATUS.txt`,
-Dropbox sync, and recipient access are outside
-that claim. It never claims that independent recovery is healthy; recovery
-remains `ExternalCheckRequired` until the current private backup and
-restore-test evidence are verified separately.
+Current health output checks configuration, local folders, accepted reporting
+state, and pending recovery. It does not prove a new week is complete, that
+cloud sync finished, or that a recipient can open a workbook. A journal may
+need reconciliation by the next ordinary invocation.
 
-Replacement-machine recovery uses
-`-RebindRestoredIntegrityAnchor <SOURCE_ANCHOR_JSON>`. The recovery-only command
-verifies the backed-up manifest hash against the fully restored chain, raw
-inventory, generated archive, published outputs, and workbook digest before it
-writes a new path-bound anchor and audit receipt. It never runs the weekly
-workflow. See `RECOVERY.md` for the required sequence.
+The current JSON attempts and committed receipts support local diagnostics.
+Do not treat them as a promised external API. Complete-input readiness and a
+coordinator result envelope are proposed in
+[COORDINATOR_CONTRACT.md](COORDINATOR_CONTRACT.md), **design only**.
 
-Approved management evidence is two-stage. First stage a candidate. Review its
-JSON and fingerprint, complete a copy of the approval template, then promote
-the same candidate bytes:
+## Corrections and management inputs
+
+For interactive correction review:
 
 ```powershell
-python _program\red_onion_weekly_metrics.py `
-  --export-management-evidence C:\SecureReview\candidate.json
-
-python _program\red_onion_weekly_metrics.py `
-  --export-management-evidence C:\SecureReview\candidate.json `
-  --approval-file C:\SecureReview\approval.json
+& '.\Run Weekly Snapshot.cmd' -ReviewCorrections
 ```
 
-Promotion is local only. There is no automatic upload, send, or deletion.
+The review shows business-value changes and records one choice per conflicting
+date. It includes keeping accepted facts when available. Reviewed selections
+are bound to the current alternatives. A changed selection set requires review
+again. A noninteractive caller can provide `-CorrectionsFile <review.json>`;
+it must never invent a choice or auto-select the newest filename.
+
+Management is read by table/column names and stable Action IDs. An Excel save,
+formatting change, or master rename is allowed. If different master copies
+exist, select the intended one with `-ManagementWorkbook <path>`; it must
+be in Finished Reports. Preserve the other copy until its edits are reconciled.
+
+After initial import, saved generated actions/history/evidence remain
+authoritative. The importer merges targets, the owner roster, and only the
+seven editable Current Actions fields. A missing master can be rebuilt from
+the last committed management snapshot, but workbook edits made after that
+snapshot require the latest workbook copy. Never claim those unsaved-to-state
+edits were recovered from an older receipt.
+
+## History import and rebuild
+
+First test these operations on a complete copy of the workspace. Explicit path
+arguments prevent accidentally choosing a live default. For example, from the
+repository root:
+
+```powershell
+python _program\red_onion_weekly_metrics.py --input-dir "D:\Review\01 Daily Reports - Drop Here" --output-dir "D:\Review\02 Finished Reports" --archive-dir "D:\Review\03 Archive" --migrate-history-only --migrate-history-from "D:\Approved History"
+```
+
+This copies validated source bytes into portable state and accepts history
+without generating reports or deleting originals. Duplicate facts count once.
+Conflicting corrections use the same review path. Partial history can be
+imported, but only complete reporting weeks can be published.
+An import retains the existing publication identity and records a pending
+refresh. The next ordinary run refreshes the master and complete affected weeks
+even when no new files are in the drop folder.
+
+Rebuild from accepted history with the same three explicit folder arguments
+and `--rebuild-from-history`. Rebuild ignores active intake, preserves current
+management inputs, and regenerates the latest complete restaurant reports and
+master. `--migrate-history-from` may be combined with rebuild when needed.
+Correcting older facts through incoming reports updates affected historical
+restaurant reports as well as the current master.
+
+The first portable invocation reads existing canonical
+`processed-daily-reports` history and imports it. It does not rewrite old
+manifests, regenerate a trust chain, or require historical derivative files.
+With empty intake, it saves history and the current management inputs without
+changing reports. A subsequent ordinary run refreshes complete accepted history.
+
+## Local evidence export
+
+The existing two-stage employee-evidence workflow remains separate from
+weekly report generation:
+
+```powershell
+python _program\red_onion_weekly_metrics.py --export-management-evidence C:\SecureReview\candidate.json
+python _program\red_onion_weekly_metrics.py --export-management-evidence C:\SecureReview\candidate.json --approval-file C:\SecureReview\approval.json
+```
+
+First review the exact candidate and fingerprint, then complete the generated
+approval template for that candidate and purpose. The second command promotes
+those exact reviewed bytes locally. A changed candidate needs a new review.
+No upload, email, draft, or deletion is performed. See
+[DATA_GOVERNANCE.md](DATA_GOVERNANCE.md).
+
+## Legacy forensic maintenance
+
+The retained `--legacy-integrity` path verifies the old manifest chain,
+canonical raw inventory, generated archive, workbook digest, and machine
+anchor. `--initialize-integrity-baseline` and
+`--rebind-restored-integrity-anchor` are also legacy operations. They are
+not portable setup, repair, or routine reporting steps.
+
+Use a preserved pre-migration workspace for legacy maintenance. Portable
+writers leave old evidence untouched; legacy writers are blocked from altering
+a workspace with committed portable state. Do not create a replacement
+baseline to bypass a discrepancy. If a historical investigation requires
+anchor rebind, restore the exact old chain and its independently saved anchor
+into an isolated copy, then use the legacy recovery command and verify the
+result there. See [RECOVERY.md](RECOVERY.md).

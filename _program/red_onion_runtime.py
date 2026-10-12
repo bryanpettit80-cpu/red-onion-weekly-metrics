@@ -297,6 +297,22 @@ class RunAttemptRecorder:
 
     def _status_text(self) -> str:
         payload = self.payload()
+        if payload["details"].get("workflow") == "portable-v1":
+            lines = [
+                "RED ONION WEEKLY METRICS - LAST RUN STATUS",
+                f"Outcome: {payload['outcome']}",
+                f"Run ID: {payload['run_id']}",
+                f"Finished (UTC): {payload['completed_at_utc'] or 'Still running'}",
+                f"Message: {payload['message']}",
+            ]
+            lines.extend("Warning: " + str(w) for w in payload["details"].get("warnings", []))
+            lines.extend([
+                "",
+                "Scope: Local business validation and recoverable publication. The current",
+                "reporting receipt records the committed set. Dropbox synchronization,",
+                "recipient access and independent backups are outside this run's checks.",
+            ])
+            return "\n".join(lines)
         lines = [
             "RED ONION WEEKLY METRICS - LAST RUN STATUS",
             f"Outcome: {payload['outcome']}",

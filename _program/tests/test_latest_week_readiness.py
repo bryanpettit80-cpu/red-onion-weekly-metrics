@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from dataclasses import replace
 import json
 
 from openpyxl import Workbook
@@ -32,7 +33,8 @@ def metric_record(report_date: date) -> metrics.MetricRecord:
 def report_records(*, missing: date | None = None) -> list[metrics.MetricRecord]:
     week_start = LATEST_WEEK_END - timedelta(days=metrics.OPERATING_WEEK_DAYS - 1)
     return [
-        metric_record(week_start + timedelta(days=offset))
+        replace(metric_record(week_start + timedelta(days=offset)), location=location)
+        for location in metrics.DEFAULT_CONFIG["locations"]
         for offset in range(metrics.OPERATING_WEEK_DAYS)
         if week_start + timedelta(days=offset) != missing
     ]
@@ -156,7 +158,8 @@ def test_missing_configured_store_suppresses_actions_and_blanks_stale_scorecard(
         weekly_location("RC Virginia Beach", week_end=prior_week_end),
     ]
     readiness = metrics.latest_week_readiness(
-        report_records(), locations, metrics.DEFAULT_CONFIG
+        [record for record in report_records() if record.location == "RC Richmond"],
+        locations, metrics.DEFAULT_CONFIG
     )
     stale_store = entity_candidate("RC Virginia Beach", week_end=prior_week_end)
     stale_store["latest"]["gross_sales"] = 999999.0
