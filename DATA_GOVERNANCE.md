@@ -9,6 +9,14 @@ screening rules. They are not a statistical, predictive, causal, or
 employment-decision model. Data integrity and reproducibility do not establish
 that a signal fairly attributes performance to one person.
 
+The separate `2026.10-v2` descriptive scorecards include all resolved named
+servers in the latest eight complete weeks, with explicit low-data reasons.
+Their Data Coverage label describes sample sufficiency, not statistical
+confidence. They do not feed people-review prompts. Exact, verified
+per-location identity aliases may join name variants for descriptive reports;
+they do not alter management Action IDs or transfer assignments. Shared POS
+identities must never be converted into person identities.
+
 ## Allowed Use
 
 - Weekly context review by authorized Red Onion leaders.
@@ -125,10 +133,20 @@ classification, retention, review, or access requirements.
 
 The lowercase workbook password `redonion` is only a convenience against
 accidental edits for authorized operators. It is not encryption, does not grant
-Dropbox access, and does not weaken role restrictions, recovery controls, the
-manifest chain, or the machine-local trusted head. A saved change to generated
-workbook content or structure still fails the substantive-digest check; correct
-source/configuration and regenerate instead of editing the managed master.
+Dropbox access, and does not replace role restrictions or recovery copies.
+Ordinary reporting accepts a harmless Excel save, formatting change, or master
+filename change. Required management tables, column names, valid inputs, and
+stable Action IDs must remain readable. Generated metrics are recomputed from
+accepted daily facts; editing a displayed number does not change those facts.
+Correct the authoritative source through the correction workflow and regenerate.
+
+Portable Reporting State contains accepted daily facts, source copies, saved
+management inputs, generated action evidence, and run receipts. Treat it and
+the latest editable master as restricted operational data. After the first
+import, only the documented editable fields merge from the workbook; saved
+generated actions, history, and evidence retain their accepted identities.
+Back up the whole operations root, not only the finished reports. The local
+Python environment and old machine anchors are not needed for portable recovery.
 
 The one-time Gmail history backfill is restricted to original Marketing Vitals
 TM report attachments needed for the approved historical window. Retrieve them
@@ -146,8 +164,9 @@ mailbox metadata belong in this repository or normal weekly workflow.
 Employees or managers may dispute an identity, source, date, metric,
 peer-reference, missing context, threshold, or model/signal result through the
 business owner. Preserve the original evidence and disposition for audit. If
-authoritative source data are wrong, correct the source and regenerate through
-the protected transaction; if context or methodology explains the dispute,
+authoritative source data are wrong, preserve the original and review the
+changed business facts through the correction workflow before regeneration;
+if context or methodology explains the dispute,
 record that outcome without rewriting the original signal.
 
 The business owner resolves use and context disputes. The technical maintainer
@@ -159,3 +178,10 @@ Remove access promptly when roles change and review membership quarterly.
 
 See [MODEL_CARD.md](MODEL_CARD.md) for the formulas, cohort rules, limitations,
 calibration contract, validation history, and change cadence.
+
+The future shared-coordinator interface is [design only](COORDINATOR_CONTRACT.md).
+It must preserve AOL as the read/unread authority, keep Gmail as its mirror,
+leave existing gift-card Micros intake separate, and create management emails
+only as drafts for review. This repository currently performs no recurring mail
+scan, notification send, draft creation, or schedule activation. The existing
+two-stage local evidence approval remains separate from ordinary reporting.

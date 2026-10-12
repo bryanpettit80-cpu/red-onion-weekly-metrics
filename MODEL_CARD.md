@@ -3,15 +3,14 @@
 ## Identity And Status
 
 - **System:** Red Onion Weekly Metrics
-- **Release contract:** `v0.5.3` (deployed-launcher source-bytecode preflight;
-  descriptive performance/consistency views;
-  people-review methodology remains `2026.07-v3`)
-- **Operational status:** protected backfill migration, exact post-migration
-  replay, and managed local publication are complete; authorized people-review
-  use remains blocked until a separate business-owner approval record is
-  documented and verified
+- **Release contract:** `v0.6.0` (portable ordinary workflow and complete
+  descriptive roster; people-review methodology remains `2026.07-v3`)
+- **Operational status:** this card describes source capabilities. Deployment,
+  production results, and a physical second-PC restore must be verified
+  separately. Generating a report does not authorize an employment decision or
+  an external evidence distribution.
 - **People-review methodology:** `2026.07-v3`
-- **Descriptive performance/consistency methodology:** `2026.08-v1`
+- **Descriptive performance/consistency methodology:** `2026.10-v2`
 - **System type:** deterministic, rule-based observational coaching signal
 - **Owners:** Red Onion business owner and designated technical maintainer
 - **Decision authority:** accountable human manager; never the automation
@@ -56,7 +55,7 @@ described as:
 - validated for demographic fairness.
 
 Independent corroboration and an accountable human review are mandatory.
-`Overall Read`, Performance, Consistency, Confidence, weekly bands, ranks, and
+`Overall Read`, Performance, Consistency, Data Coverage, weekly bands, ranks, and
 dashboard categories are not formal performance ratings or standalone
 employment evidence. They measure neither total job performance nor equal
 sales opportunity.
@@ -110,18 +109,29 @@ classification.
 
 ## Descriptive Performance And Consistency Layer
 
-Methodology `2026.08-v1` is a separate deterministic review aid. It uses the
-latest eight globally complete Tuesday-Sunday weeks and the current
-non-excluded roster as of the latest complete shared week. It never supplies an
+Methodology `2026.10-v2` is a separate deterministic review aid. It uses the
+latest eight globally complete Tuesday-Sunday weeks and every resolved,
+non-excluded named server appearing anywhere in that window, including people
+absent from the latest week. It never supplies an
 input, score, driver, persistence result, or action to the `2026.07-v3`
 people-review path.
 
-A current-roster person-week qualifies only with at least 25 guests, at least
-three active days, and at least five other qualified current-roster servers in
+A person-week qualifies only with at least 25 guests, at least three active
+days, and at least five other qualified named servers actually present in
 the same store and week. The peer reference is the leave-one-person-out median.
 Sales/Guest and Wine gaps are the person's result minus that weekly peer
-median. Summary peer gaps use `min(guests, 50)` as the weekly weight; eight-week
-Sales/Guest and Wine % use aggregated qualified sales, guests, and wine sales.
+median. The main actual and peer summaries use the same qualified weeks and
+`min(guests, 50)` weights, so the displayed difference reconciles. Sales/Guest
+differences are dollars and Wine Mix differences are percentage points.
+Pooled observed Sales/Guest and Wine Mix, last-worked information, variation,
+and recent movement remain separate supporting facts. Low-data people remain
+visible with explicit reasons rather than disappearing from the roster.
+
+An optional exact, per-location `person_identity_aliases` mapping can join
+verified raw-name variants for descriptive reporting. There is no fuzzy
+matching, alias chaining, or conversion of shared/numbered POS IDs into people.
+Same-week alias merges require disjoint daily evidence; ambiguous overlaps
+stop. These aliases do not change management action identities or assignments.
 
 Weekly bands use these rules:
 
@@ -134,7 +144,7 @@ Weekly bands use these rules:
   unavailable; neither case is converted to zero.
 
 Performance applies the same boundary logic to capped guest-weighted average
-peer gaps. Data-sufficiency `Confidence` is `High` at six qualified weeks and
+peer gaps. `Data Coverage` is `High` at six qualified weeks and
 200 qualified guests, `Provisional` at four weeks and 150 guests, and
 `Insufficient` otherwise. This is not statistical confidence, significance,
 predictive validity, or causal certainty.
@@ -142,8 +152,8 @@ predictive validity, or causal certainty.
 Consistency uses sample standard deviation of the qualified weekly peer gaps.
 It is `High` only when Sales/Guest SD is no greater than $11.50 and Wine-gap SD
 is no greater than 4.1 percentage points; `Moderate` requires no greater than
-$17.50 and 5.7 points; otherwise it is `Low`. Insufficient-confidence rows are
-always `Insufficient` consistency. `Overall Read` combines the performance and
+$17.50 and 5.7 points; otherwise it is `Low`. Insufficient-coverage rows receive
+no performance or consistency classification. `Overall Read` combines the performance and
 consistency axes only after the data-sufficiency gate; an insufficient row is
 always `Insufficient Data`.
 
@@ -344,8 +354,9 @@ Owner (`E`), Due Date (`F`), Context Notes (`N`), Review Disposition (`U`),
 Reviewed By (`V`), and Review Date (`W`). Detailed `Data Quality`, `Evidence
 Detail`, and `Run Notes`, legacy presentation sheets, and technical
 calculation/raw layers remain protected `veryHidden` audit/support sheets.
-Their hidden status does not remove them from validation, lineage, retention,
-or substantive-digest controls.
+Their hidden status does not remove them from generation validation, lineage,
+or retention. Ordinary reporting reads management business fields and saved
+state; it does not require the previous workbook's permanent presentation hash.
 
 ## Validation And Acceptance
 
@@ -362,34 +373,32 @@ historical backtests. The candidate historical replay must demonstrate:
 - less than 25% category reversal between consecutive qualified weeks; and
 - exact guest reconciliation and sales/wine reconciliation within $0.01.
 
-The `2026.08-v1` regression contract additionally verifies current-roster peer
-exclusion, even-count medians, the 50-guest cap, sample rather than population
-SD, exact boundary behavior, missing versus unqualified weeks, confidence and
-overall-read mappings, rolling-window behavior, and 100% invariance of
-`2026.07-v3` action outputs. Workbook tests require locked visible sheets, a
-protected `veryHidden` calculation layer, no comments or unapproved drawings,
-valid chart bindings, and substantive-digest coverage. These tests establish
-determinism and controls, not fairness or causal validity.
+The `2026.10-v2` regression contract additionally verifies the complete named
+roster, historical store/week peers, even-count medians, the 50-guest cap,
+sample rather than population SD, exact boundaries, missing versus unqualified
+weeks, coverage and overall-read mappings, low-data explanations, aligned
+actual/peer values, explicit identity aliases, and invariance of `2026.07-v3`
+action outputs. Workbook tests check generated values, visible presentation,
+locked input boundaries, a protected `veryHidden` calculation layer, and valid
+chart bindings. These tests establish determinism and controls, not fairness
+or causal validity.
 
-The lowercase workbook password `redonion` is documented for authorized
-operators as an accidental-edit convenience. It is not encryption or an access
-control. The v4 substantive digest remains fail-closed for generated values and
-formulas, sheet and table schema, validation and editability boundaries,
-material cell styles, chart definitions and source bindings, meaningful
-worksheet-view settings, hidden dimensions, internal links, drawings, external
-links, and protection. To stay stable across a no-edit Excel save, it normalizes
-only enumerated serializer defaults such as an explicit-versus-implicit `A1`
-scroll origin and chart caches derived from protected formulas and cells. The
-generator writes Excel's known persisted row heights up front; row heights and
-column widths otherwise remain exact because a small or cumulative change can
-alter rendered layout. The companion metadata-rich digest
-still reports those serializer-sensitive differences as `metadata_drift=true`
-with a Ready warning. That warning requires review or regeneration and does not
-prove that every metadata change was harmless; corrections to substantive
-content must be made in source/configuration and regenerated.
-The immediately preceding v3 digest is accepted only through a one-way bridge
-to the exact manifest-inventoried archived master; the next successful run
-records the v4 contract.
+The lowercase workbook password `redonion` is an accidental-edit convenience,
+not encryption or an access control. The portable workflow accepts harmless
+Excel saves, formatting changes, and master renames. Required management
+tables, columns, valid inputs, and stable Action IDs remain necessary.
+Generated business values are recomputed from accepted daily facts. After
+initial import, only documented editable fields merge from the workbook;
+saved generated actions, history, and evidence remain authoritative. Correct
+reporting facts through the reviewed correction workflow. Copy hashes protect
+current publication and recovery; the old substantive-digest/anchor contract
+is retained only for explicit legacy maintenance.
+
+Portable-workflow checks additionally cover 12 restaurant-days or explicit
+closures, incomplete inputs, semantic duplicates, reviewed corrections,
+interrupted publication, post-commit cleanup warnings, external edit conflicts,
+management carry-forward, and copied/renamed workspaces. Copied-folder tests
+do not establish physical two-computer Dropbox recovery.
 
 The read-only `2026.07-v3` candidate replay covered 16 complete weeks, 96
 business-date reports, 202 qualified person-weeks, and 25 store-week groups.
@@ -401,14 +410,14 @@ estimable because there were zero prompts; the methodology intentionally has
 no minimum prompt quota. Automated regressions separately prove that
 context-only metrics cannot change a person action.
 
-Those results meet the observable numerical acceptance limits for the
-candidate. The 24 validated backfill files were migrated through the protected
-history transaction, and the exact post-migration replay matched these
-aggregate results before managed workbooks were published. No separate
-business-owner approval record has been verified. Until one is documented and
-verified, authorized operational use of the people-review signals remains
-blocked; technical migration, replay, and publication do not by themselves
-establish approval.
+The historical validation record states that those results met the observable
+candidate limits, that 24 validated backfill files were migrated, and that the
+post-migration replay matched before publication. It did not establish a
+separate business-owner approval record. These are historical results, not a
+fresh production verification or an ordinary-reporting prerequisite. A manager
+still reviews each people-review conclusion, and external AI evidence use
+requires the existing exact local candidate/fingerprint approval. Technical
+generation alone authorizes neither use nor distribution.
 
 These are operational stability and alert-quality tests, not proof of
 statistical, causal, or demographic fairness. No minimum prompt quota is
@@ -436,11 +445,13 @@ history transaction, and removed from staging after verification. Email bodies
 and message identifiers are not retained. The system has no ongoing Gmail
 connector and a weekly run never accesses Gmail.
 
-The maintainer-only `--rebuild-from-history` operation rebuilds managed outputs
-from verified canonical history without processing active weekly inputs. It
-preserves management fields by header and advances the generated archive,
-manifest chain, published files, and trusted head only as one successful
-transaction. Failure leaves the prior managed state unchanged.
+The current maintainer-only `--rebuild-from-history` operation rebuilds from
+accepted portable history without processing active weekly inputs. It
+preserves management business fields, stages validated outputs, and publishes
+with a recoverable journal and portable receipt. A pre-commit failure restores
+previous reports; a post-commit cleanup issue remains a publication warning.
+Legacy manifest-based rebuild behavior is confined to explicit maintenance on
+a preserved pre-migration workspace.
 
 ## Monitoring, Disputes, And Change Control
 
@@ -462,6 +473,6 @@ thresholds, persistence, terminology, or permitted use require:
 4. business-owner approval; and
 5. a protected release and deployment.
 
-A `2026.08-v1` change must also prove that the people-review action path is
+A `2026.10-v2` change must also prove that the people-review action path is
 unchanged unless a separately versioned and approved `2026.07` successor is
 explicitly in scope.
