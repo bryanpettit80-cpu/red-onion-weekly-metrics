@@ -17,8 +17,11 @@ separate modules.
 Use a source checkout outside the live Dropbox workspace. Do not point tests,
 experiments, or Cloud tasks at the numbered operational folders. The tests
 create synthetic workbooks and isolated temporary workspaces; private source
-reports are not required. Supported package runtimes are Python 3.10-3.12;
-use Python 3.12 for a new development environment.
+reports are not required. The package's declared compatibility range is Python
+3.10-3.12; use Python 3.12 for a new development environment. Python 3.10 reached
+[upstream end of life](https://peps.python.org/pep-0619/#3-10-lifespan) on
+October 1, 2026. Its existing CI job checks backward compatibility and is not a
+recommendation to create new 3.10 installations.
 
 From the repository root, create an isolated environment on Windows:
 
