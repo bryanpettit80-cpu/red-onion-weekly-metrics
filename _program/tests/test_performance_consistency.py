@@ -107,6 +107,33 @@ def test_shared_pos_number_does_not_reclassify_an_embedded_number() -> None:
     )
 
 
+def test_verified_office_account_is_shared_without_guessing_an_operating_area() -> None:
+    week_end = date(2026, 8, 9)
+    office = weekly_server_row(week_end, "* Office Computer", guests=10, spg=50)
+    person = weekly_server_row(week_end, "Taylor Office", guests=20, spg=100)
+    config = one_location_config()
+    location_rows = [weekly_location_row(week_end)]
+
+    people = metrics.build_performance_consistency_model([office, person], location_rows, config)
+    assert {row["raw_user_name"] for row in people["summary_rows"]} == {"Taylor Office"}
+    assert people["excluded_rows"][0]["raw_user_name"] == "* Office Computer"
+    assert people["excluded_rows"][0]["reason"].startswith("Shared POS identity")
+    assert metrics.dashboard_excluded(office, config) is True
+    assert metrics.shared_pos_number(office) is None
+    assert metrics.weekly_area_for_row(office, config) is None
+
+    shared = metrics.build_shared_area_trends_model([office, person], location_rows, config)
+    assert len(shared["shared_rows"]) == 1
+    row = shared["shared_rows"][0]
+    assert row["shared_number"] == "Office Computer"
+    assert row["pos_label"] == "* Office Computer"
+    assert row["latest_gross_sales"] == pytest.approx(500)
+    assert row["latest_guest_count"] == pytest.approx(10)
+    dining = next(row for row in shared["area_rows"] if row["location"] == "RC Richmond" and row["area"] == "Dining Room")
+    assert dining["latest_gross_sales"] == pytest.approx(2000)
+    assert dining["latest_guest_count"] == pytest.approx(20)
+
+
 @pytest.mark.parametrize("name", ["Barbara Smith", "Bart Jones", "Taylor Serverton"])
 def test_weekly_area_bar_pattern_does_not_match_person_name_prefixes(
     name: str,

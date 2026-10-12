@@ -121,6 +121,9 @@ This copies validated source bytes into portable state and accepts history
 without generating reports or deleting originals. Duplicate facts count once.
 Conflicting corrections use the same review path. Partial history can be
 imported, but only complete reporting weeks can be published.
+An import retains the existing publication identity and records a pending
+refresh. The next ordinary run refreshes the master and complete affected weeks
+even when no new files are in the drop folder.
 
 Rebuild from accepted history with the same three explicit folder arguments
 and `--rebuild-from-history`. Rebuild ignores active intake, preserves current

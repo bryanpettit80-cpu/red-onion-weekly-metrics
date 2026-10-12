@@ -135,7 +135,9 @@ not for permanent presentation identity across Excel saves.
 Run ordinary history rebuilds and imports with explicit path options when
 operating on a copy; see [MAINTAINER.md](../MAINTAINER.md). A rebuild ignores
 active intake, uses accepted history, and preserves current management input.
-An import-only command accepts history without generating reports.
+An import-only command accepts history without generating reports and retains
+the prior publication identity. The next ordinary run refreshes the master and
+any complete affected weeks; incomplete history remains supporting detail.
 
 `--health-check-json` returns local health schema version 2 for
 `portable-v1`. It checks configuration, folders, and receipt readability.

@@ -13,6 +13,8 @@ import red_onion_weekly_metrics as metrics
 
 
 def initialize_integrity(args: Namespace) -> None:
+    # Explicit compatibility coverage for the legacy manifest workflow.
+    args.legacy_integrity = True
     values = vars(args).copy()
     values.update(
         initialize_integrity_baseline=True,

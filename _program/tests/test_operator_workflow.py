@@ -207,6 +207,7 @@ def full_week_records(
 
 def args_for(tmp_path: Path) -> Namespace:
     return Namespace(
+        legacy_integrity=True,
         input_dir=str(tmp_path / "Daily Reports"),
         output_dir=str(tmp_path / "Output"),
         archive_dir=str(tmp_path / "Archive - Old Files"),
@@ -217,6 +218,8 @@ def args_for(tmp_path: Path) -> Namespace:
 
 
 def initialize_integrity(args: Namespace) -> None:
+    # Explicit compatibility coverage for the legacy manifest workflow.
+    args.legacy_integrity = True
     baseline_args = Namespace(**vars(args), initialize_integrity_baseline=True)
     metrics.run(baseline_args)
 

@@ -29,6 +29,7 @@ CONTEXT_NOTES_COLUMN = action_header_column("Context Notes")
 
 def workflow_args(tmp_path: Path, *, initialize_baseline: bool = False) -> Namespace:
     return Namespace(
+        legacy_integrity=True,
         input_dir=str(tmp_path / "01 Daily Reports - Drop Here"),
         output_dir=str(tmp_path / "02 Finished Reports"),
         archive_dir=str(tmp_path / "03 Archive"),

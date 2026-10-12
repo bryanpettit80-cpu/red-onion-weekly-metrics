@@ -28,8 +28,8 @@ integrity anchor.
 3. Double-click `Run Weekly Snapshot.cmd`.
 4. Read the outcome, then open the reports in `02 Finished Reports`.
 
-The business date inside a workbook takes precedence over its filename.
-A date in the filename is a fallback when the workbook has no usable date.
+Each workbook must contain an explicit single business date in its Date(s)
+field. Filenames do not supply or override that date.
 Excel temporary files beginning with `~$` are ignored.
 
 A complete week is Tuesday through Sunday for both configured restaurants:

@@ -1708,10 +1708,10 @@ def selected_public_dates(
     records: Iterable[MetricRecord], week_start: str | None, week_end: str | None
 ) -> tuple[date, date]:
     all_dates = sorted({record.report_date for record in records})
-    if not all_dates:
+    if not all_dates and not (week_start or week_end):
         raise ValueError("No report dates were found.")
     operating_dates = [report_date for report_date in all_dates if is_operating_day(report_date)]
-    if not operating_dates:
+    if all_dates and not operating_dates:
         raise ValueError("No Tuesday-Sunday operating report dates were found.")
 
     try:
@@ -2832,7 +2832,7 @@ def write_report_definition(ws, location: str, start: date, end: date) -> None:
         ["Column", "Definition"],
         ["Gross Sales", "KPI: GrossAmount"],
         ["Guest Count", "KPI: GuestCount"],
-        ["Check Average", "KPI: GrossGuestAvg"],
+        ["Sales per Guest", "Gross Sales / Guest Count (POS KPI: GrossGuestAvg)"],
         ["Wine Sales", "KPI: MenuPrice\nMenuCategory: Banquet, Wine - Glass, Wine Bottle, Wine Glass"],
         ["Rate of Sale by Guest Count", "KPI: RateOfSaleGuestCount"],
         ["Average Ticket Time", "KPI: AvgTicketTime"],
@@ -2903,7 +2903,7 @@ def write_public_workbook(
         f"  {bullet}  Location Type:  Store\n"
         f"  {bullet}  Locations:  {location}{coverage_note}"
     )
-    headers = ["Store", "", "Gross Sales", "Guest Count", "Check Average", "Wine Sales", "Wine %"]
+    headers = ["Store", "", "Gross Sales", "Guest Count", "Sales per Guest", "Wine Sales", "Wine %"]
     for col_index, header in enumerate(headers, start=1):
         ws.cell(row=2, column=col_index, value=header)
 
@@ -4085,7 +4085,8 @@ def write_dashboard_sheet(
     summary_rows = [
         ["Latest Week", public_end],
         ["Reports Read", len({record.source_file for record in records})],
-        ["Date Coverage", format_date_range(min(dates), max(dates))],
+        ["Date Coverage", format_date_range(min(dates), max(dates)) if dates
+         else "No source reports; declared closure period " + format_date_range(public_start, public_end)],
         ["Weeks Tracked", len({row["week_end"] for row in weekly_location_rows})],
     ]
     snapshot_end = write_dashboard_table(ws, "Snapshot", 3, 1, ["Item", "Value"], summary_rows)
@@ -5236,7 +5237,8 @@ def _write_master_workbook_base(
             "Requires one explicit business day in the raw workbook's Date(s) field; filenames are labels only.",
         ),
         ("Raw Reports Read", len({record.source_file for record in records})),
-        ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
+        ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))
+         if records else "No source reports; declared closure period " + format_date_range(public_start, public_end)),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
         ("Public Exclude Patterns", ", ".join(config.get("public_exclude_name_contains", []))),
         ("Dashboard Exclude Patterns", ", ".join(config.get("dashboard_exclude_name_contains", []))),
@@ -5349,7 +5351,6 @@ def operational_context_rollup(rows: Iterable[dict[str, Any]]) -> dict[str, Any]
     check_count = sum(
         float(row.get("check_count", 0) or 0)
         for row in selected
-        if bool(row.get("check_count_available", False))
     )
     per_check_available = bool(check_count_available and check_count > 0)
 
@@ -5456,6 +5457,20 @@ def shared_pos_number(row: dict[str, Any]) -> str | None:
     return None
 
 
+def shared_pos_identity(row: dict[str, Any]) -> str | None:
+    """Retain numbered POS accounts and the verified office account separately."""
+
+    number = shared_pos_number(row)
+    if number is not None:
+        return number
+    if any(
+        str(row.get(field) or "").strip().casefold() == "* office computer"
+        for field in ("raw_user_name", "display_name")
+    ):
+        return "Office Computer"
+    return None
+
+
 def weekly_area_for_row(
     row: dict[str, Any], config: dict[str, Any]
 ) -> str | None:
@@ -5465,6 +5480,8 @@ def weekly_area_for_row(
     if number is not None:
         mapped_area = config.get("weekly_shared_number_areas", {}).get(number)
         return str(mapped_area) if mapped_area in WEEKLY_AREA_ORDER else None
+    if shared_pos_identity(row) is not None:
+        return None
     patterns = config.get(
         "weekly_area_name_patterns",
         DEFAULT_CONFIG.get("weekly_area_name_patterns", {}),
@@ -5536,7 +5553,7 @@ def build_shared_area_trends_model(
         if week_end not in selected:
             continue
         location = str(row.get("location") or "")
-        number = shared_pos_number(row)
+        number = shared_pos_identity(row)
         if number is not None:
             shared_buckets[(location, number, week_end)].append(row)
             shared_labels[(location, number)].add(
@@ -5845,7 +5862,7 @@ def descriptive_identity_exclusion_reason(
 ) -> str | None:
     """Explain non-person/configured exclusions without guessing a person's identity."""
 
-    if shared_pos_number(row) is not None:
+    if shared_pos_identity(row) is not None:
         return "Shared POS identity; see Shared & Area Trends"
     if any(is_numbered_server_placeholder(row.get(field)) for field in ("raw_user_name", "display_name")):
         return "Unresolved numbered server identity"
@@ -5943,7 +5960,7 @@ def performance_coverage_note(
     rows: list[dict[str, Any]], qualified_weeks: int, qualified_guests: float,
     coverage: str, config: dict[str, Any], min_peers: int,
 ) -> str:
-    note = f"{qualified_weeks} qualified weeks / {qualified_guests:,.0f} guests."
+    note = f"{qualified_weeks} qualified {'week' if qualified_weeks == 1 else 'weeks'} / {qualified_guests:,.0f} guests."
     if coverage == "High":
         return note + " Enough history for a full comparison."
     if coverage == "Provisional":
@@ -13942,7 +13959,7 @@ def write_shared_area_trends_sheet(
     ws.merge_cells("A3:Q3")
     ws["A3"] = (
         f"Latest {len(week_ends)} complete shared weeks through {latest:%m/%d/%Y}. "
-        "Check Average is Gross Sales / Guests; shared identities remain outside person-level scoring."
+        "Sales per Guest is Gross Sales / Guests; shared identities remain outside person-level scoring."
         if latest
         else "No complete shared week is available for shared-number or area trends."
     )
@@ -13978,12 +13995,12 @@ def write_shared_area_trends_sheet(
             "Location",
             identity_header,
             context_header,
-            *(f"{week_end:%m/%d} CA" for week_end in week_ends),
+            *(f"{week_end:%m/%d} $/Guest" for week_end in week_ends),
             "Latest Sales",
             "Latest Guests",
-            "Latest Check Avg",
+            "Latest $/Guest",
             "Latest Wine %",
-            "WoW Check Avg",
+            "WoW $/Guest",
         ]
         for column, header in enumerate(headers, start=1):
             cell = ws.cell(row=header_row, column=column, value=header)
@@ -14064,9 +14081,9 @@ def write_shared_area_trends_sheet(
 
     shared_end = write_trend_table(
         section_row=5,
-        title="SHARED POS NUMBERS | weekly operating results, never person-level scoring",
+        title="SHARED POS IDENTITIES | weekly operating results, never person-level scoring",
         rows=list(model.get("shared_rows", [])),
-        identity_header="Shared #",
+        identity_header="POS Identity",
         identity_key="shared_number",
         context_header="Source POS Label",
         context_key="pos_label",
@@ -14076,7 +14093,7 @@ def write_shared_area_trends_sheet(
     area_end = write_trend_table(
         section_row=area_section_row,
         title=(
-            "AREA CHECK AVERAGE | Bar, Patio, Dining Room, Banquets, and Wine Dinners"
+            "AREA SALES PER GUEST | Bar, Patio, Dining Room, Banquets, and Wine Dinners"
         ),
         rows=list(model.get("area_rows", [])),
         identity_header="Area",
@@ -14248,7 +14265,7 @@ def write_performance_dashboard_sheet(
             overall.get("guest_count_change_pct") if overall else None,
         ),
         (
-            "Check Average",
+            "Sales per Guest",
             overall.get("check_average") if overall else None,
             "$#,##0.00",
             overall_delta_text(
@@ -14632,8 +14649,8 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ),
         (
             "4. Use the overall store card on Performance Dashboard and Shared & Area "
-            "Trends for the operations layer: sales, guests, Check Average, Wine Mix, shared "
-            "POS results, and guest-weighted area Check Average. Use Methodology for the "
+            "Trends for the operations layer: sales, guests, Sales per Guest, Wine Mix, shared "
+            "POS results, and guest-weighted area Sales per Guest. Use Methodology for the "
             "definitions and limits. Do not make a person-level decision from a card."
         ),
         (
@@ -14821,7 +14838,7 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ),
         (
             "Shared & Area Trends",
-            "eight-week shared POS results and guest-weighted Check Average by operating area",
+            "eight-week shared POS results and guest-weighted Sales per Guest by operating area",
             "No — locked by default",
         ),
         (
@@ -15422,6 +15439,7 @@ def write_management_center_sheet(
         if readiness.expected_dates
         else "No complete reporting window is available"
     )
+    coverage_text = declared_closure_coverage_text(readiness, config) or coverage_text
     readiness_rows = [
         (
             "Weekly status",
@@ -16245,7 +16263,15 @@ def write_store_group_scorecards_sheet(
         for location in readiness.configured_locations:
             item = by_entity.get(location)
             item_week_end = as_date(item.get("latest", {}).get("week_end")) if item else None
-            if item is None or (
+            latest_row = next((
+                row for row in weekly_location_rows
+                if row["location"] == location and row["week_end"] == readiness.latest_week_end
+            ), None)
+            if location_week_display_coverage(
+                latest_row, location, readiness.latest_week_end, config
+            )[3]:
+                display_items.append((location, None, "closed"))
+            elif item is None or (
                 item_week_end is not None and item_week_end != readiness.latest_week_end
             ):
                 display_items.append((location, None, "missing"))
@@ -16257,7 +16283,10 @@ def write_store_group_scorecards_sheet(
         scorecard_start_rows.append(current_row)
         print_section_start_rows.append(current_row)
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=7)
-        if readiness_state == "missing":
+        if readiness_state == "closed":
+            title_text = f"{entity} | Declared closed | No trading data or current-week comparisons."
+            title_priority = "Monitor"
+        elif readiness_state == "missing":
             title_text = f"{entity} | Missing | No current-week data; comparisons are paused."
             title_priority = "Review"
         elif readiness_state == "preliminary":
@@ -16285,10 +16314,11 @@ def write_store_group_scorecards_sheet(
         ):
             row = current_row + offset
             ws.cell(row=row, column=1, value=label)
-            if readiness_state == "missing":
-                ws.cell(row=row, column=6, value="No current-week data")
-                ws.cell(row=row, column=7, value="Missing")
-                fill = priority_fill("Review")
+            if readiness_state in {"missing", "closed"}:
+                closed = readiness_state == "closed"
+                ws.cell(row=row, column=6, value="Declared closed" if closed else "No current-week data")
+                ws.cell(row=row, column=7, value="Not applicable" if closed else "Missing")
+                fill = priority_fill("Monitor" if closed else "Review")
                 if fill:
                     ws.cell(row=row, column=7).fill = fill
                 continue
@@ -16424,6 +16454,7 @@ def write_store_group_scorecards_sheet(
         ws,
         weekly_location_rows,
         weekly_group_rows,
+        config=config,
         sales_anchor=f"I{sales_chart_row}",
         guest_anchor=f"I{guest_chart_row}",
     )
@@ -16484,15 +16515,80 @@ def recent_completeness_week_ends(
     ]
 
 
+def location_week_display_coverage(
+    row: dict[str, Any] | None,
+    location: str,
+    week_end: date | None,
+    config: dict[str, Any] | None = None,
+) -> tuple[int, int, bool, bool]:
+    """Keep received source days distinct from explicit closure coverage."""
+    expected = {
+        week_end - timedelta(days=offset) for offset in range(OPERATING_WEEK_DAYS)
+    } if week_end else set()
+    closed = {
+        date.fromisoformat(value)
+        for value in (config or {}).get("closed_dates", {}).get(location, [])
+    } & expected
+    row = row or {}
+    if "source_dates" in row:
+        received = set(row["source_dates"]) & expected
+        source_days = len(received)
+        complete = bool(expected) and expected <= received | closed
+    else:
+        # Legacy callers may supply aggregate counts without dated provenance.
+        source_days = int(row.get("source_days", 0) or 0)
+        complete = source_days >= OPERATING_WEEK_DAYS or len(closed) == OPERATING_WEEK_DAYS
+    full_closure = len(closed) == OPERATING_WEEK_DAYS and not any(
+        row.get(field, 0) for field in ("gross_sales", "guest_count", "wine_sales", "check_count")
+    )
+    return source_days, len(closed), complete, full_closure
+
+
+def declared_closure_coverage_text(
+    readiness: LatestWeekReadiness, config: dict[str, Any],
+) -> str | None:
+    """Describe closure coverage without calling a closed day a received file."""
+    if readiness.latest_week_end is None:
+        return None
+    latest = {row["location"]: row for row in readiness.latest_location_rows}
+    expected = set(readiness.expected_dates)
+    closed_count = 0
+    reported_open_count = 0
+    for location in readiness.configured_locations:
+        closed = {
+            date.fromisoformat(value)
+            for value in config.get("closed_dates", {}).get(location, [])
+        } & expected
+        row = latest.get(location, {})
+        closed_count += len(closed)
+        if "source_dates" in row:
+            reported_open_count += len((set(row["source_dates"]) & expected) - closed)
+        else:
+            reported_open_count += max(
+                0, min(int(row.get("source_days", 0) or 0), len(expected)) - len(closed)
+            )
+    if not closed_count:
+        return None
+    expected_count = len(expected) * len(readiness.configured_locations)
+    return (
+        f"{reported_open_count + closed_count} of {expected_count} restaurant-days covered "
+        f"({reported_open_count} reported; {closed_count} declared closed)"
+    )
+
+
 def write_data_quality_completeness_heatmap(
     ws,
     weekly_location_rows: list[dict[str, Any]],
     configured_locations: list[str],
     *,
     start_row: int,
+    config: dict[str, Any] | None = None,
+    latest_week_end: date | None = None,
 ) -> int:
     """Write a compact categorical matrix and return its final occupied row."""
     week_ends = recent_completeness_week_ends(weekly_location_rows)
+    if not week_ends and latest_week_end is not None:
+        week_ends = [latest_week_end]
     locations = list(configured_locations) or sorted(
         {
             str(row.get("location") or "").strip()
@@ -16538,8 +16634,9 @@ def write_data_quality_completeness_heatmap(
         column=1,
         value=(
             f"Each cell represents one {OPERATING_WEEK_LABEL} location-week. "
-            f"Complete = {OPERATING_WEEK_DAYS} source days; Partial = 1-"
-            f"{OPERATING_WEEK_DAYS - 1}; Missing = no usable location-week row. "
+            f"Complete = all {OPERATING_WEEK_DAYS} days reported or explicitly closed; "
+            "Declared closed = no trading activity for the whole week. "
+            "Partial or Missing = unresolved source coverage. "
             "Latest week appears first."
         ),
     )
@@ -16587,6 +16684,7 @@ def write_data_quality_completeness_heatmap(
         "Complete": ("D9EAD3", "274E13"),
         "Partial": ("FFF2CC", "7F6000"),
         "Missing": ("F4CCCC", "9C0006"),
+        "Declared closed": ("D9EAF7", "1F4E78"),
     }
     matrix_border = Border(
         left=Side(style="thin", color="D9E1F2"),
@@ -16602,21 +16700,30 @@ def write_data_quality_completeness_heatmap(
         date_cell.border = matrix_border
         for col, location in enumerate(locations, start=2):
             item = row_lookup.get((week_end, location))
-            source_days = int(item.get("source_days", 0) or 0) if item else 0
+            source_days, closed_days, complete, full_closure = location_week_display_coverage(
+                item, location, week_end, config
+            )
             status = (
-                "Complete"
-                if source_days >= OPERATING_WEEK_DAYS
+                "Declared closed" if full_closure
+                else "Complete" if complete
                 else "Partial"
-                if source_days > 0
+                if source_days > 0 or closed_days > 0
                 else "Missing"
             )
             fill_color, font_color = status_styles[status]
-            cell = ws.cell(row=row_index, column=col, value=status)
+            label = (
+                f"{status} ({closed_days} declared closed)"
+                if closed_days and not full_closure else status
+            )
+            cell = ws.cell(row=row_index, column=col, value=label)
             cell.fill = PatternFill("solid", fgColor=fill_color)
             cell.font = Font(bold=True, color=font_color)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = matrix_border
-        ws.row_dimensions[row_index].height = 24
+        ws.row_dimensions[row_index].height = 36 if any(
+            "declared closed" in str(ws.cell(row=row_index, column=col).value).casefold()
+            for col in range(2, 2 + len(locations))
+        ) else 24
     return data_start_row + len(week_ends) - 1
 
 
@@ -16648,6 +16755,15 @@ def write_management_data_quality_sheet(
         if latest_complete and latest_week_end
         else "Latest week is incomplete. Management trends are preliminary and server actions are suppressed."
     )
+    if latest_complete and latest_week_end and all(
+        location_week_display_coverage(
+            latest_by_location.get(location), location, latest_week_end, config
+        )[3] for location in configured_locations
+    ):
+        ws["A3"] = (
+            f"Latest week ending {latest_week_end:%m/%d/%Y} is complete: all restaurants "
+            "declared closed; no trading comparisons."
+        )
     report_audit = config.get("_report_audit", {})
     if report_audit:
         ws["A3"] = (
@@ -16678,16 +16794,22 @@ def write_management_data_quality_sheet(
         cell.font = Font(bold=True)
     for row_index, location in enumerate(configured_locations, start=6):
         row = latest_by_location.get(location)
+        source_days, closed_days, complete, full_closure = location_week_display_coverage(
+            row, location, latest_week_end, config
+        )
         status = (
-            "Missing" if row is None
-            else "Complete" if row.get("source_days", 0) >= OPERATING_WEEK_DAYS
+            "Declared closed" if full_closure
+            else "Complete" if complete
+            else "Missing" if row is None
             else "Short Week"
         )
+        if closed_days and not full_closure:
+            status += f" ({closed_days} declared closed)"
         values = [
             latest_week_end,
             location,
             row.get("active_days", 0) if row else 0,
-            row.get("source_days", 0) if row else 0,
+            source_days,
             (
                 row.get("check_count", 0)
                 if row and row.get("check_count_available")
@@ -16703,23 +16825,25 @@ def write_management_data_quality_sheet(
             ),
             status,
             (
-                "People review eligible; operational context complete"
-                if status == "Complete"
+                "Declared closed; no trading data or person review"
+                if full_closure
+                else "People review eligible; operational context complete"
+                if complete
                 and row
                 and row.get("check_count_available")
                 and row.get("ticket_time_available")
                 and row.get("rate_available")
                 else "People review eligible; Rate of Sale unavailable"
-                if status == "Complete"
+                if complete
                 and row
                 and row.get("check_count_available")
                 and row.get("ticket_time_available")
                 else "People review eligible; Ticket Time unavailable"
-                if status == "Complete"
+                if complete
                 and row
                 and row.get("check_count_available")
                 else "People review eligible; check-based context unavailable"
-                if status == "Complete"
+                if complete
                 else "Preliminary only"
             ),
         ]
@@ -16731,7 +16855,7 @@ def write_management_data_quality_sheet(
         ws.cell(row=row_index, column=1).number_format = EXCEL_DATE_NUMBER_FORMAT
         if row and row.get("check_count_available"):
             ws.cell(row=row_index, column=5).number_format = "#,##0"
-        fill = priority_fill("Recognize" if status == "Complete" else "High")
+        fill = priority_fill("Recognize" if complete else "High")
         if fill:
             ws.cell(row=row_index, column=7).fill = fill
         ws.row_dimensions[row_index].height = 72
@@ -16742,6 +16866,8 @@ def write_management_data_quality_sheet(
         weekly_location_rows,
         configured_locations,
         start_row=heatmap_start_row,
+        config=config,
+        latest_week_end=latest_week_end,
     )
     historical_title_row = heatmap_end + 2
     historical_header_row = historical_title_row + 1
@@ -16752,7 +16878,10 @@ def write_management_data_quality_sheet(
         "solid", fgColor="E7E6E6"
     )
     historical = [
-        row for row in weekly_location_rows if row.get("source_days", 0) < OPERATING_WEEK_DAYS
+        row for row in weekly_location_rows
+        if not location_week_display_coverage(
+            row, row["location"], row["week_end"], config
+        )[2]
     ]
     for col, header in enumerate(["Week End", "Location", "Active Days", "Source Days", "Status", "Benchmark Treatment"], start=1):
         cell = ws.cell(row=historical_header_row, column=col, value=header)
@@ -16956,11 +17085,16 @@ def write_management_chart_data(
     wb: Workbook,
     weekly_location_rows: list[dict[str, Any]],
     weekly_group_rows: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     remove_sheet_if_present(wb, "_Dashboard Chart Data")
     ws = wb.create_sheet("_Dashboard Chart Data")
-    locations = sorted({row["location"] for row in weekly_location_rows})
-    _, global_full_week_ends = full_week_ends_by_location(weekly_location_rows)
+    locations = sorted((config or {}).get("locations", {})) or sorted(
+        {row["location"] for row in weekly_location_rows}
+    )
+    _, global_full_week_ends = full_week_ends_by_location(
+        weekly_location_rows, locations, closed_dates=(config or {}).get("closed_dates", {})
+    )
     week_ends = sorted(global_full_week_ends)[-8:]
     ws.cell(row=1, column=1, value="Week End")
     for col, location in enumerate(locations, start=2):
@@ -16972,7 +17106,11 @@ def write_management_chart_data(
         ws.cell(row=row_index, column=1, value=week_end.strftime("%m/%d"))
         for col, location in enumerate(locations, start=2):
             row = location_lookup.get((week_end, location))
-            ws.cell(row=row_index, column=col, value=row["gross_sales"] if row else None)
+            full_closure = location_week_display_coverage(row, location, week_end, config)[3]
+            ws.cell(
+                row=row_index, column=col,
+                value=row["gross_sales"] if row and not full_closure else None,
+            )
 
     group_lookup = {row["week_end"]: row for row in weekly_group_rows}
     group_rows = [group_lookup[week_end] for week_end in week_ends if week_end in group_lookup]
@@ -16991,15 +17129,18 @@ def add_management_scorecard_charts(
     weekly_location_rows: list[dict[str, Any]],
     weekly_group_rows: list[dict[str, Any]],
     *,
+    config: dict[str, Any] | None = None,
     sales_anchor: str = "I4",
     guest_anchor: str = "I20",
 ) -> None:
     location_points, group_points = write_management_chart_data(
-        wb, weekly_location_rows, weekly_group_rows
+        wb, weekly_location_rows, weekly_group_rows, config
     )
     chart_ws = wb["_Dashboard Chart Data"]
     if location_points:
-        locations = sorted({row["location"] for row in weekly_location_rows})
+        locations = sorted((config or {}).get("locations", {})) or sorted(
+            {row["location"] for row in weekly_location_rows}
+        )
         chart = LineChart()
         chart.title = "Complete-Week Sales Trend by Store"
         chart.y_axis.title = "Gross Sales"
@@ -17101,11 +17242,13 @@ def latest_week_readiness(
     records: list[MetricRecord],
     weekly_location_rows: list[dict[str, Any]],
     config: dict[str, Any],
+    *,
+    fallback_week_end: date | None = None,
 ) -> LatestWeekReadiness:
     latest_week_end = max(
         [row["week_end"] for row in weekly_location_rows]
         + [week_period_for(record.report_date)[1] for record in records if is_operating_day(record.report_date)],
-        default=None,
+        default=fallback_week_end,
     )
     latest_rows, configured_locations, location_gaps, _locations_complete = (
         latest_location_completeness(weekly_location_rows, latest_week_end, config)
@@ -17248,17 +17391,31 @@ def write_management_dashboard_sheet(
     received_dates = readiness.received_dates
     latest_complete = readiness.ready
     missing_text = readiness.missing_text
-    current_location_names = {row["location"] for row in latest_location_rows}
+    latest_by_location = {row["location"]: row for row in latest_location_rows}
+    fully_closed_locations = {
+        location for location in configured_locations
+        if location_week_display_coverage(
+            latest_by_location.get(location), location, latest_week_end, config
+        )[3]
+    }
+    current_location_names = set(latest_by_location) - fully_closed_locations
     current_store_rows = {
         item["entity"]: item
         for item in store_rows
         if item["entity"] in current_location_names
     }
-    _, global_full = full_week_ends_by_location(weekly_location_rows)
+    _, global_full = full_week_ends_by_location(
+        weekly_location_rows, configured_locations, closed_dates=config.get("closed_dates", {})
+    )
+    if latest_complete and latest_week_end and fully_closed_locations == set(configured_locations):
+        global_full.add(latest_week_end)
+    coverage_text = declared_closure_coverage_text(readiness, config) or (
+        f"{len(received_dates)} of {len(expected_dates)} daily reports"
+    )
 
     ws.merge_cells("A3:L3")
     ws["A3"] = (
-        f"Week ending {latest_week_end:%m/%d/%Y} | {len(received_dates)} of {len(expected_dates)} daily reports | "
+        f"Week ending {latest_week_end:%m/%d/%Y} | {coverage_text} | "
         f"{len(global_full)} complete weeks available"
         if latest_week_end
         else "No management data available"
@@ -17274,7 +17431,8 @@ def write_management_dashboard_sheet(
     ws["A4"].fill = PatternFill("solid", fgColor="D9EAD3" if latest_complete else "F4CCCC")
     ws["A4"].font = Font(bold=True)
     ws["A4"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[3].height = 22
+    ws.row_dimensions[3].height = 32 if fully_closed_locations or config.get("closed_dates") else 22
+    ws["A3"].alignment = Alignment(vertical="center", wrap_text=True)
     ws.row_dimensions[4].height = 28
 
     group = group_rows[0] if group_rows else None
@@ -17479,11 +17637,13 @@ def write_management_dashboard_sheet(
                 ws.cell(row=row_index, column=3).fill = fill
         else:
             ws.cell(row=row_index, column=1, value=location or "No store data")
-            ws.cell(row=row_index, column=3, value="Missing")
+            declared_closed = location in fully_closed_locations
+            ws.cell(row=row_index, column=3, value="Declared closed" if declared_closed else "Missing")
             ws.cell(
                 row=row_index,
                 column=11,
-                value="What source data is missing, and who will confirm it?",
+                value=("No trading data or store comparison for this closed week."
+                       if declared_closed else "What source data is missing, and who will confirm it?"),
             )
             fill = priority_fill("Review")
             if fill:
@@ -17613,7 +17773,8 @@ def write_management_run_notes(
         ("Semantic Duplicates Ignored", report_audit.get("duplicate_files_ignored", 0)),
         ("Canonical History Folder", report_audit.get("canonical_archive", "Not recorded")),
         ("Report Conflicts", "None; conflicting same-date reports stop the run before output or archiving."),
-        ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))),
+        ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))
+         if records else "No source reports; declared closure period " + format_date_range(public_start, public_end)),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
         ("Recent Movement", f"Latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete person-weeks. Partial weeks, limited samples, missing metrics, and insufficient references are Not Evaluated."),
         ("Evidence Status", f"Eligibility requires latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests. This is not statistical confidence."),
@@ -17764,23 +17925,30 @@ def write_master_workbook(
     public_end: date,
 ) -> Path:
     integrity_context = config.get("_integrity", {})
-    state = read_management_state(
-        output_path,
-        allow_legacy_protection_upgrade=bool(
-            integrity_context.get("allow_legacy_master_upgrade", False)
-        ),
-        expected_digest=integrity_context.get(
-            "expected_master_generated_content_sha256"
-        ),
-        expected_digest_scheme=integrity_context.get(
-            "expected_master_generated_content_digest_scheme"
-        ),
-        legacy_reference_path=(
-            Path(integrity_context["legacy_master_reference_path"])
-            if integrity_context.get("legacy_master_reference_path")
-            else None
-        ),
-    )
+    if "_portable_management_state" in config:
+        from copy import deepcopy
+        state = deepcopy(config["_portable_management_state"])
+    else:
+        state = read_management_state(
+            output_path,
+            allow_legacy_protection_upgrade=bool(
+                integrity_context.get("allow_legacy_master_upgrade", False)
+            ),
+            expected_digest=integrity_context.get(
+                "expected_master_generated_content_sha256"
+            ),
+            expected_digest_scheme=integrity_context.get(
+                "expected_master_generated_content_digest_scheme"
+            ),
+            legacy_reference_path=(
+                Path(integrity_context["legacy_master_reference_path"])
+                if integrity_context.get("legacy_master_reference_path")
+                else None
+            ),
+        )
+    if not records:
+        # Empty data is meaningful only for an explicitly complete closure period.
+        validate_complete_reporting_set(records, config, public_start, public_end)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(f".{output_path.stem}.{os.getpid()}.tmp.xlsx")
     if temp_path.exists():
@@ -17795,7 +17963,9 @@ def write_master_workbook(
         )
         ranked_rows = weekly_server_rank_rows(weekly_server_rows, rank_min_guest_count)
         weekly_group_rows = group_weekly_rows(records)
-        readiness = latest_week_readiness(records, weekly_location_rows, config)
+        readiness = latest_week_readiness(
+            records, weekly_location_rows, config, fallback_week_end=public_end
+        )
         full_by_location, global_full = full_week_ends_by_location(
             weekly_location_rows, config.get("locations", {}),
             closed_dates=config.get("closed_dates", {}),
@@ -19418,6 +19588,17 @@ def assert_staging_capacity(
 
 
 def run(args: argparse.Namespace) -> list[Path]:
+    # The old manifest/anchor implementation remains an explicit maintenance
+    # path for examining pre-portability workspaces. Ordinary reporting uses
+    # business validation and a portable journal instead.
+    legacy = bool(getattr(args, "legacy_integrity", False)) or bool(
+        getattr(args, "initialize_integrity_baseline", False)
+    )
+    if not legacy:
+        from red_onion_workflow import run as run_portable
+        return run_portable(args)
+    if (Path(args.archive_dir) / "Reporting State" / "current.json").exists():
+        raise ValueError("This workspace uses portable reporting. Legacy writers cannot alter it; use a preserved pre-migration copy for legacy maintenance.")
     config_path = Path(args.config).resolve()
     # Validate before a folder, run lock, environment, or report artifact is created.
     args._validated_config = load_config(config_path)
@@ -20237,6 +20418,9 @@ def validate_v2_management_evidence_workbook(
 def verified_evidence_source(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Path]:
+    if (Path(args.archive_dir) / "Reporting State" / "current.json").exists():
+        from red_onion_workflow import evidence_source
+        return evidence_source(args)
     output_dir = Path(args.output_dir).resolve()
     archive_dir = Path(args.archive_dir).resolve()
     configured_anchor_dir = getattr(args, "integrity_anchor_dir", None)
@@ -20595,6 +20779,9 @@ def promote_approved_management_evidence(
 
 
 def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
+    if not getattr(args, "legacy_integrity", False):
+        from red_onion_workflow import health_check
+        return health_check(args)
     """Inspect runtime readiness without creating folders, locks, reports, or state."""
 
     checked_at = datetime.now(timezone.utc).isoformat()
@@ -20810,6 +20997,12 @@ def build_health_check(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def print_health_check(payload: dict[str, Any]) -> None:
+    if payload.get("workflow") == "portable-v1":
+        print(f"Red Onion health: {payload['overall']}")
+        for check in payload["checks"]:
+            print(f"  [{check['status']}] {check['name']}: {check['message']}")
+        print(payload["scope"])
+        return
     print(f"Red Onion health: {payload['overall']}")
     for check in payload["checks"]:
         print(f"  [{check['status']}] {check['name']}: {check['detail']}")
@@ -20840,11 +21033,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--integrity-anchor-dir",
         default=str(default_integrity_anchor_dir()),
         help=(
-            "Machine-local trusted-head folder outside the Dropbox/operator workspace. "
-            "Keep it restricted to the automation runner account."
+            "Legacy maintenance only: machine-local trusted-head folder. "
+            "Ordinary portable reporting does not use it."
         ),
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config JSON.")
+    parser.add_argument("--legacy-integrity", action="store_true", help="Maintainer-only legacy workflow on preserved pre-migration workspaces.")
+    parser.add_argument("--review-corrections", action="store_true", help="Show changed business values and choose each conflicting report once.")
+    parser.add_argument("--corrections-file", help="Previously reviewed correction choices bound to current business facts.")
+    parser.add_argument("--management-workbook", help="Select an editable master in Finished Reports when several different copies exist.")
     parser.add_argument("--week-start", help="Optional public snapshot start date, YYYY-MM-DD.")
     parser.add_argument("--week-end", help="Optional public snapshot end date, YYYY-MM-DD.")
     parser.add_argument(
@@ -20853,8 +21050,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FOLDER",
         help=(
-            "Copy validated daily reports from a legacy folder into the canonical processed "
-            "archive. Repeat this option for additional source folders."
+            "Capture validated daily reports from a legacy folder into portable reporting "
+            "history. Repeat this option for additional source folders."
         ),
     )
     parser.add_argument(
@@ -20866,8 +21063,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebuild-from-history",
         action="store_true",
         help=(
-            "Maintainer-only: rebuild and publish the latest complete week from "
-            "manifest-pinned history without reading, moving, or deleting active "
+            "Rebuild and publish the latest complete week from "
+            "accepted history without reading, moving, or deleting active "
             "drop-folder files. May be combined with --migrate-history-from."
         ),
     )
@@ -20896,12 +21093,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--health-check",
         action="store_true",
-        help="Run a read-only local readiness check and exit.",
+        help="Check local folders, configuration and reporting state without processing inputs.",
     )
     parser.add_argument(
         "--health-check-json",
         action="store_true",
-        help="Run the read-only readiness check and print versioned JSON.",
+        help="Print read-only local health as versioned JSON; does not establish incoming-set completeness.",
     )
     parser.add_argument(
         "--export-management-evidence",

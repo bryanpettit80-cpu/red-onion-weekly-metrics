@@ -32,7 +32,8 @@
     "Bar",
     "Patio",
     "Banquet",
-    "Takeout"
+    "Takeout",
+    "* Office Computer"
   ],
   "management_score_thresholds": {
     "check_average": {

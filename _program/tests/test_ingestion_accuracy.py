@@ -233,6 +233,7 @@ def test_partial_public_preview_names_local_missing_day(tmp_path: Path) -> None:
     workbook = load_workbook(path)
     try:
         assert "PRELIMINARY - Missing: 2026-07-23" in workbook["Report(All)"]["A1"].value
+        assert workbook["Report(All)"]["E2"].value == "Sales per Guest"
     finally:
         workbook.close()
 

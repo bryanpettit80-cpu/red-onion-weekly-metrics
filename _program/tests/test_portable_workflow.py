@@ -359,3 +359,43 @@ def test_explicit_full_week_location_closure_allows_complete_publication(tmp_pat
     finally:
         closed.close()
     assert len(store_for(root).current()["days"]) == 6
+
+
+def test_explicit_all_closed_period_publishes_without_inputs_or_future_advancement(tmp_path):
+    root = make_workspace(tmp_path / "Both restaurants declared closed")
+    config_path = root / "_program/red_onion_config.json"
+    config = json.loads(config_path.read_text())
+    config["closed_dates"] = {
+        location: [(WEEK_START + timedelta(days=offset)).isoformat() for offset in range(6)]
+        + [(WEEK_START + timedelta(days=14 + offset)).isoformat() for offset in range(6)]
+        for location in LOCATIONS
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    args = arguments(root, week_start="2026-10-06", week_end="2026-10-11")
+    assert len(workflow.run(args)) == 3
+    assert args._run_attempt_recorder.outcome == "published"
+    commit = store_for(root).current()
+    assert commit["period"] == {"start": "2026-10-06", "end": "2026-10-11"}
+    assert commit["changed_weeks"] == ["2026-10-11"]
+    assert commit["days"] == {}
+    assert set(output_hashes(root)) == {
+        "Check_Wine_RVA101126.xlsx", "Check_Wine_VB101126.xlsx", "Red_Onion_Server_Master.xlsx",
+    }
+    for code in ("RVA", "VB"):
+        assert public_totals(root, code) == (None, None, None, None, None)
+    wb = load_workbook(root / "Finished Reports/Red_Onion_Server_Master.xlsx", data_only=True)
+    try:
+        assert wb["Management Center"]["F7"].value == "10/11/2026"
+        assert wb["Management Center"]["F8"].value == (
+            "12 of 12 restaurant-days covered (0 reported; 12 declared closed)"
+        )
+        assert wb["Data Quality"]["G6"].value == "Declared closed"
+        assert wb["Data Quality"]["G7"].value == "Declared closed"
+    finally:
+        wb.close()
+    previous_outputs = output_hashes(root)
+    retry = arguments(root)
+    assert workflow.run(retry) == []
+    assert retry._run_attempt_recorder.outcome == "waiting_for_inputs"
+    assert store_for(root).current() == commit
+    assert output_hashes(root) == previous_outputs

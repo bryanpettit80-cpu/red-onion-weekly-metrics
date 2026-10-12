@@ -33,7 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dashboard_long_term_developing_min_recent_guests": 75,
     "dashboard_long_term_developing_min_earlier_guests": 50,
     "dashboard_exclude_name_contains": ["Banquet", "Server"],
-    "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout"],
+    "dashboard_exclude_exact_names": ["Bar", "Patio", "Banquet", "Takeout", "* Office Computer"],
     "management_score_thresholds": {
         "check_average": {"neutral": 11.5, "strong": 17.5, "lower_is_better": False},
         "wine_pct": {"neutral": 0.041, "strong": 0.057, "lower_is_better": False},

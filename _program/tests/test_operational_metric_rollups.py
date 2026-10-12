@@ -219,6 +219,28 @@ def test_legacy_rows_never_fall_back_to_guest_weighted_ticket_time() -> None:
     assert rollup["ticket_time_weight_basis"].startswith("Unavailable")
 
 
+@pytest.mark.parametrize("has_unavailable_active_row", [False, True])
+def test_second_rollup_preserves_known_checks_without_enabling_incomplete_ratios(
+    has_unavailable_active_row: bool,
+) -> None:
+    source = [record("* Office Computer", gross_sales=0, guests=0, checks=3, rate=0, ticket_seconds=0)]
+    if has_unavailable_active_row:
+        source.append(record("* Office Computer", gross_sales=100, guests=1, checks=0,
+                             rate=1, ticket_seconds=0, check_count_available=False))
+    first = metrics.aggregate_records(source, ("location", "raw_user_name", "display_name"))[0]
+    second = metrics.aggregate_weekly_rows([first])
+
+    assert first["check_count"] == second["check_count"] == 3
+    for row in (first, second):
+        assert row["check_count_available"] is False
+        assert row["per_check_available"] is False
+        assert row["ticket_time_available"] is False
+        assert metrics.management_metric_available(row, "sales_per_check") is False
+        assert metrics.management_metric_available(row, "guests_per_check") is False
+    assert first["active_days"] == (1 if has_unavailable_active_row else 0)
+    assert metrics.dashboard_trend_eligible(first, metrics.DEFAULT_CONFIG) is False
+
+
 def test_hidden_summaries_leave_unavailable_ticket_time_blank() -> None:
     legacy_week = metrics.aggregate_records(
         [

@@ -20,6 +20,7 @@ ACTIVE_WEEK_END = date(2026, 7, 26)  # Sunday
 
 def workflow_args(tmp_path: Path, *, initialize_baseline: bool = False) -> Namespace:
     return Namespace(
+        legacy_integrity=True,
         input_dir=str(tmp_path / "01 Daily Reports - Drop Here"),
         output_dir=str(tmp_path / "02 Finished Reports"),
         archive_dir=str(tmp_path / "03 Archive"),
@@ -579,7 +580,7 @@ def downgrade_master_to_pre_simplification_layout(path: Path) -> str:
                 "No - locked",
             ),
             "Shared & Area Trends": (
-                "eight-week shared POS results and guest-weighted Check Average by operating area",
+                "eight-week shared POS results and guest-weighted Sales per Guest by operating area",
                 "No - locked by default",
             ),
             "Methodology": (

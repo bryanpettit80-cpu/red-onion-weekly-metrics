@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from dataclasses import replace
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+import pytest
 
 import red_onion_weekly_metrics as metrics
 
@@ -112,6 +113,140 @@ def dashboard_inputs(source_days: int = metrics.OPERATING_WEEK_DAYS):
         action("server|casey", "Casey", "Recognize"),
     ]
     return records, weekly_locations, stores, groups, actions
+
+
+def closure_config(location: str, week_end: date, *, days: int = 6) -> dict:
+    return {
+        **metrics.DEFAULT_CONFIG,
+        "closed_dates": {
+            location: [(week_end - timedelta(days=offset)).isoformat() for offset in range(days)]
+        },
+    }
+
+
+def test_declared_week_closure_is_explicit_without_financial_comparisons() -> None:
+    wb = Workbook()
+    week_end = date(2026, 7, 12)
+    config = closure_config("RC Virginia Beach", week_end)
+    records, _, stores, groups, _ = dashboard_inputs()
+    records = [record for record in records if record.location == "RC Richmond"]
+    _, locations = metrics.weekly_rollups(records, config)
+    readiness = metrics.latest_week_readiness(records, locations, config)
+    assert readiness.ready
+
+    metrics.write_management_data_quality_sheet(wb, locations, config, readiness)
+    quality = wb["Data Quality"]
+    assert quality["G7"].value == "Declared closed"
+    assert "no trading data or person review" in quality["H7"].value
+    assert quality["D7"].value == 0
+    assert quality["C13"].value == "Declared closed"
+    assert "explicitly closed" in quality["A11"].value
+
+    metrics.write_management_center_sheet(wb, {}, [], [], [], config, readiness, [])
+    assert wb["Management Center"]["F8"].value == (
+        "12 of 12 restaurant-days covered (6 reported; 6 declared closed)"
+    )
+    metrics.write_management_dashboard_sheet(
+        wb, records, locations, [], [], stores, groups, [], config, readiness
+    )
+    dashboard = wb["Dashboard"]
+    assert "6 declared closed" in dashboard["A3"].value
+    assert dashboard["C20"].value == "Declared closed"
+    assert all(dashboard.cell(20, col).value is None for col in range(5, 11))
+
+    metrics.write_store_group_scorecards_sheet(wb, stores, config, locations, [], readiness)
+    scorecards = wb["Store & Group Scorecards"]
+    closed_title = next(
+        cell.row for row in scorecards for cell in row
+        if isinstance(cell.value, str)
+        and cell.value.startswith("RC Virginia Beach | Declared closed")
+    )
+    assert all(scorecards.cell(closed_title + 2, col).value is None for col in range(2, 6))
+    chart_data = wb["_Dashboard Chart Data"]
+    assert chart_data["C1"].value == "Virginia Beach"
+    assert chart_data["C2"].value is None
+
+
+def test_partial_closure_reports_actual_source_days_and_complete_coverage() -> None:
+    wb = Workbook()
+    week_end = date(2026, 7, 12)
+    config = closure_config("RC Richmond", week_end, days=1)
+    records, _, stores, groups, _ = dashboard_inputs()
+    records = [record for record in records
+               if (record.location, record.report_date) != ("RC Richmond", week_end)]
+    _, locations = metrics.weekly_rollups(records, config)
+    readiness = metrics.latest_week_readiness(records, locations, config)
+    metrics.write_management_data_quality_sheet(wb, locations, config, readiness)
+    quality = wb["Data Quality"]
+    assert readiness.ready
+    assert quality["D6"].value == 5
+    assert quality["G6"].value == "Complete (1 declared closed)"
+    assert quality["B13"].value == "Complete (1 declared closed)"
+    assert not any(cell.value == "Short Week" for row in quality for cell in row)
+    assert metrics.declared_closure_coverage_text(readiness, config) == (
+        "12 of 12 restaurant-days covered (11 reported; 1 declared closed)"
+    )
+    # Dated rows from the legacy, no-config rollup also count the explicit closure.
+    _, dated_rows = metrics.weekly_rollups(records)
+    assert metrics.write_management_chart_data(wb, dated_rows, [], config)[0] == 1
+    metrics.write_management_dashboard_sheet(
+        wb, records, dated_rows, [], [], stores, groups, [], config, readiness
+    )
+    assert "1 complete weeks available" in wb["Dashboard"]["A3"].value
+
+
+def test_complete_week_counts_keep_a_closed_store_in_its_historical_cohort() -> None:
+    wb = Workbook()
+    week_end = date(2026, 7, 12)
+    config = closure_config("RC Virginia Beach", week_end)
+    current, _, stores, groups, _ = dashboard_inputs()
+    records = [replace(record, report_date=record.report_date - timedelta(days=7))
+               for record in current]
+    records.extend(record for record in current if record.location == "RC Richmond")
+    _, locations = metrics.weekly_rollups(records, config)
+    # Preserve the old optional call shape, but configuration-aware views include the closure week.
+    assert metrics.write_management_chart_data(wb, locations, [])[0] == 1
+    assert metrics.write_management_chart_data(wb, locations, [], config)[0] == 2
+    assert wb["_Dashboard Chart Data"]["C2"].value == 600
+    assert wb["_Dashboard Chart Data"]["C3"].value is None
+    metrics.write_management_dashboard_sheet(
+        wb, records, locations, [], [], stores, groups, [], config
+    )
+    assert "2 complete weeks available" in wb["Dashboard"]["A3"].value
+
+
+def test_explicit_all_closed_empty_master_has_coverage_without_invented_history(tmp_path) -> None:
+    start, end = date(2026, 7, 7), date(2026, 7, 12)
+    config = {
+        **metrics.DEFAULT_CONFIG,
+        "closed_dates": {
+            location: [(start + timedelta(days=offset)).isoformat() for offset in range(6)]
+            + [(start + timedelta(days=7 + offset)).isoformat() for offset in range(6)]
+            for location in metrics.DEFAULT_CONFIG["locations"]
+        },
+    }
+    path = metrics.write_master_workbook(
+        [], tmp_path / "master.xlsx", config, tmp_path / "intake", start, end
+    )
+    wb = load_workbook(path, data_only=True)
+    try:
+        assert wb["Management Center"]["F7"].value == "07/12/2026"
+        assert wb["Management Center"]["F8"].value == (
+            "12 of 12 restaurant-days covered (0 reported; 12 declared closed)"
+        )
+        quality = wb["Data Quality"]
+        assert quality["G6"].value == quality["G7"].value == "Declared closed"
+        assert quality["B13"].value == quality["C13"].value == "Declared closed"
+        assert "no trading comparisons" in quality["A3"].value
+        assert wb["_Dashboard Chart Data"]["B2"].value is None
+        assert wb["_Dashboard Chart Data"]["C2"].value is None
+    finally:
+        wb.close()
+    with pytest.raises(ValueError, match="Reporting set is incomplete"):
+        metrics.write_master_workbook(
+            [], tmp_path / "unsupported.xlsx", config, tmp_path / "intake",
+            start + timedelta(days=14), end + timedelta(days=14),
+        )
 
 
 def test_dashboard_is_one_screen_and_deduplicates_actions() -> None:
