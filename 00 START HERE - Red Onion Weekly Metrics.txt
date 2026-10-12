@@ -1,0 +1,61 @@
+RED ONION WEEKLY METRICS - QUICK GUIDE
+=======================================
+
+BEFORE YOU START
+Use one computer at a time. Let Dropbox finish downloading the whole workspace.
+Save and close the daily reports and all Red Onion workbooks in Excel.
+
+WEEKLY SNAPSHOT
+1. Save the week's original Marketing Vitals .xls or .xlsx daily reports in:
+   01 Daily Reports - Drop Here
+2. Check Tuesday through Sunday coverage for Richmond and Virginia Beach:
+   six business dates and 12 restaurant-days, normally six daily workbooks
+   containing both restaurants. Use the Date(s) field inside each report;
+   filenames do not establish the business date. Keep only one week in intake.
+   Previously accepted reports can supply other dates in that same week.
+3. Double-click Run Weekly Snapshot.cmd in this folder.
+4. Read the screen result and 02 Finished Reports\LAST RUN STATUS.txt.
+   Check the report week before opening the finished workbooks.
+
+READ THE RESULT
+waiting_for_inputs      Supply the listed missing reports or finish downloading.
+                        Previous reports remain available; missing is not zero.
+needs_review            Have the stated conflict or invalid input reviewed.
+published               The complete report set was saved locally.
+published_with_warnings The report was saved; review the warning. Do not restore
+                        inputs or repeat the week just because cleanup is pending.
+already_processed       These facts were accepted; reports were not regenerated.
+failed_before_publication Resolve the stated problem before retrying.
+history_imported        History was saved without reports. The next ordinary run
+                        refreshes the complete accepted history.
+
+FINISHED REPORTS AND MANAGEMENT UPDATES
+Weekly restaurant reports and Red_Onion_Server_Master.xlsx are in
+02 Finished Reports. Start with How to Use; check Management Center readiness.
+Edit the supported blue cells in Management Center. Targets, owners, and
+Current Actions updates carry forward. Keep tables, columns, and Action IDs
+intact. Save and close the master before the next run. Keep exploratory edits
+in a separate review copy; different management edits in multiple masters
+require a choice. Correct reporting data through source review, not by changing
+a generated number. Verified closures require an explicit configuration entry.
+
+KEEP HISTORY AND BACKUPS TOGETHER
+Keep all three numbered folders, program, and launcher together. Do not move,
+rename, or delete archive contents to resolve a run message. Accepted sources
+and recovery history are saved under 03 Archive, including Reporting State.
+Inputs leave intake after publication and saved-copy verification; warnings
+may leave cleanup pending. Keep the existing archive for the first import.
+Back up the whole Red Onion Metrics folder, including the latest edited master
+and Reporting State, to an independent location outside the live synced folder.
+A program-only download or Dropbox sync alone is not an independent backup.
+Before switching PCs, finish the run, close Excel, and let Dropbox finish
+uploading here and downloading there. Local success does not prove cloud sync.
+See the program's SETUP.md and RECOVERY.md for setup or recovery help.
+
+FOLDER MAP
+01 Daily Reports - Drop Here         Current daily reports waiting to run
+02 Finished Reports                  Weekly workbooks, master, and run status
+03 Archive                           Saved source history and recovery files
+Red Onion Weekly Metrics Automation  Program and help; operators do not edit
+
+An empty drop folder is normal. Excel temporary files beginning with ~$ are ignored.
