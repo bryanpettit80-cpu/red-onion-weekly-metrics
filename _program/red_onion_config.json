@@ -110,6 +110,7 @@
     "rate": 0.005,
     "ticket_minutes": 2.5
   },
+  "person_identity_aliases": {},
   "public_name_aliases": {
     "Bar 1 Bar 1": "Bar",
     "Bar Server": "Bar",

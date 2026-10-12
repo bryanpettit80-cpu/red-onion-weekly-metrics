@@ -99,6 +99,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "Bar Server": "Bar",
         "BarPatio Bartender Patio": "Patio",
     },
+    "person_identity_aliases": {},
     "weekly_area_name_patterns": {
         "Bar": ["Bar"],
         "Patio": ["Patio"],
@@ -317,6 +318,43 @@ def validate_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 target, f"public_name_aliases.{source}"
             )
         payload["public_name_aliases"] = normalized_aliases
+
+    if "person_identity_aliases" in payload:
+        locations = {**DEFAULT_CONFIG["locations"], **payload.get("locations", {})}
+        identity_aliases = _require_mapping(
+            payload["person_identity_aliases"], "person_identity_aliases"
+        )
+        normalized_identity_aliases: dict[str, dict[str, str]] = {}
+        for location, aliases_value in identity_aliases.items():
+            location = _require_string(location, "person_identity_aliases location")
+            if location not in locations:
+                raise ConfigError(
+                    f"person_identity_aliases location {location!r} is not configured."
+                )
+            if location in normalized_identity_aliases:
+                raise ConfigError("person_identity_aliases locations must be unique after trimming.")
+            aliases = _require_mapping(aliases_value, f"person_identity_aliases.{location}")
+            normalized: dict[str, str] = {}
+            for source, target in aliases.items():
+                source = _require_string(source, f"person_identity_aliases.{location} key")
+                target = _require_string(target, f"person_identity_aliases.{location}.{source}")
+                if source in normalized:
+                    raise ConfigError("person_identity_aliases keys must be unique after trimming.")
+                if source == target:
+                    raise ConfigError("person_identity_aliases must map different raw names.")
+                if any(
+                    name.isdecimal()
+                    or re.match(r"^\d{4}\b", name)
+                    or re.fullmatch(r"\d+\s+Server\d*(?:\s+Server\d*)*", name, re.IGNORECASE)
+                    or re.fullmatch(r"server\s*\d+(?:\s+server\s*\d+)?", name, re.IGNORECASE)
+                    for name in (source, target)
+                ):
+                    raise ConfigError("person_identity_aliases cannot convert shared POS or numbered server identities into people.")
+                normalized[source] = target
+            if set(normalized) & set(normalized.values()):
+                raise ConfigError("person_identity_aliases must map directly to a canonical name; chains and cycles are not allowed.")
+            normalized_identity_aliases[location] = normalized
+        payload["person_identity_aliases"] = normalized_identity_aliases
 
     if "weekly_area_name_patterns" in payload:
         patterns = _require_mapping(
