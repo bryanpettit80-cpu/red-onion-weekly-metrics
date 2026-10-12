@@ -135,6 +135,8 @@ restaurant reports as well as the current master.
 The first portable invocation reads existing canonical
 `processed-daily-reports` history and imports it. It does not rewrite old
 manifests, regenerate a trust chain, or require historical derivative files.
+With empty intake, it saves history and the current management inputs without
+changing reports. A subsequent ordinary run refreshes complete accepted history.
 
 ## Local evidence export
 

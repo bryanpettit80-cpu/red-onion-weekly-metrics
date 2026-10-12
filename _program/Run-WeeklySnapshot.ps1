@@ -37,19 +37,32 @@ $env:PYTHONPYCACHEPREFIX = Join-Path (
 ) ("RedOnionMetrics-PythonCache-" + [guid]::NewGuid().ToString("N"))
 
 function Test-OperatorFolders {
-    param([Parameter(Mandatory = $true)][string]$Root)
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [switch]$RequireComplete
+    )
 
+    $FolderCount = 0
     foreach ($Name in @("01 Daily Reports - Drop Here", "02 Finished Reports", "03 Archive")) {
         if (Test-Path -LiteralPath (Join-Path $Root $Name) -PathType Container) {
-            return $true
+            $FolderCount += 1
         }
     }
-    return $false
+    if ($RequireComplete) {
+        return $FolderCount -eq 3
+    }
+    return $FolderCount -gt 0
 }
 
 if (-not $OperationsRoot) {
     $ParentRoot = Split-Path -Parent $RepositoryRoot
-    if (Test-OperatorFolders -Root $RepositoryRoot) {
+    if (Test-OperatorFolders -Root $RepositoryRoot -RequireComplete) {
+        $OperationsRoot = $RepositoryRoot
+    } elseif ($ParentRoot -and (Test-OperatorFolders -Root $ParentRoot -RequireComplete)) {
+        $OperationsRoot = $ParentRoot
+    } elseif (Test-OperatorFolders -Root $RepositoryRoot) {
+        # Keep the partial workspace selected so the ordinary missing-folder
+        # check explains what must be restored instead of creating empty data.
         $OperationsRoot = $RepositoryRoot
     } elseif ($ParentRoot -and (Test-OperatorFolders -Root $ParentRoot)) {
         $OperationsRoot = $ParentRoot

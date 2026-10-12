@@ -54,7 +54,7 @@ finished reports unchanged and reports the missing restaurant-days.
 | `published` | The complete report set was published locally. |
 | `published_with_warnings` | Publication succeeded; review the stated cleanup or status warning. |
 | `failed_before_publication` | The new reporting set did not commit. Resolve the stated problem before retrying. |
-| `history_imported` | A maintainer imported history without generating reports. |
+| `history_imported` | Existing history was saved without generating reports. The next ordinary run refreshes complete accepted history. |
 
 `LAST RUN STATUS.txt` is the convenient summary. The portable run receipt in
 `03 Archive\Reporting State` records the committed result. Neither a success

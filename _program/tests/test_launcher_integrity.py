@@ -645,6 +645,40 @@ def test_operator_root_resolves_by_folder_evidence_or_explicit_argument(
 
 
 @pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
+@pytest.mark.parametrize("child_folders", [
+    ("03 Archive",),
+    ("01 Daily Reports - Drop Here", "02 Finished Reports"),
+    OPERATOR_FOLDERS,
+])
+def test_complete_workspace_discovery_prefers_own_then_parent(
+    tmp_path: Path, launcher_environment: dict[str, str], child_folders: tuple[str, ...],
+) -> None:
+    repository_root = tmp_path / "Renamed program"
+    launcher = _write_minimal_runner(repository_root, operator_folders=False)
+    _write_operator_folders(tmp_path)
+    preserved = {}
+    for folder in child_folders:
+        directory = repository_root / folder
+        directory.mkdir()
+        marker = directory / "Existing child data.txt"
+        marker.write_text(folder, encoding="utf-8")
+        preserved[marker] = marker.read_bytes()
+    capture_path = tmp_path / "selected-workspace.txt"
+    environment = launcher_environment.copy()
+    environment["RED_ONION_TEST_ARGUMENTS_PATH"] = str(capture_path)
+
+    result = _run_launcher(launcher, environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = repository_root if len(child_folders) == 3 else tmp_path
+    forwarded = capture_path.read_text(encoding="utf-8").splitlines()
+    for option, folder in zip(("--input-dir", "--output-dir", "--archive-dir"), OPERATOR_FOLDERS):
+        assert Path(forwarded[forwarded.index(option) + 1]) == expected / folder
+        assert (repository_root / folder).exists() is (folder in child_folders)
+    assert {path: path.read_bytes() for path in preserved} == preserved
+
+
+@pytest.mark.skipif(not WINDOWS_LAUNCHER_AVAILABLE, reason="Windows PowerShell required")
 @pytest.mark.parametrize("layout", ["standalone", "renamed-child", "explicit"])
 def test_cmd_noninteractive_routes_without_pause_or_false_recovery_claim(
     tmp_path: Path, layout: str

@@ -145,6 +145,11 @@ management inputs, generated action evidence, and run receipts. Treat it and
 the latest editable master as restricted operational data. After the first
 import, only the documented editable fields merge from the workbook; saved
 generated actions, history, and evidence retain their accepted identities.
+Write access to Reporting State grants authority over accepted history and
+recovery actions in the intake and finished-report folders. Give it only to
+trusted reporting operators; report consumers and upload-only users must not
+have it. Receipts and checksums detect damage or incomplete copies, not
+deliberate edits by someone with that write access.
 Back up the whole operations root, not only the finished reports. The local
 Python environment and old machine anchors are not needed for portable recovery.
 

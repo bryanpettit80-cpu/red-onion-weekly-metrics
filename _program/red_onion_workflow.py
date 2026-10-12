@@ -11,6 +11,7 @@ from dataclasses import asdict
 from datetime import date
 import math
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 import uuid
@@ -351,9 +352,17 @@ def _run_locked(
         if any(not weekly.is_operating_day(row.report_date) for row in rows):
             raise ValueError(f"{path.name} is not a Tuesday-Sunday business-day report.")
     explicit_period = bool(args.week_start or args.week_end)
+    bootstrap_only = bool(
+        previous is None and days and not incoming and not rebuild
+        and not migration_only and not migration_roots and not explicit_period
+    )
+    # The first ordinary legacy run can save canonical history and current
+    # management without republishing an old week. An explicit import-only
+    # command still requires its source folder, checked above.
+    migration_only = migration_only or bootstrap_only
     pending_refresh = bool((previous or {}).get("pending_report_refresh"))
     pending_weeks = {date.fromisoformat(value) for value in (previous or {}).get("pending_report_weeks", [])}
-    if not incoming and not rebuild and not explicit_period and not pending_refresh:
+    if not incoming and not rebuild and not explicit_period and not pending_refresh and not bootstrap_only:
         raise WorkflowAttention("waiting_for_inputs", "No new daily reports are available. The previous report is unchanged.")
     if active_paths:
         # A wrong-period attachment must not silently select a different week.
@@ -400,7 +409,10 @@ def _run_locked(
             affected_weeks.add(latest_end)
     else:
         latest_start = latest_end = None
-    expected_master = (previous or {}).get("published_outputs", {}).get("master", {}).get("name")
+    expected_master = (
+        (previous or {}).get("published_outputs", {}).get("master", {}).get("name")
+        or (previous or {}).get("management_workbook_name")
+    )
     current_master = find_master(store.output_dir, getattr(args, "management_workbook", None), expected_name=expected_master)
     old_management = previous.get("management_state") if previous else None
     current_master_hash = sha256_file(current_master) if current_master else None
@@ -413,6 +425,14 @@ def _run_locked(
         if not rebuild:
             raise WorkflowAttention("needs_review", "The current management workbook is missing. Finish downloading the workspace or use --rebuild-from-history to restore the last saved management state.")
         warnings.append("The master was not present; its last saved management state was restored.")
+    if current_master is not None and any(
+        re.fullmatch(r"Check_Wine_" + re.escape(info["short_code"]) + r"\d{6}\.xlsx", current_master.name, re.IGNORECASE)
+        for info in config["locations"].values()
+    ):
+        raise WorkflowAttention(
+            "needs_review", "The management workbook name conflicts with a restaurant report filename. "
+            "Rename the management workbook before retrying; no report was overwritten."
+        )
     run_id = recorder.run_id
     run_root = child(store.runs, run_id)
     run_root.mkdir(parents=True, exist_ok=False)
@@ -458,6 +478,19 @@ def _run_locked(
         affected_weeks.add(latest_end)
     try:
         if not no_business_change and not migration_only:
+            master_name = current_master.name if current_master is not None else "Red_Onion_Server_Master.xlsx"
+            planned_names = [
+                f"Check_Wine_{info['short_code']}{end:%m%d%y}.xlsx"
+                for end in sorted(affected_weeks) for info in config["locations"].values()
+            ] + [master_name]
+            if len({name.casefold() for name in planned_names}) != len(planned_names):
+                raise ValueError("Generated report filenames collide; check the restaurant short codes and master filename.")
+            # Record the destination baseline before any generation. A manager
+            # save or cloud replacement during the build must not be overwritten.
+            output_expected = {
+                name: sha256_file(store.output_dir / name) if (store.output_dir / name).exists() else None
+                for name in planned_names
+            }
             weekly.assert_staging_capacity(store.output_dir, store.archive_dir, tuple(active_captures))
             recorder.update(RunStage.BUILDING_WORKBOOKS, "Building a complete reporting set and preserving management input.")
             for end in sorted(affected_weeks):
@@ -474,9 +507,6 @@ def _run_locked(
                 renamed = stage / current_master.name
                 staged_master.rename(renamed)
                 staged_paths = [renamed if p == staged_master else p for p in staged_paths]
-            for path in staged_paths:
-                target = store.output_dir / path.name
-                output_expected[path.name] = sha256_file(target) if target.exists() else None
         if current_master is not None and sha256_file(current_master) != current_master_hash:
             raise RecoveryRequired("Management inputs changed while the report was building. Rerun to preserve the latest edits.")
         weekly.verify_captured_active_inputs(active_captures, store.input_dir)
@@ -492,6 +522,7 @@ def _run_locked(
             "previous_run_id": previous["run_id"] if previous else None,
             "operation": "history_import" if migration_only else "duplicate_receipt" if no_business_change else "history_rebuild" if rebuild else "weekly_report",
             "days": updated, "management_state": json_value(management),
+            "management_workbook_name": current_master.name if current_master is not None else expected_master,
             "corrections": correction_receipts,
             "period": {"start": latest_start.isoformat(), "end": latest_end.isoformat()} if latest_end else (previous or {}).get("period"),
             "changed_weeks": [d.isoformat() for d in sorted(affected_weeks)],

@@ -33,7 +33,7 @@ mail or Google Drive credentials. Keep Dropbox authentication in the Dropbox app
 ## Choose the workspace
 
 The program uses an explicit `-OperationsRoot` first. Otherwise, it looks for
-numbered operator folders beside the program's `_program` folder, then in the
+all three numbered operator folders beside the program's `_program` folder, then in the
 parent folder. A new standalone copy defaults to its own folder. A program-folder
 rename does not change these rules. If there are several possible workspaces,
 choose one explicitly:
