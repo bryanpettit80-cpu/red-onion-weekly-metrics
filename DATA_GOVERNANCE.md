@@ -4,25 +4,28 @@ Server scorecards, named signals, coaching/recognition prompts, review
 dispositions, owner assignments, evidence details, and approved evidence
 exports are Restricted Employee Performance Information.
 
-The current `2026.07-v3` methodology uses deterministic observational
+The tracked-action methodology `2026.07-v3` uses deterministic observational
 screening rules. They are not a statistical, predictive, causal, or
 employment-decision model. Data integrity and reproducibility do not establish
 that a signal fairly attributes performance to one person.
 
-The separate `2026.10-v2` descriptive scorecards include all resolved named
-servers in the latest eight complete weeks, with explicit low-data reasons.
-Their Data Coverage label describes sample sufficiency, not statistical
-confidence. They do not feed people-review prompts. Exact, verified
-per-location identity aliases may join name variants for descriptive reports;
+The separate `2026.10-v3` staff discussion views include all resolved named
+servers in the latest eight complete weeks. Usable positive sales and guests
+can support feedback after one active day when at least five other qualified
+same-store/week peers are available. Established, Building, and Early
+indication describe the sample, not statistical confidence. Small samples
+retain conversation topics with context; missing denominators or peer
+references remain unavailable. These suggestions do not create or escalate
+tracked actions. Exact, verified per-location identity aliases may join name variants for descriptive reports;
 they do not alter management Action IDs or transfer assignments. Shared POS
 identities must never be converted into person identities.
 
 ## Allowed Use
 
 - Weekly context review by authorized Red Onion leaders.
-- Identifiable coaching and recognition conversations after source accuracy,
-  comparable-work context, peer-reference sufficiency, and stability have been
-  reviewed.
+- Identifiable coaching and recognition conversations after checking source
+  accuracy, the comparison sample, and comparable-work context. Tracked-action
+  dispositions also require their documented persistence and stability review.
 - Accountable tracking of the generated signal, manager disposition, reviewer,
   review date, and resulting follow-up.
 - AI-assisted analysis only after a named authorized manager reviews the exact
@@ -40,7 +43,7 @@ person identities. They must remain outside server scorecards, peer cohorts,
 people-review signals, evidence packages, and employment decisions.
 
 Bar, Patio, Dining Room, Banquets, and Wine Dinners trends are operational
-aggregates across complete weeks. Sales/Guest is guest-weighted: total Gross
+aggregates across complete weeks. Spend per guest is guest-weighted: total Gross
 Sales divided by total Guests. Dining Room is the fallback for eligible named
 rows not assigned to another area. Wine Dinners must show as unavailable until
 the source supplies an explicitly configured name or
@@ -66,7 +69,8 @@ Names must not be used to infer protected characteristics.
 
 ## Required Human Review
 
-Every generated row begins with `Pending Review`. The reviewer must check:
+Every generated tracked-action row in Management Center begins with
+`Pending Review`. Before completing its disposition, the reviewer must check:
 
 1. the source date, identity, location, completeness, and reconciliation;
 2. the sample and peer-reference requirements;
@@ -102,6 +106,10 @@ Area Trends`, `Methodology`, and `Management Center`. `Management Center`
 consolidates the data-readiness summary, editable targets and owner roster,
 Current Actions, and locked Action History that previously occupied separate
 operator tabs.
+
+Staff discussion suggestions remain separate from this action queue. History
+distinguishes completed, dismissed, and cleared signals; clearing a signal
+preserves its recorded review status and does not certify completed follow-up.
 
 The permitted workbook inputs are target values in `D:I` (Entity in `C` stays
 locked), Owner Roster values in `K:L`, and Current Actions Status (`D`), Owner

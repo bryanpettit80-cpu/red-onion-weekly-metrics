@@ -661,6 +661,7 @@ def test_dashboard_does_not_hide_seventh_server_or_insufficient_data_people() ->
     for location in location_rows:
         for number in range(1, 6):
             server_rows.append(weekly_server_row(location["week_end"], f"Additional Colleague {number}"))
+        server_rows.append(weekly_server_row(location["week_end"], "Mixed Colleague", spg=112, wine_pct=.08))
     server_rows.append(weekly_server_row(location_rows[-2]["week_end"], "Limited Colleague", guests=10, active_days=1))
     config = one_location_config()
     model = metrics.build_performance_consistency_model(server_rows, location_rows, config)
@@ -673,13 +674,23 @@ def test_dashboard_does_not_hide_seventh_server_or_insufficient_data_people() ->
     metrics.write_performance_consistency_sheets(workbook, model, config, readiness)
     dashboard = workbook["Performance Dashboard"]
     values = [cell.value for cell in dashboard._cells.values()]
-    for row in model["summary_rows"]:
-        assert values.count(row["display_name"]) == 1
-    assert "Limited Colleague" in values
-    assert "all 11 qualifying servers" in dashboard["A17"].value
+    name_cells = [str(cell.value) for cell in dashboard._cells.values()
+                  if cell.column == 1 and cell.value is not None]
+    for row in model["staff_feedback"]["rows"]:
+        expected = 2 if row["present_latest_week"] and row["coaching_prompt"] and row["recognition_prompt"] else 1
+        assert sum(value.startswith(row["display_name"] + "\n") for value in name_cells) == expected
+    assert any(value.startswith("Limited Colleague\n") for value in name_cells)
+    assert any(value.startswith("Mixed Colleague\n") for value in name_cells)
+    assert "NO RECORDED ACTIVITY LATEST WEEK" in values
+    assert "both coaching and recognition" in dashboard["A12"].value
     assert "Confidence" not in values
-    last_name_row = max(cell.row for cell in dashboard._cells.values() if cell.value in {row["display_name"] for row in model["summary_rows"]})
-    assert int(dashboard._charts[0].anchor[1:]) > last_name_row
+    limited_row = next(row for row in model["staff_feedback"]["rows"] if row["display_name"] == "Limited Colleague")
+    assert limited_row["comparison_spg"] is not None
+    assert limited_row["data_coverage"] == "Early indication"
+    assert dashboard.page_setup.paperSize == int(dashboard.PAPERSIZE_LETTER)
+    assert dashboard.page_setup.scale == 100
+    assert dashboard.sheet_properties.pageSetUpPr.fitToPage is False
+    assert dashboard.row_breaks.brk
     workbook.close()
 
 
@@ -791,21 +802,37 @@ def test_generated_sheets_preserve_navigation_protection_and_audit_boundary(
 
         assert reloaded["_Consistency Calc"].sheet_state == "veryHidden"
         assert reloaded["_Consistency Calc"].protection.sheet is True
-        assert reloaded["Server Scorecards"].tables["ServerScorecardsTable"].ref == "A6:P12"
-        assert reloaded["Weekly Performance"].tables["WeeklyPerformanceTable"].ref == "A6:Q12"
+        assert reloaded["_Staff Feedback Calc"].sheet_state == "veryHidden"
+        assert reloaded["_Staff Feedback Calc"].protection.sheet is True
+        assert reloaded["Server Scorecards"].tables["ServerScorecardsTable"].ref == "A6:R12"
+        assert reloaded["Weekly Performance"].tables["WeeklyPerformanceTable"].ref == "A6:N12"
         assert "ServerScorecardDetailTable" in reloaded["Server Scorecards"].tables
         scorecards = reloaded["Server Scorecards"]
-        assert [scorecards.cell(6, column).value for column in (3, 4, 9, 10, 11, 12, 13, 14)] == [
-            "Last Worked", "Data Coverage", "Actual $ / Guest", "Peer $ / Guest", "$ / Guest Difference",
-            "Actual Wine Share", "Peer Wine Share", "Wine Difference (pp)",
+        assert [scorecards.cell(6, column).value for column in (3, 4, 7, 8, 9, 10, 11, 12)] == [
+            "Latest week activity", "Data coverage", "Spend per guest", "Typical teammate spend", "Spend difference",
+            "Wine sales per $100", "Typical teammate wine", "Wine difference per $100",
         ]
         taylor_row = next(row for row in range(7, 13) if scorecards.cell(row, 2).value == "Taylor Guest")
-        assert scorecards.cell(taylor_row, 9).value == pytest.approx(112.0)
-        assert scorecards.cell(taylor_row, 10).value == pytest.approx(100.0)
-        assert scorecards.cell(taylor_row, 11).value == pytest.approx(12.0)
-        assert scorecards.cell(taylor_row, 14).value == pytest.approx(2.0)
-        assert '" pp"' in scorecards.cell(taylor_row, 14).number_format
-        assert not any(" SD" in str(scorecards.cell(6, column).value) for column in range(1, 17))
+        assert scorecards.cell(taylor_row, 7).value == pytest.approx(112.0)
+        assert scorecards.cell(taylor_row, 8).value == pytest.approx(100.0)
+        assert scorecards.cell(taylor_row, 9).value == pytest.approx(12.0)
+        assert scorecards.cell(taylor_row, 10).value == pytest.approx(12.0)
+        assert scorecards.cell(taylor_row, 11).value == pytest.approx(10.0)
+        assert scorecards.cell(taylor_row, 12).value == pytest.approx(2.0)
+        assert scorecards.cell(taylor_row, 7).value - scorecards.cell(taylor_row, 8).value == pytest.approx(scorecards.cell(taylor_row, 9).value)
+        assert scorecards.cell(taylor_row, 10).value - scorecards.cell(taylor_row, 11).value == pytest.approx(scorecards.cell(taylor_row, 12).value)
+        assert "$" in scorecards.cell(taylor_row, 12).number_format
+        assert not any(" SD" in str(scorecards.cell(6, column).value) or "(pp)" in str(scorecards.cell(6, column).value)
+                       for column in range(1, 19))
+        for name in ("Performance Dashboard", "Server Scorecards", "Weekly Performance", "Methodology"):
+            sheet = reloaded[name]
+            assert sheet.page_setup.paperSize == int(sheet.PAPERSIZE_LETTER)
+            assert sheet.page_setup.orientation == "landscape"
+            assert sheet.page_setup.scale == 100
+            assert sheet.sheet_properties.pageSetUpPr.fitToPage is False
+            assert sheet.row_breaks.brk
+        for name in ("Server Scorecards", "Weekly Performance"):
+            assert "$Y$" in str(reloaded[name].print_area)
         assert "SharedPosTrendTable" in reloaded["Shared & Area Trends"].tables
         assert "AreaCheckAverageTrendTable" in reloaded["Shared & Area Trends"].tables
         shared_area_sheet = reloaded["Shared & Area Trends"]
@@ -838,9 +865,9 @@ def test_generated_sheets_preserve_navigation_protection_and_audit_boundary(
                 shared_area_sheet.tables[table_name].ref
             )
             assert shared_area_sheet.row_dimensions[header_row].height == 30
-        assert len(reloaded["Performance Dashboard"]._charts) == 1
+        assert len(reloaded["Performance Dashboard"]._charts) == 0
         assert reloaded["Performance Dashboard"]["A6"].value.startswith(
-            "OVERALL STORE PERFORMANCE"
+            "OVERALL STORE RESULTS"
         )
         assert reloaded["Performance Dashboard"]["A8"].value == pytest.approx(
             100_000.0
@@ -872,9 +899,7 @@ def test_generated_sheets_preserve_navigation_protection_and_audit_boundary(
         assert "Action Board" not in operator_text
         assert "See Data Quality" not in operator_text
         assert "Management Center Current Actions" in operator_text
-        assert all(
-            reloaded["Methodology"].row_dimensions[row].height >= 50
-            for row in range(6, 13)
-        )
+        assert all(cell.font.sz >= 9 for cell in reloaded["Methodology"]._cells.values()
+                   if cell.value not in (None, ""))
     finally:
         reloaded.close()

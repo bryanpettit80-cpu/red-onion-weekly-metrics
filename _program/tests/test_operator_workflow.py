@@ -1211,9 +1211,13 @@ def test_master_workbook_contains_star_store_group_and_dashboard_sections(tmp_pa
         if isinstance(center.cell(row, 3).value, str)
         and center.cell(row, 3).value.startswith("ACTION HISTORY |")
     )
-    assert center.print_area == f"'Management Center'!$A$1:$W${action_last_row}"
+    print_left, print_first, print_right, _ = metrics.range_boundaries(
+        str(center.print_area).split("!")[1].replace("$", "")
+    )
+    assert (print_left, print_right) == (25, 32)
+    assert print_first > history_title_row
     assert action_last_row < history_title_row
-    assert center.page_setup.fitToHeight == 1
+    assert center.page_setup.fitToHeight == 0
     assert center.page_setup.pageOrder == "overThenDown"
     assert all(center.row_dimensions[row].hidden is not True for row in range(13, 28))
     assert all(center.row_dimensions[row].hidden is True for row in range(28, 63))

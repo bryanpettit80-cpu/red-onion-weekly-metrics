@@ -10,6 +10,8 @@ project's reporting rules, workbook generator, and local runtime helpers.
 | --- | --- |
 | `red_onion_config.py` | Validate configuration without third-party dependencies. |
 | `red_onion_weekly_metrics.py` | Parse reports, calculate business results, render and validate workbooks, expose CLI commands, and retain explicit legacy maintenance paths. |
+| `red_onion_staff_feedback.py` | Build matched weekly peer comparisons and staff discussion topics without changing tracked actions. |
+| `red_onion_staff_views.py` | Render the staff dashboard, scorecards, weekly comparisons, and methodology. |
 | `red_onion_workflow.py` | Ordinary intake, complete-week gating, duplicate/correction handling, accepted history, management carry-forward, and result recording. |
 | `red_onion_management.py` | Identify management tables and import allowed business inputs independently of workbook filename and formatting. |
 | `red_onion_transactions.py` | Portable receipts, verified copies, publication journals, rollback, and post-commit cleanup. |
@@ -116,11 +118,16 @@ Maintain these boundaries:
 - People-review methodology `2026.07-v3` uses only Sales/Guest and Wine
   Percentage. Operational context and descriptive scorecards do not feed its
   direction, persistence, stability, or action classification.
-- Descriptive methodology `2026.10-v2` includes all resolved named servers in
-  the latest eight globally complete weeks. Historical peers are selected
-  from their actual store/week. Main actual/peer summaries use the same
-  qualified capped weights; wine gaps are percentage points. Low-data people
-  remain visible with no unsupported classification.
+- Staff discussion methodology `2026.10-v3` includes all resolved named servers
+  in the latest eight globally complete weeks. Positive sales and guests plus
+  one active day can support a subject comparison. At least five other peers
+  meeting the existing 25-guest/three-day rule are selected from that same
+  store/week. Each measure's actual and peer summaries use identical weeks
+  and capped guest weights. Display Spend per guest and Wine sales per $100.
+- Established, Building, and Early indication describe the sample. Small
+  samples retain discussion topics; unavailable denominators or peers remain
+  explicit. Near-cutoff results call for context. Staff suggestions never
+  create or escalate `2026.07-v3` tracked actions.
 - Shared POS identities and area aggregates remain separate operations views.
 - Rate of Sale combines positive available ratios harmonically using Guests
   as opportunities. Ticket Time requires complete Check Count coverage and

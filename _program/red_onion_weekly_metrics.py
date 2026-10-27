@@ -54,6 +54,13 @@ from red_onion_integrity import (
 )
 from red_onion_config import DEFAULT_CONFIG, load_config
 from red_onion_ingestion import parse_single_business_date, validated_report_columns
+from red_onion_staff_feedback import build_staff_feedback
+from red_onion_staff_views import (
+    write_staff_dashboard,
+    write_staff_methodology,
+    write_staff_scorecards,
+    write_staff_weekly,
+)
 from red_onion_runtime import (
     RunAttemptRecorder,
     RunReadiness,
@@ -201,7 +208,7 @@ REVIEW_DISPOSITION_CHOICES: tuple[str, ...] = (
 )
 MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v3"
 PREVIOUS_MANAGEMENT_METHODOLOGY_VERSION = "2026.07-v2"
-PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION = "2026.10-v2"
+PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION = "2026.10-v3"
 PERFORMANCE_CONSISTENCY_WINDOW_WEEKS = 8
 PERFORMANCE_CONSISTENCY_BLOCK_WEEKS = 4
 PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP = 50.0
@@ -6001,7 +6008,8 @@ def build_performance_consistency_model(
 
     The model intentionally remains separate from the gated Action Board signal.
     It includes every resolved named server observed in the complete-week window,
-    same-store leave-one-person-out medians from that week, and unchanged sample gates.
+    same-store leave-one-person-out medians from that week. The legacy gated
+    calculations remain auditable; staff_feedback includes every usable subject.
     """
 
     _, global_full = full_week_ends_by_location(
@@ -6028,6 +6036,7 @@ def build_performance_consistency_model(
             },
             "store_consistency": [],
             "overall_store": None,
+            "staff_feedback": build_staff_feedback([], (), config),
         }
 
     latest_complete_week_end = week_ends[-1]
@@ -6379,6 +6388,14 @@ def build_performance_consistency_model(
         "category_counts": category_counts,
         "store_consistency": store_consistency,
         "overall_store": overall_store_performance(weekly_location_rows, week_ends),
+        "staff_feedback": build_staff_feedback(
+            [
+                {**row, "feedback_peer_eligible": dashboard_trend_eligible(row, config)}
+                for row in person_rows
+            ],
+            week_ends,
+            config,
+        ),
     }
 
 
@@ -9809,7 +9826,6 @@ def workbook_semantic_column_dimensions_payload(ws: Any) -> list[dict[str, Any]]
 
 
 EXCEL_AUTOFIT_ROW_HEIGHTS: dict[str, dict[int, float]] = {
-    "Methodology": {19: 30.0},
     "Weekly Server Metrics": {1: 19.5, 3: 30.0},
     "Weekly Server Rankings": {1: 19.5, 3: 30.0},
     "Server Week-over-Week Detail": {1: 19.5, 3: 30.0},
@@ -13213,6 +13229,10 @@ def add_management_navigation(ws) -> None:
 def configure_management_print_layout(ws) -> None:
     """Use a readable, sheet-specific printable width."""
 
+    if ws.title in {"How to Use", "Performance Dashboard", "Server Scorecards", "Weekly Performance", "Methodology"}:
+        # The guide and staff views own their explicit layouts and page breaks.
+        return
+
     last_column = max(ws.max_column, MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT)
     last_row = max(ws.max_row, 2)
     if not ws.print_area:
@@ -13226,8 +13246,6 @@ def configure_management_print_layout(ws) -> None:
     ws.page_setup.fitToWidth = MANAGEMENT_PRINT_WIDTHS.get(ws.title, 1)
     if ws.title in {
         "Data Quality",
-        "Server Scorecards",
-        "Weekly Performance",
         "Shared & Area Trends",
     }:
         # Wide analytical tables are more useful when each row stays intact.
@@ -13383,568 +13401,16 @@ def write_performance_consistency_calc_sheet(
     ws.sheet_view.topLeftCell = "A1"
 
 
-def write_server_scorecards_sheet(
-    wb: Workbook, model: dict[str, Any], config: dict[str, Any]
-) -> None:
-    remove_sheet_if_present(wb, "Server Scorecards")
-    ws = wb.create_sheet("Server Scorecards")
-    style_management_title(ws, "Server Performance & Consistency Scorecards", 16)
-    latest = model["latest_complete_week_end"]
-    subtitle = (
-        f"Every resolved named server in up to eight complete weeks through {latest:%m/%d/%Y}, "
-        "including people absent in the latest week"
-        if latest
-        else "No complete shared week is available for performance and consistency review."
-    )
-    ws.merge_cells("A3:P3")
-    ws["A3"] = subtitle
-    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
-    ws["A3"].font = Font(color="5C5C5C", size=11)
-    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
-    ws.merge_cells("A4:P4")
-    ws["A4"] = (
-        "Actual and peer values below use the same qualified weeks and capped guest weights; "
-        "their difference is the reported gap. Wine share is wine sales / gross sales; "
-        "12% versus 10% is +2 percentage points (pp). "
-        "Consistency means how steady those gaps stay from week to week. All observed actuals "
-        "and variability details are below. These describe selling outcomes, not total job performance."
-    )
-    ws["A4"].fill = PatternFill("solid", fgColor="E8F0FA")
-    ws["A4"].font = Font(color="3E6FA8", size=11)
-    ws["A4"].alignment = Alignment(wrap_text=True, vertical="center")
-    ws.row_dimensions[3].height = 28
-    ws.row_dimensions[4].height = 54
-
-    for start_col, end_col, label, fill, font in (
-        (1, 5, "IDENTITY & DATA COVERAGE", "E9E9E9", "641318"),
-        (6, 8, "PERFORMANCE & WEEK-TO-WEEK STEADINESS", "E8F0FA", "3E6FA8"),
-        (9, 14, "QUALIFIED COMPARISON | actual minus same-store peers", "E8F3E8", "1F5B23"),
-        (15, 16, "QUALIFIED SAMPLE", "E9E9E9", "5C5C5C"),
-    ):
-        ws.merge_cells(start_row=5, start_column=start_col, end_row=5, end_column=end_col)
-        cell = ws.cell(row=5, column=start_col, value=label)
-        cell.fill = PatternFill("solid", fgColor=fill)
-        cell.font = Font(color=font, bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    headers = [
-        "Location",
-        "Server",
-        "Last Worked",
-        "Data Coverage",
-        "Coverage Note",
-        "Overall Read",
-        "Performance Level",
-        "Consistency",
-        "Actual $ / Guest",
-        "Peer $ / Guest",
-        "$ / Guest Difference",
-        "Actual Wine Share",
-        "Peer Wine Share",
-        "Wine Difference (pp)",
-        "Qualified Weeks",
-        "Qualified Guests",
-    ]
-    for column, header in enumerate(headers, start=1):
-        cell = ws.cell(row=6, column=column, value=header)
-        cell.fill = PatternFill("solid", fgColor="8B1E23")
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[5].height = 28
-    ws.row_dimensions[6].height = 42
-
-    rows = model["summary_rows"]
-    for row_index, item in enumerate(rows, start=7):
-        values = [
-            excel_safe_text(item["location"]),
-            excel_safe_text(item["display_name"]),
-            performance_last_worked_text(item),
-            item["data_coverage"],
-            item["coverage_note"],
-            item["overall_read"],
-            item["performance_level"],
-            {"High": "High — steady", "Moderate": "Moderate — some variation", "Low": "Low — variable", "Insufficient": "Not enough data"}[item["consistency"]],
-            item["comparison_spg"],
-            item["peer_spg"],
-            item["average_spg_gap"],
-            item["comparison_wine_pct"],
-            item["peer_wine_pct"],
-            item["average_wine_gap"] * 100 if item["average_wine_gap"] is not None else None,
-            item["qualified_weeks"],
-            item["qualified_guests"],
-        ]
-        for column, value in enumerate(values, start=1):
-            cell = ws.cell(row=row_index, column=column, value=value)
-            cell.alignment = Alignment(vertical="center", wrap_text=column <= 8)
-        ws.row_dimensions[row_index].height = 54
-        style_performance_consistency_value(
-            ws.cell(row=row_index, column=6), str(item["overall_read"])
-        )
-        style_performance_consistency_value(
-            ws.cell(row=row_index, column=8), str(item["consistency"])
-        )
-        style_performance_consistency_value(
-            ws.cell(row=row_index, column=4), str(item["data_coverage"])
-        )
-        for column in (11, 14):
-            value = ws.cell(row=row_index, column=column).value
-            if value is not None:
-                ws.cell(row=row_index, column=column).font = Font(
-                    color="1F5B23" if float(value) >= 0 else "8B1E23"
-                )
-        ws.cell(row=row_index, column=3).number_format = "mm/dd/yyyy"
-        ws.cell(row=row_index, column=9).number_format = "$0.00"
-        ws.cell(row=row_index, column=10).number_format = "$0.00"
-        ws.cell(row=row_index, column=11).number_format = "+$0.00;-$0.00;$0.00"
-        ws.cell(row=row_index, column=12).number_format = "0.0%"
-        ws.cell(row=row_index, column=13).number_format = "0.0%"
-        ws.cell(row=row_index, column=14).number_format = '+0.0" pp";-0.0" pp";0.0" pp"'
-        ws.cell(row=row_index, column=15).number_format = "0"
-        ws.cell(row=row_index, column=16).number_format = "#,##0"
-
-    if rows:
-        table = Table(displayName="ServerScorecardsTable", ref=f"A6:P{6 + len(rows)}")
-        table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium2",
-            showFirstColumn=False,
-            showLastColumn=False,
-            showRowStripes=True,
-            showColumnStripes=False,
-        )
-        ws.add_table(table)
-    detail_heading_row = 10 + len(rows)
-    ws.merge_cells(start_row=detail_heading_row, start_column=1, end_row=detail_heading_row, end_column=16)
-    ws.cell(detail_heading_row, 1, "ALL OBSERVED RESULTS & SUPPORTING DETAIL | low-data servers remain visible")
-    ws.cell(detail_heading_row, 1).font = Font(bold=True, color="641318")
-    ws.merge_cells(start_row=detail_heading_row + 1, start_column=1, end_row=detail_heading_row + 1, end_column=16)
-    ws.cell(detail_heading_row + 1, 1,
-        "Observed actuals pool all worked weeks in this window, even when no comparison is qualified. "
-        "SD is the sample standard deviation of weekly peer gaps: lower means steadier. "
-        "Recent movement compares the latest four selected weeks with the prior four.")
-    ws.cell(detail_heading_row + 1, 1).alignment = Alignment(wrap_text=True, vertical="center")
-    ws.row_dimensions[detail_heading_row + 1].height = 42
-    detail_headers = [
-        "Location", "Server", "Observed $ / Guest", "Observed Wine Share", "Worked Weeks",
-        "Observed Guests", "Weekly $ / Guest Gap SD", "Weekly Wine Gap SD (pp)",
-        "Recent $ / Guest Gap Change", "Recent Wine Gap Change (pp)", "Source POS Names", "Latest Week",
-    ]
-    detail_header_row = detail_heading_row + 2
-    for column, header in enumerate(detail_headers, 1):
-        cell = ws.cell(detail_header_row, column, header)
-        cell.fill = PatternFill("solid", fgColor="8B1E23")
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-    ws.row_dimensions[detail_header_row].height = 42
-    for row_index, item in enumerate(rows, detail_header_row + 1):
-        values = [
-            excel_safe_text(item["location"]), excel_safe_text(item["display_name"]),
-            item["observed_spg"], item["observed_wine_pct"], item["observed_weeks"], item["observed_guests"],
-            item["weekly_spg_gap_sd"],
-            item["weekly_wine_gap_sd"] * 100 if item["weekly_wine_gap_sd"] is not None else None,
-            item["recent_spg_delta"],
-            item["recent_wine_delta"] * 100 if item["recent_wine_delta"] is not None else None,
-            excel_safe_text(", ".join(item["source_raw_names"])),
-            "Worked" if item["present_latest_week"] else "Not worked / no active row",
-        ]
-        for column, value in enumerate(values, 1):
-            ws.cell(row_index, column, value).alignment = Alignment(wrap_text=column in {1, 2, 11, 12}, vertical="center")
-        for column in (3, 7):
-            ws.cell(row_index, column).number_format = "$0.00"
-        ws.cell(row_index, 4).number_format = "0.0%"
-        ws.cell(row_index, 6).number_format = "#,##0"
-        ws.cell(row_index, 8).number_format = '0.0" pp"'
-        ws.cell(row_index, 9).number_format = "+$0.00;-$0.00;$0.00"
-        ws.cell(row_index, 10).number_format = '+0.0" pp";-0.0" pp";0.0" pp"'
-        for column, threshold in ((9, PERFORMANCE_CONSISTENCY_RECENT_SPG_THRESHOLD), (10, PERFORMANCE_CONSISTENCY_RECENT_WINE_THRESHOLD * 100)):
-            value = ws.cell(row_index, column).value
-            if value is not None and abs(float(value)) >= threshold:
-                ws.cell(row_index, column).font = Font(color="1F5B23" if value > 0 else "8B1E23", bold=True)
-    if rows:
-        detail_table = Table(displayName="ServerScorecardDetailTable", ref=f"A{detail_header_row}:L{detail_header_row + len(rows)}")
-        detail_table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
-        ws.add_table(detail_table)
-    excluded_rows = model.get("excluded_rows", [])
-    exclusion_heading_row = detail_header_row + len(rows) + 3
-    ws.merge_cells(start_row=exclusion_heading_row, start_column=1, end_row=exclusion_heading_row, end_column=16)
-    ws.cell(exclusion_heading_row, 1, "IDENTITIES OUTSIDE THE PERSON COMPARISON | shared POS activity remains in Shared & Area Trends")
-    ws.cell(exclusion_heading_row, 1).font = Font(bold=True, color="641318")
-    for column, header in enumerate(("Location", "Source POS Name", "Last Seen Week", "Reason"), 1):
-        ws.cell(exclusion_heading_row + 1, column, header).font = Font(bold=True)
-    for row_index, item in enumerate(excluded_rows, exclusion_heading_row + 2):
-        for column, value in enumerate((item["location"], item["raw_user_name"], item["week_end"], item["reason"]), 1):
-            ws.cell(row_index, column, excel_safe_text(value)).alignment = Alignment(wrap_text=True, vertical="center")
-        ws.cell(row_index, 3).number_format = "mm/dd/yyyy"
-        ws.row_dimensions[row_index].height = 54
-    if not excluded_rows:
-        ws.cell(exclusion_heading_row + 2, 1, "None in this reporting window.")
-    widths = {
-        "A": 22,
-        "B": 24,
-        "C": 23,
-        "D": 25,
-        "E": 58,
-        "F": 25,
-        "G": 17,
-        "H": 26,
-        "I": 18,
-        "J": 18,
-        "K": 24,
-        "L": 18,
-        "M": 15,
-        "N": 16,
-        "O": 16,
-        "P": 16,
-    }
-    for column, width in widths.items():
-        ws.column_dimensions[column].width = width
-    ws.freeze_panes = "C7"
-    ws.print_title_cols = "A:B"
-    ws.page_setup.fitToHeight = 0
-    ws.sheet_view.topLeftCell = "A1"
-    ws.sheet_view.zoomScale = 75
+def write_server_scorecards_sheet(wb: Workbook, model: dict[str, Any], config: dict[str, Any]) -> None:
+    write_staff_scorecards(wb, model, config)
 
 
 def write_weekly_performance_sheet(wb: Workbook, model: dict[str, Any]) -> None:
-    remove_sheet_if_present(wb, "Weekly Performance")
-    week_ends = list(model["week_ends"])
-    end_column = 5 + len(week_ends) + 4
-    end_letter = get_column_letter(max(end_column, MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT))
-    ws = wb.create_sheet("Weekly Performance")
-    style_management_title(ws, "Weekly Performance Pattern", end_column)
-    ws.merge_cells(f"A3:{end_letter}3")
-    ws["A3"] = (
-        "Read every server's weeks left to right. Gray means the weekly person sample or "
-        "same-store peer gate was not met; a dash means no row exists. Color bands summarize "
-        "performance. Consistency separately measures how steady the underlying peer gaps are."
-    )
-    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
-    ws["A3"].font = Font(color="5C5C5C", size=11)
-    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
-    for column, label in enumerate(
-        ("Strong", "Near Peer", "Mixed", "Below", "Not Qualified"), start=1
-    ):
-        cell = ws.cell(row=4, column=column, value=label)
-        style_performance_consistency_value(cell, label)
-    if max(end_column, MANAGEMENT_MENU_VISIBLE_COLUMN_COUNT) >= 6:
-        ws.merge_cells(start_row=4, start_column=6, end_row=4, end_column=max(end_column, 12))
-        ws.cell(row=4, column=6, value="Read dated weeks left to right: oldest to newest")
-        ws.cell(row=4, column=6).fill = PatternFill("solid", fgColor="F5F5F5")
-        ws.cell(row=4, column=6).font = Font(color="5C5C5C")
-        ws.cell(row=4, column=6).alignment = Alignment(vertical="center")
-    headers = [
-        "Location",
-        "Server",
-        "Overall Read",
-        "Consistency",
-        "Data Coverage",
-        *[week_end.strftime("%m/%d/%Y") for week_end in week_ends],
-        "Qualified Weeks",
-        "Guests",
-        "Last Worked",
-        "Coverage Note",
-    ]
-    for column, header in enumerate(headers, start=1):
-        cell = ws.cell(row=6, column=column, value=header)
-        cell.fill = PatternFill("solid", fgColor="8B1E23")
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[3].height = 34
-    ws.row_dimensions[4].height = 26
-    ws.row_dimensions[6].height = 38
-    rows = model["summary_rows"]
-    for row_index, item in enumerate(rows, start=7):
-        values = [
-            excel_safe_text(item["location"]),
-            excel_safe_text(item["display_name"]),
-            item["overall_read"],
-            item["consistency"],
-            item["data_coverage"],
-            *[item["weekly_bands"].get(week_end, "—") for week_end in week_ends],
-            item["qualified_weeks"],
-            item["qualified_guests"],
-            performance_last_worked_text(item),
-            item["coverage_note"],
-        ]
-        for column, value in enumerate(values, start=1):
-            cell = ws.cell(row=row_index, column=column, value=value)
-            cell.alignment = Alignment(
-                horizontal="center" if column >= 3 else None,
-                vertical="center",
-                wrap_text=column <= 5 or column > end_column - 2,
-            )
-        for column in range(6, 6 + len(week_ends)):
-            style_performance_consistency_value(
-                ws.cell(row=row_index, column=column),
-                str(ws.cell(row=row_index, column=column).value),
-            )
-        ws.cell(row=row_index, column=end_column - 2).number_format = "#,##0"
-        ws.cell(row=row_index, column=end_column - 1).number_format = "mm/dd/yyyy"
-        ws.row_dimensions[row_index].height = 54
-    if rows:
-        table = Table(
-            displayName="WeeklyPerformanceTable",
-            ref=f"A6:{get_column_letter(end_column)}{6 + len(rows)}",
-        )
-        table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium2",
-            showFirstColumn=False,
-            showLastColumn=False,
-            showRowStripes=True,
-            showColumnStripes=False,
-        )
-        ws.add_table(table)
-    widths = {"A": 22, "B": 24, "C": 25, "D": 16, "E": 14}
-    for column, width in widths.items():
-        ws.column_dimensions[column].width = width
-    for column in range(6, 6 + len(week_ends)):
-        ws.column_dimensions[get_column_letter(column)].width = 14
-    ws.column_dimensions[get_column_letter(end_column - 3)].width = 16
-    ws.column_dimensions[get_column_letter(end_column - 2)].width = 12
-    ws.column_dimensions[get_column_letter(end_column - 1)].width = 23
-    ws.column_dimensions[get_column_letter(end_column)].width = 58
-    ws.freeze_panes = "F7"
-    ws.print_title_cols = "A:B"
-    ws.page_setup.fitToHeight = 0
-    ws.sheet_view.topLeftCell = "A1"
-    ws.sheet_view.zoomScale = 75
+    write_staff_weekly(wb, model)
 
 
-def write_performance_methodology_sheet(
-    wb: Workbook, model: dict[str, Any], config: dict[str, Any]
-) -> None:
-    remove_sheet_if_present(wb, "Methodology")
-    ws = wb.create_sheet("Methodology")
-    style_management_title(ws, "How Performance & Consistency Are Measured", 12)
-    latest = model["latest_complete_week_end"]
-    ws.merge_cells("A3:L3")
-    ws["A3"] = (
-        f"Methodology {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION} | up to eight complete "
-        f"weeks through {latest:%m/%d/%Y}: same-store peer comparison and week-to-week variation."
-        if latest
-        else f"Methodology {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION} | no complete shared week is available."
-    )
-    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
-    ws["A3"].font = Font(color="5C5C5C", size=11)
-    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
-
-    for column, label in enumerate(("Overall Read", "Meaning", "Management Use"), start=1):
-        cell = ws.cell(row=5, column=column, value=label)
-        cell.fill = PatternFill("solid", fgColor="8B1E23")
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.merge_cells("E5:H5")
-    ws["E5"] = "MODEL NOTES"
-    ws["E5"].fill = PatternFill("solid", fgColor="8B1E23")
-    ws["E5"].font = Font(color="FFFFFF", bold=True)
-    ws["E5"].alignment = Alignment(horizontal="center", vertical="center")
-    interpretation_rows = (
-        ("Consistently Strong", "Above the performance band with low volatility", "Recognize and identify repeatable practices"),
-        ("Consistent / Near Peer", "Near peer norms with low volatility", "Reliable pattern; monitor normal movement"),
-        ("Strong / Variable", "Strong average result with uneven weeks", "Diagnose what changes by shift or assignment"),
-        ("Mixed / Monitor", "Near peer norms with moderate volatility", "Watch for a clearer pattern"),
-        ("Inconsistent", "Low week-to-week consistency", "Review context before coaching the process"),
-        ("Below / Variable or Consistently Below", "Below the peer band; variability is shown separately", "Validate context before any action"),
-        ("Insufficient Data", "Too few qualified weeks or guests", "Do not draw a conclusion"),
-    )
-    for row_index, values in enumerate(interpretation_rows, start=6):
-        for column, value in enumerate(values, start=1):
-            cell = ws.cell(row=row_index, column=column, value=value)
-            cell.alignment = Alignment(wrap_text=True, vertical="center")
-        ws.cell(row=row_index, column=1).font = Font(bold=True, color="641318")
-        # The Meaning column wraps to three lines for several classifications.
-        # Keep enough vertical room in both Excel and the two-page print layout.
-        ws.row_dimensions[row_index].height = 50
-    ws.merge_cells("E6:H12")
-    ws["E6"] = (
-        "• SPG means Gross Sales divided by Guest Count. Wine share means Wine Sales divided by Gross Sales. These are "
-        "the only person-level outcome metrics in this descriptive layer.\n"
-        "• Every resolved named server in the latest eight complete shared weeks is shown, "
-        "even if absent from the latest week. Historical peers are the other eligible people "
-        "who worked in that store and week.\n"
-        "• Data coverage describes the sample available; it is not statistical confidence. "
-        "Consistency describes how steady weekly peer gaps are.\n"
-        "• Gross sales, Rate of Sale, Ticket Time, and existing Management Center Current Actions signals do not change "
-        "these labels.\n"
-        "• Schedule, section, party mix, events, tenure, and staffing can explain outcomes. Use this "
-        "as a review aid, never as a standalone employment decision."
-    )
-    ws["E6"].fill = PatternFill("solid", fgColor="E8F0FA")
-    ws["E6"].font = Font(color="262626")
-    ws["E6"].alignment = Alignment(wrap_text=True, vertical="top")
-
-    ws.merge_cells("A14:L14")
-    ws["A14"] = "CALCULATION FLOW"
-    ws["A14"].fill = PatternFill("solid", fgColor="E9E9E9")
-    ws["A14"].font = Font(color="641318", bold=True)
-    flow_rows = (
-        ("1", "Qualify the week", "Minimum guests and active days", "4", "Measure consistency", "Sample SD of weekly peer gaps"),
-        ("2", "Build the peer reference", "Median of other eligible servers in that store/week", "5", "Describe data coverage", "Qualified weeks and guests"),
-        ("3", "Measure performance", "Capped guest-weighted average peer gaps", "6", "Combine the two axes", "Overall Read shown on the dashboard"),
-    )
-    for row_index, values in enumerate(flow_rows, start=15):
-        positions = (1, 2, 3, 5, 6, 7)
-        for column, value in zip(positions, values, strict=True):
-            ws.cell(row=row_index, column=column, value=value)
-            ws.cell(row=row_index, column=column).alignment = Alignment(
-                wrap_text=True, vertical="center"
-            )
-        ws.merge_cells(start_row=row_index, start_column=7, end_row=row_index, end_column=8)
-        for column in (1, 5):
-            ws.cell(row=row_index, column=column).fill = PatternFill(
-                "solid", fgColor="F8E8E9"
-            )
-            ws.cell(row=row_index, column=column).font = Font(
-                color="641318", bold=True
-            )
-            ws.cell(row=row_index, column=column).alignment = Alignment(
-                horizontal="center", vertical="center"
-            )
-        ws.row_dimensions[row_index].height = 34
-
-    ws["A19"] = "Current source"
-    ws["B19"] = "Weekly Server Metrics"
-    ws["C19"] = f"{model['complete_week_count']} complete shared weeks; latest eight used"
-    ws["E19"] = "Model version"
-    ws["F19"] = PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION
-    ws.merge_cells("F19:H19")
-    for column in (1, 5):
-        ws.cell(row=19, column=column).font = Font(bold=True, color="641318")
-    for column in range(1, 9):
-        ws.cell(row=19, column=column).alignment = Alignment(wrap_text=True, vertical="center")
-
-    for column, label in enumerate(("Setting", "Value", "Decision Rule / Purpose"), start=1):
-        cell = ws.cell(row=21, column=column, value=label)
-        cell.fill = PatternFill("solid", fgColor="8B1E23")
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.merge_cells("E21:H21")
-    ws["E21"] = "WHY THE SAME THRESHOLD APPEARS TWICE"
-    ws["E21"].fill = PatternFill("solid", fgColor="8B1E23")
-    ws["E21"].font = Font(color="FFFFFF", bold=True)
-    ws["E21"].alignment = Alignment(horizontal="center", vertical="center")
-
-    spg_threshold = management_threshold(config, "check_average")
-    wine_threshold = management_threshold(config, "wine_pct")
-    min_peers = int(
-        config.get("management_peer_reference", {}).get(
-            "min_distinct_peers_per_week",
-            DEFAULT_CONFIG["management_peer_reference"]["min_distinct_peers_per_week"],
-        )
-    )
-    settings = (
-        ("Latest complete week", latest, "Source-driven end date"),
-        ("Analysis window (weeks)", PERFORMANCE_CONSISTENCY_WINDOW_WEEKS, "Rolling complete-week view"),
-        ("Minimum guests in a week", int(config.get("dashboard_min_guest_count_for_trends", 25)), "Base sample gate"),
-        ("Minimum active days in a week", int(config.get("dashboard_min_active_days_for_trends", 3)), "Base sample gate"),
-        ("Minimum qualified peers", min_peers, "Same store/week, excluding the server"),
-        ("Weekly guest-weight cap", PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP, "Prevents one large week from dominating"),
-        ("High data coverage: qualified weeks", PERFORMANCE_CONSISTENCY_HIGH_MIN_WEEKS, "Full data-coverage gate"),
-        ("High data coverage: qualified guests", PERFORMANCE_CONSISTENCY_HIGH_MIN_GUESTS, "Full data-coverage gate"),
-        ("Provisional: qualified weeks", PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_WEEKS, "Provisional gate"),
-        ("Provisional: qualified guests", PERFORMANCE_CONSISTENCY_PROVISIONAL_MIN_GUESTS, "Provisional gate"),
-        ("High consistency maximum: weekly SPG gap SD", float(spg_threshold["neutral"]), "Lower is steadier; both SD gates must pass"),
-        ("High consistency maximum: weekly Wine gap SD", float(wine_threshold["neutral"]), "Lower is steadier; both SD gates must pass"),
-        ("Moderate consistency maximum: weekly SPG gap SD", float(spg_threshold["strong"]), "Applies only after the High gate is missed"),
-        ("Moderate consistency maximum: weekly Wine gap SD", float(wine_threshold["strong"]), "Applies only after the High gate is missed"),
-        ("Performance boundary (+/-): average SPG gap", float(spg_threshold["neutral"]), "Positive can support Strong; negative can support Below"),
-        ("Performance boundary (+/-): average Wine gap", float(wine_threshold["neutral"]), "Positive can support Strong; negative can support Below"),
-        ("Recent movement display threshold: SPG", PERFORMANCE_CONSISTENCY_RECENT_SPG_THRESHOLD, "Highlights material recent-four minus prior-four movement"),
-        ("Recent movement display threshold: Wine", PERFORMANCE_CONSISTENCY_RECENT_WINE_THRESHOLD, "Highlights material recent-four minus prior-four movement"),
-    )
-    for row_index, values in enumerate(settings, start=22):
-        for column, value in enumerate(values, start=1):
-            cell = ws.cell(row=row_index, column=column, value=value)
-            cell.alignment = Alignment(wrap_text=True, vertical="center")
-        ws.row_dimensions[row_index].height = 30
-    ws["B22"].number_format = "mm/dd/yyyy"
-    for row_index in (32, 34, 36, 38):
-        ws.cell(row=row_index, column=2).number_format = "$0.00"
-    for row_index in (33, 35, 37, 39):
-        ws.cell(row=row_index, column=2).number_format = "0.0%"
-
-    example = next(
-        (
-            row
-            for row in model["summary_rows"]
-            if row["average_spg_gap"] is not None
-            and row["weekly_spg_gap_sd"] is not None
-        ),
-        None,
-    )
-    ws.merge_cells("E22:F22")
-    ws.merge_cells("G22:H22")
-    for coordinate, label, fill, font in (
-        ("E22", "PERFORMANCE", "2E7D32", "FFFFFF"),
-        ("G22", "CONSISTENCY", "3E6FA8", "FFFFFF"),
-    ):
-        ws[coordinate] = label
-        ws[coordinate].fill = PatternFill("solid", fgColor=fill)
-        ws[coordinate].font = Font(color=font, bold=True)
-        ws[coordinate].alignment = Alignment(horizontal="center", vertical="center")
-    ws.merge_cells("E23:F25")
-    ws.merge_cells("G23:H25")
-    if example:
-        ws["E23"] = (
-            "Average SPG gap vs peer\nHigher positive = stronger\n\n"
-            f"{excel_safe_text(example['display_name'])}: {example['average_spg_gap']:+.2f} vs "
-            f"+{float(spg_threshold['neutral']):.2f} minimum\nResult: {example['performance_level']}"
-        )
-        ws["G23"] = (
-            "Weekly SPG gap sample SD\nLower = steadier\n\n"
-            f"{excel_safe_text(example['display_name'])}: {example['weekly_spg_gap_sd']:.2f} vs "
-            f"{float(spg_threshold['neutral']):.2f} maximum\nResult: {example['consistency']} consistency"
-        )
-    else:
-        ws["E23"] = "Average peer gap measures performance; higher positive is stronger."
-        ws["G23"] = "Sample SD of weekly peer gaps measures consistency; lower is steadier."
-    for coordinate, fill, font in (
-        ("E23", "E8F3E8", "1F5B23"),
-        ("G23", "E8F0FA", "3E6FA8"),
-    ):
-        ws[coordinate].fill = PatternFill("solid", fgColor=fill)
-        ws[coordinate].font = Font(color=font)
-        ws[coordinate].alignment = Alignment(
-            horizontal="center", vertical="center", wrap_text=True
-        )
-    ws.merge_cells("E26:H31")
-    ws["E26"] = (
-        "Same number, opposite decision rule.\n\n"
-        "Performance: a capped guest-weighted average peer gap must meet a positive or "
-        "negative boundary, with the other metric on the same side of zero.\n\n"
-        "Consistency: BOTH weekly-gap sample SDs must be at or below their maximums.\n\n"
-        "Never compare an average peer gap directly with an SD result."
-    )
-    ws["E26"].fill = PatternFill("solid", fgColor="FFF4CC")
-    ws["E26"].alignment = Alignment(wrap_text=True, vertical="center")
-
-    ws.merge_cells("A41:L41")
-    ws["A41"] = (
-        "Protected generated view: values are recomputed from verified weekly source data on "
-        "each successful run. Technical audit sheets remain veryHidden and protected. The "
-        "existing Management Center Current Actions readiness, evidence, persistence, and human-review gates remain separate."
-    )
-    ws["A41"].fill = PatternFill("solid", fgColor="F5F5F5")
-    ws["A41"].font = Font(color="5C5C5C")
-    ws["A41"].alignment = Alignment(wrap_text=True, vertical="center")
-    ws.row_dimensions[41].height = 42
-    widths = {
-        "A": 38,
-        "B": 18,
-        "C": 42,
-        "D": 3,
-        "E": 19,
-        "F": 26,
-        "G": 37,
-        "H": 3,
-    }
-    for column, width in widths.items():
-        ws.column_dimensions[column].width = width
-    for column in ("I", "J", "K", "L"):
-        ws.column_dimensions[column].width = 3
-    ws.freeze_panes = "A5"
-    ws.sheet_view.topLeftCell = "A1"
-    ws.sheet_view.zoomScale = 80
-    ws.print_area = "A1:L41"
+def write_performance_methodology_sheet(wb: Workbook, model: dict[str, Any], config: dict[str, Any]) -> None:
+    write_staff_methodology(wb, model, config)
 
 
 def write_shared_area_trends_sheet(
@@ -14174,379 +13640,8 @@ def configure_generated_chart_excel_defaults(
             series.invertIfNegative = False
 
 
-def write_performance_dashboard_sheet(
-    wb: Workbook,
-    model: dict[str, Any],
-    config: dict[str, Any],
-    readiness: LatestWeekReadiness,
-) -> None:
-    remove_sheet_if_present(wb, "Performance Dashboard")
-    ws = wb.create_sheet("Performance Dashboard")
-    style_management_title(ws, "Red Onion Performance Dashboard", 15)
-    latest = model["latest_complete_week_end"]
-    rows = model["summary_rows"]
-    ws.merge_cells("A3:O3")
-    ws["A3"] = (
-        f"Generated eight-week snapshot through {latest:%m/%d/%Y} | {len(rows)} named "
-        "servers seen in the window | peers from each historical store/week"
-        if latest
-        else "No complete shared week is available for the performance snapshot."
-    )
-    ws["A3"].fill = PatternFill("solid", fgColor="F5F5F5")
-    ws["A3"].font = Font(color="5C5C5C", size=11)
-    ws["A3"].alignment = Alignment(wrap_text=True, vertical="center")
-    evaluated = [row for row in rows if row["data_coverage"] != "Insufficient"]
-    high_count = sum(row["consistency"] == "High" for row in evaluated)
-    moderate_count = sum(row["consistency"] == "Moderate" for row in evaluated)
-    low_count = sum(row["consistency"] == "Low" for row in evaluated)
-    insufficient_count = len(rows) - len(evaluated)
-    summary_parts = [
-        f"{high_count} of {len(evaluated)} evaluated servers show high consistency"
-        if evaluated
-        else "No servers meet the evaluated-data gate"
-    ]
-    if moderate_count:
-        summary_parts.append(f"{moderate_count} show moderate consistency")
-    if low_count:
-        summary_parts.append(f"{low_count} show low consistency")
-    summary_parts.append(f"{insufficient_count} need more qualified data")
-    ws.merge_cells("A4:O4")
-    ws["A4"] = "; ".join(summary_parts) + "."
-    ws["A4"].fill = PatternFill("solid", fgColor="E8F0FA")
-    ws["A4"].font = Font(color="3E6FA8", bold=True, size=12)
-    ws["A4"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[3].height = 26
-    ws.row_dimensions[4].height = 30
-
-    overall = model.get("overall_store")
-    ws.merge_cells("A6:O6")
-    ws["A6"] = (
-        f"OVERALL STORE PERFORMANCE | latest complete week {latest:%m/%d/%Y}"
-        if latest
-        else "OVERALL STORE PERFORMANCE"
-    )
-    ws["A6"].fill = PatternFill("solid", fgColor="641318")
-    ws["A6"].font = Font(color="FFFFFF", bold=True, size=12)
-    ws["A6"].alignment = Alignment(horizontal="center", vertical="center")
-
-    def overall_delta_text(value: float | None, kind: str, baseline_weeks: int) -> str:
-        if value is None or baseline_weeks == 0:
-            return "No prior complete-week baseline"
-        if kind == "pct":
-            change = f"{value:+.1%}"
-        elif kind == "currency":
-            change = f"{'+' if value >= 0 else '-'}${abs(value):.2f}"
-        else:
-            change = f"{value * 100:+.1f} pts"
-        return f"{change} vs prior {baseline_weeks}-week baseline"
-
-    baseline_week_count = int(overall.get("baseline_week_count", 0)) if overall else 0
-    overall_cards = (
-        (
-            "Gross Sales",
-            overall.get("gross_sales") if overall else None,
-            "$#,##0",
-            overall_delta_text(
-                overall.get("gross_sales_change_pct") if overall else None,
-                "pct",
-                baseline_week_count,
-            ),
-            overall.get("gross_sales_change_pct") if overall else None,
-        ),
-        (
-            "Guests",
-            overall.get("guest_count") if overall else None,
-            "#,##0",
-            overall_delta_text(
-                overall.get("guest_count_change_pct") if overall else None,
-                "pct",
-                baseline_week_count,
-            ),
-            overall.get("guest_count_change_pct") if overall else None,
-        ),
-        (
-            "Sales per Guest",
-            overall.get("check_average") if overall else None,
-            "$#,##0.00",
-            overall_delta_text(
-                overall.get("check_average_change") if overall else None,
-                "currency",
-                baseline_week_count,
-            ),
-            overall.get("check_average_change") if overall else None,
-        ),
-        (
-            "Wine Mix",
-            overall.get("wine_pct") if overall else None,
-            "0.0%",
-            overall_delta_text(
-                overall.get("wine_pct_change") if overall else None,
-                "points",
-                baseline_week_count,
-            ),
-            overall.get("wine_pct_change") if overall else None,
-        ),
-        (
-            "Complete Stores",
-            f"{int(overall.get('complete_location_count', 0))} of {len(config.get('locations', {}))}"
-            if overall
-            else "—",
-            "General",
-            "Source location totals; not server-row sums",
-            None,
-        ),
-    )
-    for start_column, (label, value, number_format, note, delta) in zip(
-        (1, 4, 7, 10, 13), overall_cards, strict=True
-    ):
-        end_column = start_column + 2
-        ws.merge_cells(
-            start_row=7,
-            start_column=start_column,
-            end_row=7,
-            end_column=end_column,
-        )
-        ws.merge_cells(
-            start_row=8,
-            start_column=start_column,
-            end_row=9,
-            end_column=end_column,
-        )
-        ws.merge_cells(
-            start_row=10,
-            start_column=start_column,
-            end_row=10,
-            end_column=end_column,
-        )
-        header = ws.cell(row=7, column=start_column, value=label)
-        header.fill = PatternFill("solid", fgColor="3E6FA8")
-        header.font = Font(color="FFFFFF", bold=True)
-        header.alignment = Alignment(horizontal="center", vertical="center")
-        value_cell = ws.cell(row=8, column=start_column, value=value)
-        value_cell.fill = PatternFill("solid", fgColor="E8F0FA")
-        value_cell.font = Font(color="1F4E78", bold=True, size=21)
-        value_cell.alignment = Alignment(horizontal="center", vertical="center")
-        value_cell.number_format = number_format
-        note_cell = ws.cell(row=10, column=start_column, value=note)
-        note_cell.fill = PatternFill("solid", fgColor="E8F0FA")
-        note_cell.font = Font(
-            color=("1F5B23" if float(delta) >= 0 else "8B1E23")
-            if delta is not None
-            else "5C5C5C",
-            bold=delta is not None,
-            size=9,
-        )
-        note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[6].height = 24
-    ws.row_dimensions[7].height = 22
-    ws.row_dimensions[8].height = 28
-    ws.row_dimensions[9].height = 28
-    ws.row_dimensions[10].height = 34
-
-    card_data = (
-        ("Consistently Strong", "Strong results + low volatility", "2E7D32", "E8F3E8"),
-        ("Consistent / Near Peer", "Near peer norms + low volatility", "2F6F6D", "E3F0EF"),
-        ("Variable / Inconsistent", "Results change materially week to week", "B77900", "FFF4CC"),
-        ("Below / Review", "Below peer band after sample gates", "8B1E23", "F8E8E9"),
-        ("Insufficient Data", "No conclusion until volume improves", "5C5C5C", "E9E9E9"),
-    )
-    counts = model["category_counts"]
-    for start_column, (label, note, accent, body) in zip(
-        (1, 4, 7, 10, 13), card_data, strict=True
-    ):
-        end_column = start_column + 2
-        ws.merge_cells(start_row=12, start_column=start_column, end_row=12, end_column=end_column)
-        ws.merge_cells(start_row=13, start_column=start_column, end_row=14, end_column=end_column)
-        ws.merge_cells(start_row=15, start_column=start_column, end_row=15, end_column=end_column)
-        header = ws.cell(row=12, column=start_column, value=label)
-        header.fill = PatternFill("solid", fgColor=accent)
-        header.font = Font(color="FFFFFF", bold=True)
-        header.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        value = ws.cell(row=13, column=start_column, value=counts[label])
-        value.fill = PatternFill("solid", fgColor=body)
-        value.font = Font(color=accent, bold=True, size=24)
-        value.alignment = Alignment(horizontal="center", vertical="center")
-        note_cell = ws.cell(row=15, column=start_column, value=note)
-        note_cell.fill = PatternFill("solid", fgColor=body)
-        note_cell.font = Font(color=accent, size=9)
-        note_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[12].height = 24
-    ws.row_dimensions[13].height = 28
-    ws.row_dimensions[14].height = 28
-    ws.row_dimensions[15].height = 34
-
-    consistent_rows = [
-        row
-        for row in rows
-        if row["overall_read"] in {"Consistently Strong", "Consistent / Near Peer"}
-    ]
-    review_rows = [
-        row
-        for row in rows
-        if row["overall_read"]
-        in {
-            "Strong / Variable",
-            "Mixed / Monitor",
-            "Inconsistent",
-            "Consistently Below",
-            "Below / Variable",
-        }
-    ]
-    limited_rows = [row for row in rows if row["data_coverage"] == "Insufficient"]
-    list_row_count = max(6, len(consistent_rows), len(review_rows))
-    ws.merge_cells("A17:G17")
-    ws["A17"] = f"CONSISTENT PERFORMANCE | all {len(consistent_rows)} qualifying servers"
-    ws["A17"].fill = PatternFill("solid", fgColor="E8F3E8")
-    ws["A17"].font = Font(color="1F5B23", bold=True)
-    ws.merge_cells("I17:O17")
-    ws["I17"] = f"VARIABILITY / REVIEW | all {len(review_rows)} servers; check context"
-    ws["I17"].fill = PatternFill("solid", fgColor="FFF4CC")
-    ws["I17"].font = Font(color="B77900", bold=True)
-    list_headers = [
-        "Server",
-        "Location",
-        "Overall Read",
-        "Data Coverage",
-        "$ / Guest Gap",
-        "Wine Gap (pp)",
-        "Weeks",
-    ]
-    for start_column in (1, 9):
-        for offset, header in enumerate(list_headers):
-            cell = ws.cell(row=18, column=start_column + offset, value=header)
-            cell.fill = PatternFill("solid", fgColor="8B1E23")
-            cell.font = Font(color="FFFFFF", bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    def write_dashboard_list(start_column: int, selected: list[dict[str, Any]]) -> None:
-        for offset in range(list_row_count):
-            row_index = 19 + offset
-            if offset < len(selected):
-                item = selected[offset]
-                values = (
-                    excel_safe_text(item["display_name"]),
-                    excel_safe_text(item["location"]),
-                    item["overall_read"],
-                    item["data_coverage"],
-                    item["average_spg_gap"],
-                    item["average_wine_gap"] * 100 if item["average_wine_gap"] is not None else None,
-                    item["qualified_weeks"],
-                )
-            else:
-                values = ("—", "No additional", None, None, None, None, None)
-            for column_offset, value in enumerate(values):
-                cell = ws.cell(
-                    row=row_index, column=start_column + column_offset, value=value
-                )
-                cell.alignment = Alignment(vertical="center", wrap_text=column_offset < 4)
-            ws.cell(row=row_index, column=start_column + 4).number_format = "+$0.00;-$0.00;$0.00"
-            ws.cell(row=row_index, column=start_column + 5).number_format = '+0.0" pp";-0.0" pp";0.0" pp"'
-            ws.row_dimensions[row_index].height = 36
-
-    write_dashboard_list(1, consistent_rows)
-    write_dashboard_list(9, review_rows)
-
-    limited_heading_row = 21 + list_row_count
-    ws.merge_cells(start_row=limited_heading_row, start_column=1, end_row=limited_heading_row, end_column=15)
-    ws.cell(limited_heading_row, 1, f"NEEDS MORE DATA | all {len(limited_rows)} servers remain visible")
-    ws.cell(limited_heading_row, 1).fill = PatternFill("solid", fgColor="E9E9E9")
-    ws.cell(limited_heading_row, 1).font = Font(bold=True, color="5C5C5C")
-    limited_header_row = limited_heading_row + 1
-    for column, header in ((1, "Server"), (2, "Location"), (3, "Last Worked"), (4, "Qualified Weeks"), (5, "Reason")):
-        ws.cell(limited_header_row, column, header).font = Font(bold=True, color="641318")
-        ws.cell(limited_header_row, column).alignment = Alignment(wrap_text=True)
-    ws.merge_cells(start_row=limited_header_row, start_column=5, end_row=limited_header_row, end_column=15)
-    for row_index, item in enumerate(limited_rows, limited_heading_row + 2):
-        for column, value in enumerate((excel_safe_text(item["display_name"]), excel_safe_text(item["location"]), performance_last_worked_text(item), item["qualified_weeks"]), 1):
-            ws.cell(row_index, column, value).alignment = Alignment(wrap_text=True, vertical="center")
-        ws.cell(row_index, 3).number_format = "mm/dd/yyyy"
-        ws.merge_cells(start_row=row_index, start_column=5, end_row=row_index, end_column=15)
-        ws.cell(row_index, 5, item["coverage_note"]).alignment = Alignment(wrap_text=True, vertical="center")
-        ws.row_dimensions[row_index].height = 42
-    if not limited_rows:
-        ws.cell(limited_heading_row + 2, 1, "None in this window.")
-    chart_start_row = limited_heading_row + max(1, len(limited_rows)) + 4
-    calc_ws = wb["_Consistency Calc"]
-    if model["store_consistency"]:
-        chart = BarChart()
-        chart.type = "bar"
-        chart.grouping = "stacked"
-        chart.overlap = 100
-        chart.style = 10
-        chart.title = "Consistency by Store"
-        chart.height = 7.0
-        chart.width = 13.0
-        max_row = 1 + len(model["store_consistency"])
-        data = Reference(calc_ws, min_col=24, max_col=27, min_row=1, max_row=max_row)
-        cats = Reference(calc_ws, min_col=23, min_row=2, max_row=max_row)
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
-        category_formula = f"'_Consistency Calc'!$W$2:$W${max_row}"
-        for series in chart.series:
-            series.cat = AxDataSource(strRef=StrRef(f=category_formula))
-        for series, color in zip(
-            chart.series, ("2E7D32", "B77900", "8B1E23", "7F7F7F"), strict=True
-        ):
-            series.graphicalProperties.solidFill = color
-            series.graphicalProperties.line.solidFill = color
-        chart.legend.position = "b"
-        configure_generated_chart_excel_defaults(
-            chart,
-            x_axis_position="l",
-            y_axis_position="b",
-            line_series=False,
-        )
-        ws.add_chart(chart, f"A{chart_start_row}")
-
-    guide_heading = f"I{chart_start_row}"
-    guide_body = f"I{chart_start_row + 1}"
-    ws.merge_cells(f"{guide_heading}:O{chart_start_row}")
-    ws[guide_heading] = "READ THE WORKBOOK IN THIS ORDER"
-    ws[guide_heading].fill = PatternFill("solid", fgColor="8B1E23")
-    ws[guide_heading].font = Font(color="FFFFFF", bold=True)
-    ws.merge_cells(f"{guide_body}:O{chart_start_row + 14}")
-    ws[guide_body] = (
-        "1. Data coverage: Is there enough qualified data? This is not statistical confidence.\n\n"
-        "2. Server Scorecards: Actual and peer $ / guest and wine share use matching weeks and weights. Wine gaps are percentage points.\n\n"
-        "3. Consistency: How steady are the results relative to peers from week to week? The SD detail is below the scorecards.\n\n"
-        "4. Weekly Performance: Inspect the dated pattern, then verify shift and assignment context.\n\n"
-        "5. Management Center Current Actions: Treat its readiness, evidence, persistence, and human-review gates as separate.\n\n"
-        "Important: this measures selling outcomes, not total job performance."
-    )
-    ws[guide_body].fill = PatternFill("solid", fgColor="E8F0FA")
-    ws[guide_body].alignment = Alignment(wrap_text=True, vertical="top")
-    quality_row = chart_start_row + 17
-    quality_cell = f"A{quality_row}"
-    ws.merge_cells(f"{quality_cell}:O{quality_row}")
-    latest_status = (
-        f"latest source week complete ({len(readiness.received_dates)} of {len(readiness.expected_dates)} daily reports)"
-        if readiness.ready
-        else f"latest source week preliminary ({readiness.missing_text or 'coverage incomplete'})"
-    )
-    ws[quality_cell] = (
-        f"Data quality: {latest_status}. This view uses only complete shared weeks through "
-        f"{latest:%m/%d/%Y}. See Management Center readiness before review; detailed source "
-        "reconciliation remains in the protected Data Quality audit layer."
-        if latest
-        else f"Data quality: {latest_status}. See Management Center readiness before review."
-    )
-    ws[quality_cell].fill = PatternFill("solid", fgColor="F5F5F5")
-    ws[quality_cell].font = Font(color="5C5C5C")
-    ws[quality_cell].alignment = Alignment(wrap_text=True, vertical="center")
-    ws.row_dimensions[quality_row].height = 42
-    for column in range(1, 16):
-        ws.column_dimensions[get_column_letter(column)].width = 14
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 22
-    ws.column_dimensions["C"].width = 22
-    ws.column_dimensions["I"].width = 22
-    ws.column_dimensions["J"].width = 22
-    ws.column_dimensions["K"].width = 22
-    ws.freeze_panes = "A18"
-    ws.sheet_view.topLeftCell = "A1"
-    ws.sheet_view.zoomScale = 80
-    ws.print_area = f"A1:O{quality_row}"
-    ws.page_setup.fitToHeight = 0
+def write_performance_dashboard_sheet(wb: Workbook, model: dict[str, Any], config: dict[str, Any], readiness: LatestWeekReadiness) -> None:
+    write_staff_dashboard(wb, model, config, readiness)
 
 
 def write_performance_consistency_sheets(
@@ -14556,10 +13651,41 @@ def write_performance_consistency_sheets(
     readiness: LatestWeekReadiness,
 ) -> None:
     write_performance_consistency_calc_sheet(wb, model)
+    write_staff_feedback_calc_sheet(wb, model["staff_feedback"])
     write_server_scorecards_sheet(wb, model, config)
     write_weekly_performance_sheet(wb, model)
     write_performance_methodology_sheet(wb, model, config)
     write_performance_dashboard_sheet(wb, model, config, readiness)
+
+
+def write_staff_feedback_calc_sheet(wb: Workbook, feedback: dict[str, Any]) -> None:
+    """Keep every displayed comparison traceable without adding operator clutter."""
+    remove_sheet_if_present(wb, "_Staff Feedback Calc")
+    ws = wb.create_sheet("_Staff Feedback Calc")
+    fields = [
+        ("week_end", "Week End"), ("location", "Location"),
+        ("raw_user_name", "Resolved Identity"), ("display_name", "Server"),
+        ("source_raw_names", "Source Identities"), ("gross_sales", "Gross Sales"),
+        ("guest_count", "Guests"), ("wine_sales", "Wine Sales"),
+        ("active_days", "Active Days"), ("check_average", "Spend per Guest"),
+        ("wine_pct", "Wine Share"), ("feedback_peer_eligible", "Peer Eligible"),
+        ("distinct_peer_count", "Other Spend Peers"), ("wine_peer_count", "Other Wine Peers"),
+        ("peer_spg", "Peer Spend per Guest"), ("peer_wine_pct", "Peer Wine Share"),
+        ("spg_gap", "Spend Difference"), ("wine_gap", "Wine Share Difference"),
+        ("guest_weight", "Guest Weight"), ("compared", "Compared"),
+        ("comparison_note", "Comparison Note"),
+    ]
+    ws.append([f"Staff feedback methodology {feedback['methodology_version']}"])
+    ws.append([label for _, label in fields])
+    for row in feedback["detail_rows"]:
+        values = []
+        for field, _ in fields:
+            value = row.get(field)
+            if isinstance(value, tuple):
+                value = "; ".join(value)
+            values.append(excel_safe_text(value) if isinstance(value, str) else value)
+        ws.append(values)
+    ws.sheet_state = "veryHidden"
 
 
 def write_guide_text_row(
@@ -14575,7 +13701,7 @@ def write_guide_text_row(
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
     cell = ws.cell(row=row, column=1, value=text)
     cell.fill = PatternFill("solid", fgColor=fill_color)
-    cell.font = Font(bold=bold, color=font_color, size=10)
+    cell.font = Font(bold=bold, color=font_color, size=11)
     cell.alignment = Alignment(wrap_text=True, vertical="center")
     ws.row_dimensions[row].height = height
 
@@ -14621,8 +13747,9 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ws,
         5,
         (
-            f"Methodology {MANAGEMENT_METHODOLOGY_VERSION}. "
-            f"{MANAGEMENT_SIGNAL_DISCLAIMER}"
+            f"Staff discussion method {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION}; "
+            f"tracked-action method {MANAGEMENT_METHODOLOGY_VERSION}. "
+            "Discussion suggestions do not create tracked actions in Management Center."
         ),
         height=30,
         fill_color="F3F4F6",
@@ -14643,25 +13770,27 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ),
         (
             "3. Read Performance Dashboard, Server Scorecards, and Weekly Performance in "
-            "that order: data coverage first, then peer-adjusted performance, then consistency "
-            "and the dated weekly pattern. Methodology defines every gate. These views are "
-            "descriptive selling-outcome review aids, not total job performance."
+            "that order: compare Spend per guest and Wine sales per $100, read the sample "
+            "and weekly pattern, then discuss the suggested topic. Established, Building, "
+            "and Early indication describe sample size. Small samples and near-cutoff results "
+            "need context, not a sharp conclusion."
         ),
         (
             "4. Use the overall store card on Performance Dashboard and Shared & Area "
-            "Trends for the operations layer: sales, guests, Sales per Guest, Wine Mix, shared "
-            "POS results, and guest-weighted area Sales per Guest. Use Methodology for the "
-            "definitions and limits. Do not make a person-level decision from a card."
+            "Trends for sales, guests, Spend per guest, Wine sales per $100, and shared "
+            "POS or area results. Compare like work and ask about guest preferences, "
+            "section mix, and opportunities. Methodology explains the calculations."
         ),
         (
-            "5. Use Management Center as the single current queue. Its readiness, peer-reference, "
-            "persistence, stability, evidence, and human-review gates remain separate from the "
-            "descriptive performance/consistency labels. Review the evidence fields, then "
-            "complete only the blue targets, owner-roster, and action fields."
+            "5. Use Management Center for tracked actions. Its sample, history, peer, "
+            "persistence, stability, and review rules are unchanged. Staff discussion "
+            "suggestions are separate. Review the evidence, then complete only the blue "
+            "targets, owner-roster, and action fields."
         ),
         (
-            "6. Track follow-up in Management Center. Completed or dismissed items move from "
-            "Current Actions to Action History on the next successful run."
+            "6. Track follow-up in Management Center and check unassigned or undated items. "
+            "Print the sheet for a current-action handout. History retains completed, "
+            "dismissed, and cleared signals; cleared does not mean follow-up was completed."
         ),
     )
     workflow_step_heights = (48, 36, 42, 42, 48, 36)
@@ -14672,7 +13801,7 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
 
     write_guide_section_header(ws, 13, HOW_TO_USE_SECTION_HEADINGS[2])
     required_review_rows = (
-        "Before dispositioning a generated row, verify:",
+        "Before completing a tracked-action disposition, verify:",
         "• Source date, identity, location, completeness, and reconciliation",
         "• Latest sample and peer-reference sufficiency",
         (
@@ -14696,7 +13825,7 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
 
     write_guide_section_header(ws, 21, HOW_TO_USE_SECTION_HEADINGS[3])
     signal_rows = (
-        "Not Evaluated or Reference Unavailable — gates were not met; no prompt.",
+        "For tracked actions: Not Evaluated or Reference Unavailable means the action gates were not met.",
         "Context Review — investigate context only; this is not a coaching conclusion.",
         (
             "Coaching Prompt — second consecutive aligned qualified signal with a "
@@ -14823,27 +13952,27 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         ),
         (
             "Performance Dashboard",
-            "eight-week data coverage, peer-adjusted performance, and consistency overview",
+            "store totals and staff coaching, recognition, and check-in discussion suggestions",
             "No — locked",
         ),
         (
             "Server Scorecards",
-            "all named servers, data coverage, actual/peer comparisons, last worked, and supporting detail",
+            "all named servers, actual/peer comparisons, sample, consistency, and discussion topics",
             "No — locked",
         ),
         (
             "Weekly Performance",
-            "dated Strong, Near Peer, Mixed, Below, Not Qualified, and missing-row pattern",
+            "dated Spend per guest and Wine sales per $100 comparisons, sample, and weekly topics",
             "No — locked",
         ),
         (
             "Shared & Area Trends",
-            "eight-week shared POS results and guest-weighted Sales per Guest by operating area",
+            "eight-week shared POS results and Spend per guest by operating area",
             "No — locked by default",
         ),
         (
             "Methodology",
-            "definitions, calculation flow, gates, thresholds, and limitations",
+            "metric definitions, peer rules, sample labels, and conversation thresholds",
             "No — locked",
         ),
         (
@@ -14895,7 +14024,7 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
             "better; multi-row totals use opportunities divided by inferred qualifying "
             "sales. Ticket Time is weighted only by complete Check Count coverage. "
             "Legacy weeks without Check Count show Ticket Time as unavailable. Both "
-            "metrics are context only and cannot create person-level prompts."
+            "metrics are context only and cannot create tracked person-level prompts."
         ),
         (
             "The source does not observe assignment and equal-opportunity context. Correct "
@@ -14925,10 +14054,24 @@ def write_how_to_use_sheet(wb: Workbook) -> None:
         )
 
     ws.print_area = f"A1:L{limits_start_row + len(limit_rows) - 1}"
+    ws.print_title_rows = "1:1"
+    # Preserve the wide on-screen guide and avoid horizontal overflow.
+    # Each page contains complete related sections and tables.
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
+    ws.page_setup.scale = None
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
+    ws.page_margins.left = ws.page_margins.right = 0
+    ws.page_margins.top = ws.page_margins.bottom = 0.25
+    ws.page_margins.header = ws.page_margins.footer = 0.1
+    for last_row_on_page in (12, 26, 36, 43, 52):
+        ws.row_breaks.append(Break(id=last_row_on_page))
+    ws.oddFooter.center.text = "Page &P of &N"
+    ws.oddFooter.center.size = 11
+    ws.oddFooter.right.text = "How to Use"
+    ws.oddFooter.right.size = 11
     ws.print_options.horizontalCentered = True
 
 
@@ -15421,9 +14564,9 @@ def write_management_center_sheet(
     ws.merge_cells("C3:W3")
     ws["C3"] = (
         "Weekly control center: confirm data readiness, maintain targets and owners, then "
-        "update only the blue cells in Current Actions. Completed and dismissed items move "
-        "to the read-only history below. The default printout covers the current management "
-        "snapshot; history remains available below for on-screen lookup."
+        "update only the blue cells in Current Actions. History retains completed, dismissed, "
+        "and cleared signals; a cleared signal does not mean the follow-up was completed. "
+        "Print this sheet for a readable current-action handout."
     )
     ws["C3"].fill = PatternFill("solid", fgColor="FFF2CC")
     ws["C3"].font = Font(bold=True, color="7F6000")
@@ -15669,12 +14812,29 @@ def write_management_center_sheet(
     )
 
     history_title_row = current_end_row + 2
+    completed_count = sum(
+        str(action.get("Status") or "").strip().casefold() == "complete"
+        for action in action_history
+    )
+    dismissed_count = sum(
+        str(action.get("Status") or "").strip().casefold() == "dismissed"
+        for action in action_history
+    )
+    cleared_count = sum(
+        str(action.get("Status") or "").strip().casefold()
+        not in {"complete", "dismissed"}
+        and str(action.get("Signal State") or "").strip().casefold() == "cleared"
+        for action in action_history
+    )
+    other_history_count = len(action_history) - completed_count - dismissed_count - cleared_count
     style_section_header(
         ws,
         history_title_row,
         3,
         len(ACTION_HEADERS),
-        f"ACTION HISTORY | {len(action_history)} completed or dismissed item(s)",
+        f"ACTION HISTORY | {completed_count} completed; {dismissed_count} dismissed; "
+        f"{cleared_count} cleared without completed follow-up"
+        + (f"; {other_history_count} other retained" if other_history_count else ""),
     )
     ws.merge_cells(
         start_row=history_title_row,
@@ -15695,13 +14855,78 @@ def write_management_center_sheet(
     ws.freeze_panes = "C6"
     ws.sheet_view.topLeftCell = "C1"
     ws.sheet_view.zoomScale = 75
-    ws.print_title_rows = "1:5"
-    ws.print_area = f"A1:W{current_end_row}"
+    first_action_row = current_title_row + 3
+    style_section_header(ws, 5, 11, 12, "FOLLOW-UP TO ASSIGN")
+    ws.merge_cells("K5:L5")
+    for row_index, label, field in ((6, "Unassigned items", "E"), (7, "Items without a due date", "F")):
+        ws.cell(row_index, 11, label).font = Font(bold=True, size=11)
+        ws.cell(row_index, 11).alignment = Alignment(wrap_text=True, vertical="center")
+        ws.cell(row_index, 12, (
+            f'=COUNTIFS($D${first_action_row}:$D${current_end_row},"<>Complete",'
+            f'$D${first_action_row}:$D${current_end_row},"<>Dismissed",'
+            f'${field}${first_action_row}:${field}${current_end_row},"")'
+        ) if current_actions else 0)
+        ws.cell(row_index, 12).font = Font(bold=True, size=11)
+        ws.cell(row_index, 12).number_format = "0"
+        ws.conditional_formatting.add(
+            f"L{row_index}",
+            CellIsRule(operator="greaterThan", formula=[0], fill=PatternFill("solid", fgColor="FFF2CC")),
+        )
+
+    # The editable table is intentionally wide. A separate print region in the
+    # same sheet preserves its import contract and gives the handout independent
+    # column widths and row heights. Links keep editable fields current in Excel.
+    print_start = history_end_row + 5
+    for column in range(25, 33):
+        ws.column_dimensions[get_column_letter(column)].width = 13
+
+    def print_line(row: int, value: Any, *, bold: bool = False, height: float = 30,
+                   start_col: int = 25, end_col: int = 32, fill: str | None = None) -> None:
+        ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
+        cell = ws.cell(row, start_col, value)
+        cell.font = Font(name="Arial", size=11, bold=bold, color="262626")
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        if fill:
+            cell.fill = PatternFill("solid", fgColor=fill)
+        ws.row_dimensions[row].height = max(ws.row_dimensions[row].height or 0, height)
+
+    ws.merge_cells("K9:L9")
+    ws["K9"] = "Print-friendly review"
+    ws["K9"].hyperlink = f"#'{MANAGEMENT_CENTER_SHEET}'!Y{print_start}"
+    ws["K9"].font = Font(color="7A1E1E", bold=True, underline="single", size=11)
+    print_line(print_start, "Management review", bold=True, height=26, fill="D9E1F2")
+    print_line(print_start + 1, f'="Week ending "&F7&". "&F8', height=24)
+    print_line(print_start + 2, '=F6&". "&L6&" unassigned; "&L7&" without a due date."', height=30)
+    print_line(print_start + 3, "Back to Current Actions to record owners, dates, and review decisions.", height=24)
+    ws.cell(print_start + 3, 25).hyperlink = f"#'{MANAGEMENT_CENTER_SHEET}'!C{current_title_row}"
+    ws.cell(print_start + 3, 25).font = Font(name="Arial", size=11, color="7A1E1E", underline="single")
+    print_row = print_start + 5
+    if not current_actions:
+        print_line(print_row, "No current review items.")
+        print_row += 1
+    for offset, action in enumerate(current_actions):
+        source_row = first_action_row + offset
+        if offset:
+            ws.row_breaks.append(Break(id=print_row - 1))
+        print_line(print_row, f'={offset + 1}&". "&H{source_row}&" - "&G{source_row}', bold=True, height=30, fill="E8EEF5")
+        print_line(print_row + 1, f'="Action: "&I{source_row}&". Status: "&D{source_row}', height=30)
+        print_line(print_row + 2, f'="Owner: "&IF(E{source_row}="","Unassigned",E{source_row})&". Due: "&IF(F{source_row}="","Not set",TEXT(F{source_row},"mm/dd/yyyy"))', height=30)
+        print_line(print_row + 3, f'="Why review: "&K{source_row}', height=60)
+        print_line(print_row + 4, f'="Next step: "&L{source_row}', height=75)
+        print_line(print_row + 5, f'="Review decision: "&U{source_row}&". Reviewed by: "&IF(V{source_row}="","Not recorded",V{source_row})', height=45)
+        print_line(print_row + 6, f'="Manager context: "&IF(N{source_row}="","Not recorded",N{source_row})', height=90)
+        print_row += 8
+    ws.print_title_rows = f"{print_start}:{print_start + 3}"
+    ws.print_area = f"Y{print_start}:AF{print_row - 1}"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 1
+    ws.page_setup.fitToHeight = 0
+    ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
     ws.page_setup.pageOrder = "overThenDown"
+    ws.page_margins.left = ws.page_margins.right = 0.4
+    ws.page_margins.top = ws.page_margins.bottom = 0.4
+    ws.page_margins.header = ws.page_margins.footer = 0.2
     ws.print_options.horizontalCentered = True
 
 
@@ -17776,27 +17001,35 @@ def write_management_run_notes(
         ("Date Coverage", format_date_range(min(r.report_date for r in records), max(r.report_date for r in records))
          if records else "No source reports; declared closure period " + format_date_range(public_start, public_end)),
         ("Public Snapshot Dates", format_date_range(public_start, public_end)),
-        ("Recent Movement", f"Latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete person-weeks. Partial weeks, limited samples, missing metrics, and insufficient references are Not Evaluated."),
-        ("Evidence Status", f"Eligibility requires latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests. This is not statistical confidence."),
+        ("Recent Movement", f"Tracked actions: latest complete Tuesday-Sunday week versus up to {config.get('dashboard_baseline_full_weeks', 4)} prior complete person-weeks. Partial weeks, limited samples, missing metrics, and insufficient references are Not Evaluated. Staff discussion comparisons follow their separate rules below."),
+        ("Evidence Status", f"Tracked-action eligibility requires latest guests >= {config.get('dashboard_min_guest_count_for_trends', 25)} AND active days >= {config.get('dashboard_min_active_days_for_trends', 3)}, plus at least {config.get('dashboard_min_prior_full_weeks', 2)} prior full weeks and {config.get('dashboard_min_prior_guest_count', 50)} prior guests. These gates do not suppress staff discussion feedback."),
         ("8-Week Direction", f"Compares the most recent {config.get('dashboard_long_term_block_weeks', 4)} complete weeks with the preceding {config.get('dashboard_long_term_block_weeks', 4)}. Full uses eight server weeks with at least {config.get('dashboard_long_term_full_min_recent_guests', 100)} recent / {config.get('dashboard_long_term_full_min_earlier_guests', 100)} earlier guests; Developing requires at least {config.get('dashboard_long_term_developing_min_total_weeks', 6)} usable weeks, {config.get('dashboard_long_term_developing_min_recent_weeks', 3)} recent / {config.get('dashboard_long_term_developing_min_earlier_weeks', 2)} earlier weeks, and {config.get('dashboard_long_term_developing_min_recent_guests', 75)} recent / {config.get('dashboard_long_term_developing_min_earlier_guests', 50)} earlier guests."),
-        ("Peer Comparison", "Person-level comparison uses a leave-one-person-out same-store median pooled across the prior four complete weeks. It fails closed when cohort sufficiency gates are not met. Store totals are never a person fallback."),
-        ("Targets", "Management Setup targets apply only to store/group operational context. They do not create person-level coaching prompts."),
-        ("Signal Scoring", "Person-level movement and peer comparison use separately calibrated Sales / Guest and Wine % bands only. Check Count, Rate of Sale, and Ticket Time are context only. Rank is display-only and contributes no points. A prompt requires aligned movement and peer context, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
+        ("Peer Comparison", "Tracked actions use a leave-one-person-out same-store median pooled across the prior four complete weeks. Action references fail closed when cohort gates are not met. Staff discussions instead use other qualified peers from each same store and week. Store totals are never a person fallback."),
+        ("Targets", "Management Center targets apply only to store/group operational context. They do not create person-level coaching prompts."),
+        ("Signal Scoring", "Tracked-action movement and peer comparison use separately calibrated Sales / Guest and Wine % bands only. Check Count, Rate of Sale, and Ticket Time are context only. Rank contributes no points. An action prompt requires aligned movement and peers, recurring drivers in two consecutive qualified weeks, a common-store-shock guard, and leave-one-active-day stability."),
         ("Review Gate", "Generated rows start at Review Needed. A later workflow state requires Review Disposition, Reviewed By, and Review Date; the signal cannot be the sole basis for an adverse employment decision."),
         (
             "Team Trends",
-            "Shows every current non-excluded server with exact consecutive-week "
+            "Legacy audit view showing current non-excluded servers with exact consecutive-week "
             "Sales / Guest and Wine % deltas plus descriptive 4-week and 8-week "
-            "direction. These visible movements do not bypass the action gates.",
+            "direction. These movements do not bypass the tracked-action gates.",
         ),
         (
             "Performance & Consistency",
-            f"Descriptive methodology {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION} uses the latest "
-            f"{PERFORMANCE_CONSISTENCY_WINDOW_WEEKS} complete shared weeks, all resolved named servers, and same-store "
-            f"historical weekly medians with at least {config.get('management_peer_reference', {}).get('min_distinct_peers_per_week', 5)} eligible peers, "
-            f"a {PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP:,.0f}-guest weekly weight cap, and sample SD. "
-            "It measures selling outcomes only and does not bypass readiness, evidence, persistence, "
-            "stability, review, or Action Board controls.",
+            f"Staff discussion method {PERFORMANCE_CONSISTENCY_METHODOLOGY_VERSION}: latest "
+            f"{PERFORMANCE_CONSISTENCY_WINDOW_WEEKS} complete shared weeks, every resolved named server, "
+            "positive sales and guests plus at least one active day. Compare with at least "
+            f"{config.get('management_peer_reference', {}).get('min_distinct_peers_per_week', 5)} other qualified same-store/week peers. "
+            f"Each metric uses matched actual/peer weeks and a {PERFORMANCE_CONSISTENCY_GUEST_WEIGHT_CAP:,.0f}-guest weight cap. "
+            "Sample and consistency describe evidence; they do not suppress all feedback.",
+        ),
+        (
+            "Staff Discussion Topics",
+            "Spend per guest and Wine sales per $100 suggest coaching, recognition, or a routine "
+            "check-in. Nominal gaps are $5 per guest and $1.50 of wine per $100; within 10% of a "
+            "cutoff is Near conversation threshold and calls for context. Sample is Established "
+            "(6 compared weeks / 200 guests), Building (4 / 150), or Early indication. "
+            "Missing denominators or peers remain unavailable. Suggestions do not create tracked actions.",
         ),
         (
             "Shared POS & Area Trends",
@@ -17806,7 +17039,7 @@ def write_management_run_notes(
             "actual source name or shared number is configured.",
         ),
         ("Technical Trend Detail", "Server Week-over-Week Detail remains protected descriptive audit context. Generated coaching prompts use qualified Recent Movement, peer comparison, evidence stability, and two-week persistence."),
-        ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward between weekly runs. Cleared signals move to Action History."),
+        ("Action Tracking", "Owner, due date, status, context notes, and review fields carry forward. History distinguishes completed, dismissed, and cleared signals; a cleared signal does not mean follow-up was completed. Current unassigned/undated counts and a compact print handout support manager review."),
         (
             "Evidence Contract",
             "Action and reason codes, exact evidence weeks, source hashes/parser "
@@ -17826,6 +17059,11 @@ def write_management_run_notes(
                 "Peer Comparison",
                 "Signal Scoring",
                 "Metric Caveat",
+                "Recent Movement",
+                "Evidence Status",
+                "Performance & Consistency",
+                "Staff Discussion Topics",
+                "Action Tracking",
             }
             else 42
             if label in {"Check Count Coverage", "Metric Rule", "Team Trends", "Performance & Consistency"}
