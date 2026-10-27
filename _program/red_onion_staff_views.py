@@ -16,6 +16,8 @@ from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
+from red_onion_staff_feedback import currency_display_value
+
 
 BURGUNDY = "7A1E1E"
 INK = "262626"
@@ -121,6 +123,7 @@ def _date(value: Any) -> str:
 def _money(value: float | None, *, signed: bool = False) -> str:
     if value is None:
         return "Unavailable"
+    value = currency_display_value(value)
     if signed:
         return f"{'+' if value > 0 else '-' if value < 0 else ''}${abs(value):,.2f}"
     return f"${value:,.2f}"

@@ -5,10 +5,39 @@ from datetime import date, timedelta
 
 import pytest
 
-from red_onion_staff_feedback import build_staff_feedback
+from red_onion_staff_feedback import _topic, build_staff_feedback, currency_display_value
 
 
 END = date(2026, 10, 25)
+
+
+@pytest.mark.parametrize("value,shown", [
+    (100.625, 100.63), (-100.625, -100.63),
+    (2.675, 2.68), (-2.675, -2.68),
+    (5.504, 5.50), (5.505, 5.51), (-5.505, -5.51),
+    (1.6549999999999998, 1.66), (-1.6549999999999998, -1.66),
+    (5.504999999999995, 5.51), (5.5049, 5.50),
+])
+def test_currency_display_rounds_half_cents_away_from_zero(value: float, shown: float) -> None:
+    assert currency_display_value(value) == shown
+
+
+@pytest.mark.parametrize("gap,metric,shown,action", [
+    (5.505, "spg", 5.51, "Recognition opportunity"),
+    (-5.505, "spg", -5.51, "Coaching conversation"),
+    (4.495, "spg", 4.50, "Near conversation threshold"),
+    (-4.495, "spg", -4.50, "Near conversation threshold"),
+    (.01655, "wine", 1.66, "Recognition opportunity"),
+    (-.01655, "wine", -1.66, "Coaching conversation"),
+    (.01345, "wine", 1.35, "Near conversation threshold"),
+    (-.01345, "wine", -1.35, "Near conversation threshold"),
+])
+def test_half_cent_topic_boundaries_match_displayed_currency(
+    gap: float, metric: str, shown: float, action: str,
+) -> None:
+    topic = _topic(gap, metric)
+    assert topic["display_gap"] == shown
+    assert topic["action"] == action
 
 
 def person(name: str, *, week: date = END, spg: float = 100, wine: float = .10,

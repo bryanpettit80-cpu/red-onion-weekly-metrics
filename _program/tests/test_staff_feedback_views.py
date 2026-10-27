@@ -2,14 +2,27 @@ from datetime import date, timedelta
 
 from openpyxl import Workbook
 from openpyxl.utils.cell import range_boundaries
+import pytest
 
 from red_onion_staff_feedback import build_staff_feedback
 from red_onion_staff_views import (
+    _money,
     write_staff_dashboard,
     write_staff_methodology,
     write_staff_scorecards,
     write_staff_weekly,
 )
+
+
+@pytest.mark.parametrize("value, signed, expected", [
+    (100.625, False, "$100.63"),
+    (100.625, True, "+$100.63"),
+    (-100.625, True, "-$100.63"),
+    (1.005, False, "$1.01"),
+    (0.004, True, "$0.00"),
+])
+def test_text_money_matches_excel_half_up_currency_display(value, signed, expected):
+    assert _money(value, signed=signed) == expected
 
 
 def staff_model():

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from math import isfinite
 from statistics import median, stdev
 from typing import Any, Iterable
@@ -31,11 +32,22 @@ def _number(value: Any) -> float | None:
     return result if isfinite(result) else None
 
 
+def currency_display_value(value: float) -> float:
+    """Round a finite currency amount to cents as Excel displays half cents."""
+    # Excel retains 15 significant digits. Remove binary scaling/subtraction
+    # noise before cent rounding (for example, .01655 * 100 is just below 1.655).
+    with localcontext() as context:
+        context.prec = 15
+        context.rounding = ROUND_HALF_UP
+        amount = +Decimal(str(value))
+    return float(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def _topic(gap: float | None, metric: str) -> dict[str, Any]:
     wine = metric == "wine"
     threshold = WINE_CONVERSATION_THRESHOLD if wine else SPG_CONVERSATION_THRESHOLD
     display_threshold = threshold * 100 if wine else threshold
-    display_gap = round(gap * 100, 2) if wine and gap is not None else round(gap, 2) if gap is not None else None
+    display_gap = currency_display_value(gap * 100 if wine else gap) if gap is not None else None
     near = display_gap is not None and abs(abs(display_gap) - display_threshold) <= display_threshold * NEAR_THRESHOLD_FRACTION + 1e-9
     if display_gap is None:
         direction, action = "Unavailable", "Comparison unavailable"
