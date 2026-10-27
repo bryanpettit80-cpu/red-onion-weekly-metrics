@@ -76,7 +76,9 @@ internal copy/provenance evidence. If accepted history or reviewed correction
 alternatives change between inspection and execution, execution must not use
 the stale inspection.
 
-Illustrative incomplete result:
+Illustrative incomplete result using the methodology versions recorded for
+October 12, 2026. A current run records its actual versions; release v0.7.0
+uses descriptive methodology `2026.10-v3` and management methodology `2026.07-v3`.
 
 ```json
 {

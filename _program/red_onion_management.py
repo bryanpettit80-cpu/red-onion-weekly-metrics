@@ -143,14 +143,17 @@ def _actions(wb: Any, name: str, required: set[str]) -> list[dict[str, Any]]:
     # Accept only the recognizable, actually blank empty section, never a
     # missing table that still has saved manager rows underneath its header.
     import red_onion_weekly_metrics as weekly
-    title, offset = (
-        ("CURRENT ACTIONS | 0 open review item(s)", 2)
-        if name == "ActionBoardTable" else ("ACTION HISTORY | 0 completed or dismissed item(s)", 1)
+    titles, offset = (
+        (("CURRENT ACTIONS | 0 open review item(s)",), 2)
+        if name == "ActionBoardTable" else ((
+            "ACTION HISTORY | 0 completed or dismissed item(s)",
+            "ACTION HISTORY | 0 completed; 0 dismissed; 0 cleared without completed follow-up",
+        ), 1)
     )
     for ws in wb.worksheets:
         for row in ws.iter_rows(min_col=3, max_col=3):
             cell = row[0]
-            if cell.value != title:
+            if cell.value not in titles:
                 continue
             header = cell.row + offset
             names = [ws.cell(header, col).value for col in range(1, len(weekly.ACTION_HEADERS) + 1)]

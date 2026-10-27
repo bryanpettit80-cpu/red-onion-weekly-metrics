@@ -4,7 +4,7 @@ Red Onion turns daily Marketing Vitals reports into weekly restaurant reports
 and a master workbook. Operators use the numbered folders and one launcher.
 See [SETUP.md](SETUP.md) to prepare another Windows computer.
 
-The current release is [v0.6.0](https://github.com/bryanpettit80-cpu/red-onion-weekly-metrics/releases/tag/v0.6.0).
+The current release is [v0.7.0](https://github.com/bryanpettit80-cpu/red-onion-weekly-metrics/releases/tag/v0.7.0).
 The reporting workflow runs locally on Windows with Python 3.10-3.12;
 Python 3.12 is recommended. Excel is optional for generation and useful for
 reviewing and editing the finished workbooks. Linux CI exercises the Python
@@ -107,9 +107,9 @@ complete week.
 The master has seven visible tabs:
 
 - `How to Use`: workflow, navigation, editable fields, and interpretation.
-- `Performance Dashboard`: store totals and all named-server summaries.
-- `Server Scorecards`: actual results, peer references, differences,
-  consistency, coverage, and low-data explanations.
+- `Performance Dashboard`: store totals and staff discussion suggestions.
+- `Server Scorecards`: every named server's actual results, peer comparisons,
+  sample, consistency, and coaching or recognition discussion points.
 - `Weekly Performance`: the dated pattern behind those summaries.
 - `Shared & Area Trends`: shared POS identities and operational areas.
 - `Methodology`: definitions and limits.
@@ -138,11 +138,17 @@ Protection helps avoid accidental edits; the lowercase password `redonion`
 is not encryption. The supported edit cells remain blue in Management Center.
 Keep exploratory work in a separate copy.
 
+Management Center shows current items without an owner or due date and prints
+a readable current-action handout. Action History distinguishes completed,
+dismissed, and cleared signals. A cleared signal does not mean the manager's
+follow-up was completed; the recorded status is preserved.
+
 ## Calculation and interpretation
 
-Sales/Guest is total Gross Sales divided by total Guests. Wine Percentage is
-total Wine Sales divided by total Gross Sales. Totals and combined rates use
-their underlying amounts, rather than averages of displayed percentages.
+Spend per guest is total Gross Sales divided by total Guests. Wine sales per
+$100 is 100 times total Wine Sales divided by total Gross Sales: a value of
+$12 means $12 of wine in every $100 of recorded sales. Totals and combined
+rates use their underlying amounts, rather than averages of displayed rates.
 
 Rate of Sale is Red Onion's inverse conversion measure,
 `opportunities / qualifying sales`; lower positive values are better. The
@@ -154,17 +160,27 @@ Check Count and the total is positive. Guest weighting is not a substitute.
 See the [metric formulas](MODEL_CARD.md#descriptive-context-metrics) for
 aggregation details and unavailable-data rules.
 
-The `2026.10-v2` descriptive scorecards cover every resolved named server
+The `2026.10-v3` staff discussion views cover every resolved named server
 seen in the latest eight complete weeks, including someone absent from the
-latest week. Low-data people remain visible with explicit coverage limits.
-Shared POS identities and operational areas remain separate. The
+latest week. A person with usable positive sales and guests can receive a
+comparison even after one active day. The reference is the median of at least
+five other qualified servers in that same store and week. Shared POS
+identities and operational areas remain separate. The
 [scorecard methodology](MODEL_CARD.md#descriptive-performance-and-consistency-layer)
-defines qualified weeks, historical peers, weights, and classification rules.
+defines the peer rules, weights, sample labels, and discussion thresholds.
 
-The separate `2026.07-v3` people-review prompts use only Sales/Guest and Wine
-Percentage with sample, history, peer, persistence, and stability checks.
-Operational context and descriptive scorecard labels cannot create or escalate
-those prompts. Missing evidence prevents escalation; missing weeks are not zero.
+Sample labels are `Established`, `Building`, and `Early indication`.
+An early indication still supports a conversation, with the smaller sample
+clearly shown. Missing sales, guests, or an adequate peer reference remain
+unavailable. Each measure can suggest coaching, recognition, a routine
+check-in, or a review near the conversation threshold. Results close to a
+cutoff include context instead of a sharp conclusion.
+
+The separate `2026.07-v3` tracked actions in Management Center retain their
+Sales/Guest and Wine Percentage sample, history, peer, persistence, and
+stability checks. Staff discussion suggestions do not create or escalate
+those tracked actions. Missing evidence prevents action escalation; missing
+weeks are not zero.
 
 These are rule-based observational review prompts. They do not establish
 causation, statistical confidence, total job performance, or employment

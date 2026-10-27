@@ -45,7 +45,7 @@ jobs:
         run: python -m pytest -q
       - name: Compile script
         working-directory: _program
-        run: python -m py_compile red_onion_config.py red_onion_ingestion.py red_onion_integrity.py red_onion_management.py red_onion_runtime.py red_onion_transactions.py red_onion_workflow.py red_onion_weekly_metrics.py
+        run: python -m py_compile red_onion_config.py red_onion_ingestion.py red_onion_integrity.py red_onion_management.py red_onion_runtime.py red_onion_staff_feedback.py red_onion_staff_views.py red_onion_transactions.py red_onion_workflow.py red_onion_weekly_metrics.py
 
   windows-launcher-test:
     runs-on: windows-latest

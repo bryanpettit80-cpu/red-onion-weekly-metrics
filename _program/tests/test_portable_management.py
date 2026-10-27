@@ -102,3 +102,22 @@ def test_unreadable_renamed_master_is_not_a_new_installation(tmp_path):
         find_master(tmp_path)
     with pytest.raises(ValueError, match="Cannot read management"):
         find_master(tmp_path, expected_name=renamed.name)
+
+
+@pytest.mark.parametrize("title", [
+    "ACTION HISTORY | 0 completed or dismissed item(s)",
+    "ACTION HISTORY | 0 completed; 0 dismissed; 0 cleared without completed follow-up",
+])
+def test_empty_history_accepts_legacy_and_current_labels_without_dropping_rows(title):
+    import red_onion_weekly_metrics as weekly
+    from red_onion_management import _actions
+    wb = Workbook()
+    ws = wb.active
+    ws["C3"] = title
+    for column, label in enumerate(weekly.ACTION_HEADERS, 1):
+        ws.cell(4, column, label)
+    assert _actions(wb, "ActionHistoryTable", {"Action ID"}) == []
+    ws["A5"] = "preserved-manager-action"
+    with pytest.raises(ValueError, match="valid empty section"):
+        _actions(wb, "ActionHistoryTable", {"Action ID"})
+    wb.close()
