@@ -29,7 +29,28 @@ Run this before committing changes:
 
 ```powershell
 cd _program
+python -m pip install --require-hashes -r requirements.lock
 python -m pip install -e ".[dev]"
+python -m pip check
+python red_onion_config.py --config red_onion_config.json
 python -m pytest -q
 python -m py_compile red_onion_weekly_metrics.py
 ```
+
+Run `git diff --check` from the repository root. For Windows launcher changes, run `python -m pytest -q tests/test_launcher_integrity.py` from `_program` on Windows and record platform-specific skips honestly. CI remains the source for its complete compile list and platform matrix.
+
+Windows launcher tests also require the launcher's interpreter discovery to resolve Python 3.10-3.12; running pytest in a supported virtual environment alone does not establish that.
+
+## Project contracts
+
+Read the relevant contract when changing its area: `MODEL_CARD.md` for calculations and evidence, `DATA_GOVERNANCE.md` for people-related outputs and allowed workbook edits, `RECOVERY.md` for operational recovery, and `MAINTAINER.md` for releases. `COORDINATOR_CONTRACT.md` describes a future design, not an available integration or implemented CLI.
+
+## Code Review Rules
+
+- Preserve complete Tuesday-Sunday coverage and explicit closure/correction decisions. An unavailable workspace or missing restaurant-day is not empty intake or an implicit closure; conflicting corrected business facts require the established review path.
+- Preserve editable management inputs, stable Action IDs, accepted history, and publication/recovery behavior. Recompute generated metrics from accepted daily facts; merge only documented editable workbook fields. Do not discard manager edits or confuse a post-publication cleanup warning with a failed publication that should be repeated.
+- Keep shared POS identities and operational-area aggregates out of person-level cohorts and actions. Preserve `Pending Review`, evidence eligibility, and documented human-review requirements; do not turn descriptive reporting into an automatic employment decision or transmit raw/private evidence.
+
+## Pull requests
+
+Use a task branch and open a focused draft PR against `main`, following [the PR template](.github/pull_request_template.md). Record checks actually run and material limitations. Merge only when requested and after required checks and reviews are satisfied; these instructions grant no standing merge authorization.
